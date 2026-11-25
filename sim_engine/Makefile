@@ -58,8 +58,8 @@ $(TARGET): $(OBJS) $(JSBSIM_SONAME) $(JSBSIM_LIB)
 
 # Package the SONAME alongside the game so the executable loads the upstream ABI.
 $(JSBSIM_SONAME): $(JSBSIM_INPUTS)
-	$(CMAKE) -S $(JSBSIM_ROOT) -B $(JSBSIM_BUILD) -DCMAKE_BUILD_TYPE=Release
-	$(CMAKE) --build $(JSBSIM_BUILD) --target libJSBSim --parallel 6
+	"$(CMAKE)" -S $(JSBSIM_ROOT) -B $(JSBSIM_BUILD) -DCMAKE_BUILD_TYPE=Release
+	"$(CMAKE)" --build $(JSBSIM_BUILD) --target libJSBSim --parallel 6
 	mkdir -p ../game/bin
 	cp -L $(JSBSIM_BUILD)/src/libJSBSim.so.1 $@.tmp
 	mv $@.tmp $@

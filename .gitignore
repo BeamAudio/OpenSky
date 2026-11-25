@@ -1,0 +1,35 @@
+# Local dev tools
+.tools/
+
+# Build outputs
+*.o
+*.os
+*.a
+*.so
+*.dll
+*.dylib
+sim_engine/nspain_sim
+sim_engine/.build/
+game/bin/*.so
+game/bin/*.so.*
+
+# Generated packs, caches and downloads (IGN CC-BY 4.0 / OSM ODbL 1.0 —
+# redistribute only under their own terms; see THIRD_PARTY_LICENSES.md)
+packs/
+*.nspack
+*.nscity
+*.nsshd
+*.nsscn
+builder/.cache/
+cache/
+__pycache__/
+*.pyc
+*.blend1
+
+# Local analysis and QA output
+/graphify-out/
+/gameplay_captures/
+/.agents/
+/.commandcode/
+
+!game/bin/.gitkeep

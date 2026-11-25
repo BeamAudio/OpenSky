@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=OpenSky World Editor
+Comment=Build and install regional scenery for OpenSky VFR Simulator
+Exec="/home/beamtechnologies/Documents/juego freeroam/run_builder.sh"
+Path=/home/beamtechnologies/Documents/juego freeroam
+Icon=applications-graphics
+Terminal=false
+Categories=Utility;Geography;

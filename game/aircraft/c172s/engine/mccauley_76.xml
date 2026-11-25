@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: CC0-1.0 -->
+<!-- Estimated fixed-pitch coefficients indexed by advance ratio J. -->
+<propeller name="McCauley 76-inch fixed pitch">
+  <diameter unit="IN">76</diameter>
+  <ixx unit="SLUG*FT2">1.38</ixx>
+  <numblades>2</numblades>
+  <gearratio>1</gearratio>
+  <minpitch>20</minpitch>
+  <maxpitch>20</maxpitch>
+  <constspeed>0</constspeed>
+  <table name="C_THRUST" type="internal">
+    <tableData>
+      -0.20   0.124
+       0.00   0.102
+       0.25   0.086
+       0.50   0.063
+       0.65   0.048
+       0.80   0.029
+       1.00   0.002
+       1.25  -0.025
+       1.70  -0.053
+    </tableData>
+  </table>
+  <table name="C_POWER" type="internal">
+    <tableData>
+      -0.20   0.062
+       0.00   0.055
+       0.25   0.053
+       0.50   0.049
+       0.65   0.045
+       0.80   0.038
+       1.00   0.020
+       1.25  -0.005
+       1.70  -0.030
+    </tableData>
+  </table>
+</propeller>

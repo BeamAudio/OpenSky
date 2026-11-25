@@ -1,0 +1,1902 @@
+#include "game_frontend.hpp"
+
+#include "aircraft_hud.hpp"
+#include "frontend_font_metrics.hpp"
+#include "../third_party/stb_image.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <utility>
+
+namespace nsim {
+namespace {
+constexpr PixelRect map_area{64, 225, 1200, 750};
+constexpr int w = GAME_OUTPUT_W, h = GAME_OUTPUT_H;
+constexpr double nm_m = 1852.0;
+constexpr float globe_radius = 0.46f;
+constexpr size_t max_points = 12;
+
+bool inside(PixelRect box, Vec2 p) {
+    return p.x >= box.x && p.x < box.x + box.w && p.y >= box.y && p.y < box.y + box.h;
+}
+
+double sample_aircraft_ground(const PackReader &pack, double lat, double lon, double heading_deg) {
+    double mlat, mlon;
+    nspain::meters_per_degree(lat, mlat, mlon);
+    const double hr = heading_deg * DEG2RAD_D;
+    const double fe = std::sin(hr), fn = std::cos(hr);
+    const double re = std::cos(hr), rn = -std::sin(hr);
+    const double pts[4][2] = {{0.0, 0.0}, {fe * 2.0, fn * 2.0}, {-fe * 0.6 + re * 1.5, -fn * 0.6 + rn * 1.5},
+                              {-fe * 0.6 - re * 1.5, -fn * 0.6 - rn * 1.5}};
+    double gnd = -1e9;
+    for (const auto &p : pts) {
+        const double plat = lat + p[1] / mlat;
+        const double plon = lon + p[0] / mlon;
+        double e = pack.sample_elevation(plat, plon);
+        double rwy_e = 0.0, mu = 0.0, rough = 0.0;
+        std::string rwy_id;
+        if (pack.query_runway(plat, plon, rwy_e, mu, rough, rwy_id)) e = std::max(e, rwy_e + 0.35);
+        gnd = std::max(gnd, e);
+    }
+    return gnd;
+}
+
+double bearing(double a_lat, double a_lon, double b_lat, double b_lon) {
+    const double a = a_lat * DEG2RAD_D, b = b_lat * DEG2RAD_D;
+    const double d = (b_lon - a_lon) * DEG2RAD_D;
+    return std::fmod(360.0 + std::atan2(std::sin(d) * std::cos(b),
+        std::cos(a) * std::sin(b) - std::sin(a) * std::cos(b) * std::cos(d)) * RAD2DEG_D, 360.0);
+}
+
+Vec3 globe_xyz(double lat_deg, double lon_deg) {
+    const double lat = lat_deg * DEG2RAD_D, lon = lon_deg * DEG2RAD_D;
+    return {float(std::cos(lat) * std::cos(lon)), float(std::cos(lat) * std::sin(lon)), float(std::sin(lat))};
+}
+
+std::pair<double, double> globe_geo(Vec3 p) {
+    return {std::asin(std::clamp(double(p.z), -1.0, 1.0)) * RAD2DEG_D,
+            std::atan2(double(p.y), double(p.x)) * RAD2DEG_D};
+}
+
+struct GlobeProjection {
+    Vec3 forward, east, north;
+    Vec2 centre{map_area.x + map_area.w * .5f, map_area.y + map_area.h * .5f};
+    float radius;
+    GlobeProjection(double lat, double lon, float zoom)
+        : forward(globe_xyz(lat, lon)), east(globe_xyz(0, lon + 90)),
+          north(cross(forward, east)), radius(map_area.h * globe_radius * zoom) {}
+    std::optional<Vec2> project(Vec3 p) const {
+        if (dot(forward, p) < 0) return {};
+        return centre + Vec2{dot(east, p), -dot(north, p)} * radius;
+    }
+    std::optional<Vec3> unproject(Vec2 p) const {
+        const Vec2 v = (p - centre) * (1.0f / radius);
+        const float r = v.x * v.x + v.y * v.y;
+        if (r > 1.0f) return {};
+        return east * v.x - north * v.y + forward * std::sqrt(1.0f - r);
+    }
+};
+
+std::filesystem::path profile_path() {
+    return graphics_settings_path().parent_path() / "fleet.ini";
+}
+} // namespace
+
+GameFrontend::~GameFrontend() {
+    if (vao_) glDeleteVertexArrays(1, &vao_);
+    if (bounds_) glDeleteBuffers(1, &bounds_);
+    if (land_) glDeleteTextures(1, &land_);
+    if (font_) glDeleteTextures(1, &font_);
+    if (relief_) glDeleteTextures(1, &relief_);
+    if (backdrop_) glDeleteProgram(backdrop_);
+}
+
+bool GameFrontend::init(const PackReader &pack, const std::string &shader_root, const std::string &asset_root) {
+    pack_ = &pack;
+    backdrop_ = compile_program_files(shader_root + "/fullscreen.vert", shader_root + "/frontend.frag");
+    if (!backdrop_) return false;
+    relief_bounds_uniform_ = glGetUniformLocation(backdrop_, "u_relief_bounds");
+    globe_uniform_ = glGetUniformLocation(backdrop_, "u_globe");
+    region_count_uniform_ = glGetUniformLocation(backdrop_, "u_region_count");
+    aspect_uniform_ = glGetUniformLocation(backdrop_, "u_aspect");
+    int tw, th, channels;
+    unsigned char *pixels = stbi_load((asset_root + "/ui/globe_land.png").c_str(), &tw, &th, &channels, 1);
+    if (!pixels) {
+        std::fprintf(stderr, "[WORLD] Could not load the globe land mask\n");
+        return false;
+    }
+    glCreateTextures(GL_TEXTURE_2D, 1, &land_);
+    glTextureStorage2D(land_, 1, GL_R8, tw, th);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTextureSubImage2D(land_, 0, 0, 0, tw, th, GL_RED, GL_UNSIGNED_BYTE, pixels);
+    stbi_image_free(pixels);
+    glTextureParameteri(land_, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTextureParameteri(land_, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTextureParameteri(land_, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTextureParameteri(land_, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    pixels = stbi_load((asset_root + "/ui/frontend_font.png").c_str(), &tw, &th, &channels, 4);
+    if (!pixels) return false;
+    glCreateTextures(GL_TEXTURE_2D, 1, &font_);
+    glTextureStorage2D(font_, 1, GL_RGBA8, tw, th);
+    glTextureSubImage2D(font_, 0, 0, 0, tw, th, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+    stbi_image_free(pixels);
+    glTextureParameteri(font_, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTextureParameteri(font_, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    // The regional planning map reuses the DEM already baked by the pack reader.
+    glCreateTextures(GL_TEXTURE_2D, 1, &relief_);
+    glTextureStorage2D(relief_, 1, GL_R32F, pack.corridor_dem_w(), pack.corridor_dem_h());
+    glTextureSubImage2D(relief_, 0, 0, 0, pack.corridor_dem_w(), pack.corridor_dem_h(),
+                        GL_RED, GL_FLOAT, pack.corridor_dem().data());
+    glTextureParameteri(relief_, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTextureParameteri(relief_, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTextureParameteri(relief_, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTextureParameteri(relief_, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    relief_bounds_ = {float(pack.anchor_lon() + pack.corridor_min_e() / pack.anchor_m_lon()),
+                      float(pack.anchor_lat() + pack.corridor_min_n() / pack.anchor_m_lat()),
+                      float(pack.corridor_span_e() / pack.anchor_m_lon()),
+                      float(pack.corridor_span_n() / pack.anchor_m_lat())};
+
+    std::vector<Vec4> bounds;
+    for (const auto &region : pack.regions()) {
+        const auto &b = region.hdr;
+        bounds.emplace_back(b.lon_min, b.lat_min, b.lon_max, b.lat_max);
+    }
+    region_count_ = static_cast<int>(bounds.size());
+    if (bounds.empty()) bounds.emplace_back();
+    glCreateBuffers(1, &bounds_);
+    glNamedBufferStorage(bounds_, bounds.size() * sizeof(Vec4), bounds.data(), 0);
+    glCreateVertexArrays(1, &vao_);
+
+    load_profile();
+    if (parked_id_.empty())
+        if (const auto *home = home_airport()) parked_id_ = home->id;
+    if (const auto *parked = parked_airport()) focus_airport(*parked, 1.0f);
+    return true;
+}
+
+void GameFrontend::load_profile() {
+    std::ifstream in(profile_path());
+    int version = 0;
+    if (!(in >> version) || (version != 1 && version != 2)) return;
+
+    std::string parked;
+    double left = 21.0, right = 21.0, damage = 0.0, hours = 0.0;
+    size_t count = 0;
+    if (!(in >> std::quoted(parked) >> left >> right >> damage >> hours >> count) ||
+        !std::isfinite(left) || !std::isfinite(right) ||
+        !std::isfinite(damage) || !std::isfinite(hours) || count > max_points) return;
+
+    std::vector<RoutePoint> route;
+    for (size_t i = 0; i < count; ++i) {
+        RoutePoint p;
+        if (!(in >> std::quoted(p.label) >> p.lat >> p.lon) || p.label.size() > 32 ||
+            !std::isfinite(p.lat) || !std::isfinite(p.lon) || std::abs(p.lat) > 90 || std::abs(p.lon) > 180) return;
+        route.push_back(std::move(p));
+    }
+
+    parked_id_ = std::move(parked);
+    care_.left_fuel_gal = std::clamp(left, 0.0, 26.5);
+    care_.right_fuel_gal = std::clamp(right, 0.0, 26.5);
+    care_.airframe_damage = std::clamp(damage, 0.0, 1.0);
+    hours_ = std::max(0.0, hours);
+    route_ = std::move(route);
+
+    if (version == 1) return;
+
+    // Version 2: full aircraft care, cockpit switch memory, parking coordinates, passport & logbook
+    int custom_park = 0, chocks = 1, pitot = 1, tied = 1;
+    int master = 0, avn = 0, mags = 0, fsel = 2, running = 0;
+    double plat = 0, plon = 0, phdg = 0;
+    if (in >> care_.oil_quarts >> care_.oil_hours >> care_.battery_soc
+           >> care_.spark_fouling >> care_.shock_cooling >> care_.cylinder_wear
+           >> care_.tire_wear >> care_.brake_wear >> care_.gear_alignment
+           >> care_.prop_nicks >> care_.windshield_dirt >> care_.sump_water
+           >> chocks >> pitot >> tied
+           >> master >> avn >> mags >> fsel >> care_.mixture >> care_.flaps_deg >> care_.carb_heat >> running
+           >> custom_park >> plat >> plon >> phdg
+           >> last_park_epoch_ >> total_landings_ >> best_landing_fpm_) {
+        care_.oil_quarts = std::clamp(care_.oil_quarts, 0.0, 8.0);
+        care_.oil_hours = std::max(0.0, care_.oil_hours);
+        care_.battery_soc = std::clamp(care_.battery_soc, 0.0, 1.0);
+        care_.spark_fouling = std::clamp(care_.spark_fouling, 0.0, 1.0);
+        care_.shock_cooling = std::clamp(care_.shock_cooling, 0.0, 1.0);
+        care_.cylinder_wear = std::clamp(care_.cylinder_wear, 0.0, 1.0);
+        care_.tire_wear = std::clamp(care_.tire_wear, 0.0, 1.0);
+        care_.brake_wear = std::clamp(care_.brake_wear, 0.0, 1.0);
+        care_.gear_alignment = std::clamp(care_.gear_alignment, -1.0, 1.0);
+        care_.prop_nicks = std::clamp(care_.prop_nicks, 0.0, 1.0);
+        care_.windshield_dirt = std::clamp(care_.windshield_dirt, 0.0, 1.0);
+        care_.sump_water = std::clamp(care_.sump_water, 0.0, 1.0);
+        care_.chocks_on = chocks != 0;
+        care_.pitot_cover_on = pitot != 0;
+        care_.tie_downs_on = tied != 0;
+        care_.fuel_selector = std::clamp(fsel, 0, 3);
+        care_.mixture = std::clamp(care_.mixture, 0.0, 1.0);
+        care_.flaps_deg = std::clamp(care_.flaps_deg, 0.0, 30.0);
+        care_.carb_heat = std::clamp(care_.carb_heat, 0.0, 1.0);
+        // Always start a parked session Cold & Dark so the preflight & engine-start procedure is intact
+        // (players who want instant takeoff can still press [K] Quick Start at any time).
+        care_.engine_running = false;
+        care_.master_on = false;
+        care_.avionics_on = false;
+        care_.magnetos = 0;
+        if (custom_park && std::isfinite(plat) && std::isfinite(plon) && std::isfinite(phdg) &&
+            std::abs(plat) <= 90.0 && std::abs(plon) <= 180.0) {
+            has_custom_park_ = true;
+            parking_spot_ = {plat, plon, sample_aircraft_ground(*pack_, plat, plon, phdg) + 1.38, phdg, 0.0};
+        }
+    }
+    size_t n_stamps = 0;
+    if (in >> n_stamps && n_stamps <= 128) {
+        passport_.clear();
+        for (size_t i = 0; i < n_stamps; ++i) {
+            PassportStamp s;
+            if (!(in >> std::quoted(s.airport_id) >> s.visits >> s.best_fpm)) break;
+            passport_.push_back(std::move(s));
+        }
+    }
+    size_t n_logs = 0;
+    if (in >> n_logs && n_logs <= 32) {
+        logbook_.clear();
+        for (size_t i = 0; i < n_logs; ++i) {
+            FlightLogEntry e;
+            if (!(in >> std::quoted(e.dep_id) >> std::quoted(e.arr_id) >> std::quoted(e.grade)
+                     >> e.minutes >> e.distance_nm >> e.fuel_gal >> e.touchdown_fpm >> e.crosswind_kt)) break;
+            logbook_.push_back(std::move(e));
+        }
+    }
+}
+
+void GameFrontend::save_profile() const {
+    const auto path = profile_path();
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    if (ec) return;
+    auto temp = path;
+    temp += ".tmp";
+    std::ofstream out(temp, std::ios::trunc);
+    out << std::setprecision(12) << 2 << '\n' << std::quoted(parked_id_) << '\n'
+        << care_.left_fuel_gal << ' ' << care_.right_fuel_gal << ' ' << care_.airframe_damage << ' ' << hours_ << '\n'
+        << route_.size() << '\n';
+    for (const auto &p : route_) out << std::quoted(p.label) << ' ' << p.lat << ' ' << p.lon << '\n';
+    out << care_.oil_quarts << ' ' << care_.oil_hours << ' ' << care_.battery_soc << ' '
+        << care_.spark_fouling << ' ' << care_.shock_cooling << ' ' << care_.cylinder_wear << ' '
+        << care_.tire_wear << ' ' << care_.brake_wear << ' ' << care_.gear_alignment << ' '
+        << care_.prop_nicks << ' ' << care_.windshield_dirt << ' ' << care_.sump_water << '\n'
+        << (care_.chocks_on ? 1 : 0) << ' ' << (care_.pitot_cover_on ? 1 : 0) << ' ' << (care_.tie_downs_on ? 1 : 0) << ' '
+        << (care_.master_on ? 1 : 0) << ' ' << (care_.avionics_on ? 1 : 0) << ' ' << care_.magnetos << ' '
+        << care_.fuel_selector << ' ' << care_.mixture << ' ' << care_.flaps_deg << ' ' << care_.carb_heat << ' '
+        << (care_.engine_running ? 1 : 0) << '\n'
+        << (has_custom_park_ ? 1 : 0) << ' ' << parking_spot_.lat << ' ' << parking_spot_.lon << ' ' << parking_spot_.heading << '\n'
+        << last_park_epoch_ << ' ' << total_landings_ << ' ' << best_landing_fpm_ << '\n'
+        << passport_.size() << '\n';
+    for (const auto &s : passport_)
+        out << std::quoted(s.airport_id) << ' ' << s.visits << ' ' << s.best_fpm << '\n';
+    out << logbook_.size() << '\n';
+    for (const auto &e : logbook_)
+        out << std::quoted(e.dep_id) << ' ' << std::quoted(e.arr_id) << ' ' << std::quoted(e.grade) << ' '
+            << e.minutes << ' ' << e.distance_nm << ' ' << e.fuel_gal << ' ' << e.touchdown_fpm << ' ' << e.crosswind_kt << '\n';
+    out.close();
+    if (out) std::filesystem::rename(temp, path, ec);
+    if (ec || !out) std::filesystem::remove(temp, ec);
+}
+
+const AirportInfo *GameFrontend::parked_airport() const {
+    return parked_id_.empty() ? nullptr : pack_->find_airport(parked_id_);
+}
+
+const AirportInfo *GameFrontend::home_airport() const {
+    if (const auto *home = pack_->find_airport("ES-0205")) return home;
+    return pack_->find_airport("LECS");
+}
+
+bool GameFrontend::is_full_service_airport(const std::string &id) const {
+    return id == "ES-0205" || id == "LECS" || id == "LECI" || id == "LEHC" || id == "LEZG";
+}
+
+GameFrontend::PassportStamp *GameFrontend::find_stamp(const std::string &id) {
+    for (auto &s : passport_) if (s.airport_id == id) return &s;
+    return nullptr;
+}
+
+const GameFrontend::PassportStamp *GameFrontend::find_stamp(const std::string &id) const {
+    for (const auto &s : passport_) if (s.airport_id == id) return &s;
+    return nullptr;
+}
+
+const AirportInfo *GameFrontend::suggest_vfr_outing() const {
+    const auto *parked = parked_airport();
+    if (!parked) return nullptr;
+    const AirportInfo *best = nullptr;
+    double best_score = -1e9;
+    const int day_seed = static_cast<int>(std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()) / 86400);
+    for (size_t i = 0; i < pack_->airports().size(); ++i) {
+        const auto &ap = pack_->airports()[i];
+        if (ap.id == parked->id) continue;
+        const double dist_nm = nspain::haversine_m(parked->lat, parked->lon, ap.lat, ap.lon) / nm_m;
+        if (dist_nm < 8.0 || dist_nm > 130.0) continue;
+        // Prefer unvisited airfields in a pleasant 15..85 NM VFR range, rotated daily
+        double score = find_stamp(ap.id) ? 0.0 : 40.0;
+        score -= std::abs(dist_nm - 42.0) * 0.45;
+        score += static_cast<double>((static_cast<int>(i) * 17 + day_seed * 13) % 19);
+        if (score > best_score) { best_score = score; best = &ap; }
+    }
+    return best;
+}
+
+GameFrontend::Request GameFrontend::take_request() {
+    return std::exchange(request_, Request::None);
+}
+
+void GameFrontend::focus_airport(const AirportInfo &airport, float zoom) {
+    selected_id_ = airport.id;
+    globe_lat_ = airport.lat;
+    globe_lon_ = airport.lon;
+    globe_zoom_ = zoom;
+}
+
+void GameFrontend::add_point(RoutePoint point) {
+    if (route_.size() >= max_points) {
+        status_ = "Route is full. Remove a waypoint first.";
+        return;
+    }
+    if (!route_.empty() && nspain::haversine_m(route_.back().lat, route_.back().lon, point.lat, point.lon) < 30) return;
+    route_.push_back(std::move(point));
+    route_page_ = static_cast<int>((route_.size() - 1) / 5);
+    status_.clear();
+    save_profile();
+}
+
+namespace {
+} // namespace
+
+void GameFrontend::open_airport(const AirportInfo &ap, const LocalAirSample *parked_weather) {
+    double mlat, mlon;
+    nspain::meters_per_degree(ap.lat, mlat, mlon);
+    const bool valid_custom_park = has_custom_park_ && parked_id_ == ap.id &&
+        nspain::haversine_m(parking_spot_.lat, parking_spot_.lon, ap.lat, ap.lon) <= 2500.0;
+    if (!valid_custom_park) {
+        if (parked_id_ == ap.id) has_custom_park_ = false;
+        const auto stands = pack_->compute_parking_stands(ap, 1);
+        const ParkingStand &st = stands.front();
+        // C172 exterior GLB tires reach -1.358 m below origin; clear the highest of all 3 wheel footprints.
+        parking_spot_ = {st.lat, st.lon, sample_aircraft_ground(*pack_, st.lat, st.lon, st.heading_deg) + 1.38, st.heading_deg, 0};
+    }
+
+    // Apply real-time parked exposure (battery drain if Master left on, rain/dew sumps, untied wind wear)
+    const int64_t now_epoch = static_cast<int64_t>(std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()));
+    walk_notice_.clear();
+    if (parked_id_ == ap.id && last_park_epoch_ > 0 && now_epoch > last_park_epoch_ + 120) {
+        const double gap_hr = std::min(24.0, static_cast<double>(now_epoch - last_park_epoch_) / 3600.0);
+        if (care_.master_on) {
+            care_.battery_soc = std::max(0.02, care_.battery_soc - gap_hr * 0.18);
+            walk_notice_ = "Master switch was left ON while parked - battery drained!";
+        }
+        if (parked_weather) {
+            const double wind_kt = std::hypot(parked_weather->wind_east_mps, parked_weather->wind_north_mps) * 1.94384;
+            if ((parked_weather->precipitation_mm_hr > 0.25 || parked_weather->relative_humidity > 0.84) && gap_hr > 0.25) {
+                care_.sump_water = std::min(1.0, care_.sump_water + 0.28);
+                care_.windshield_dirt = std::min(1.0, care_.windshield_dirt + 0.18);
+                if (walk_notice_.empty()) walk_notice_ = "Moisture while parked - drain wing fuel sumps.";
+            }
+            if (!care_.tie_downs_on && wind_kt > 16.0) {
+                care_.airframe_damage = std::min(0.65, care_.airframe_damage + 0.06);
+                walk_notice_ = "Gusty wind buffeted untied aircraft! Inspect tail & tie down.";
+            }
+        }
+        last_park_epoch_ = now_epoch;
+        save_profile();
+    } else if (parked_weather) {
+        const double wind_kt = std::hypot(parked_weather->wind_east_mps, parked_weather->wind_north_mps) * 1.94384;
+        if (parked_weather->precipitation_mm_hr > 0.5 && care_.sump_water < 0.25)
+            care_.sump_water = std::min(1.0, care_.sump_water + 0.20);
+        if (parked_weather->oat_c < 6.0)
+            walk_notice_ = "Cold air outside - prime engine and warm oil before full power.";
+        else if (wind_kt > 16.0 && !care_.tie_downs_on)
+            walk_notice_ = "Strong gusts (>16 kt) - use wing tie-downs when leaving aircraft.";
+    }
+    remote_fuel_added_ = 0.0;
+    for (bool &c : walk_checked_) c = false;
+
+    const double walk_angle = (parking_spot_.heading - 55.0) * DEG2RAD_D;
+    walker_.lat = parking_spot_.lat + 10.5 * std::cos(walk_angle) / mlat;
+    walker_.lon = parking_spot_.lon + 10.5 * std::sin(walk_angle) / mlon;
+    walker_.alt = pack_->sample_elevation(walker_.lat, walker_.lon) + 1.68;
+    walker_.heading = bearing(walker_.lat, walker_.lon, parking_spot_.lat, parking_spot_.lon);
+    walker_.pitch = -4;
+    walking_ = true;
+    inspecting_ = false;
+    status_.clear();
+}
+
+float GameFrontend::distance_to_plane() const {
+    return static_cast<float>(nspain::haversine_m(walker_.lat, walker_.lon, parking_spot_.lat, parking_spot_.lon));
+}
+
+GameFrontend::WalkStation GameFrontend::nearest_walk_station(float &out_dist_m) const {
+    double mlat, mlon;
+    nspain::meters_per_degree(parking_spot_.lat, mlat, mlon);
+    const double dn = (walker_.lat - parking_spot_.lat) * mlat;
+    const double de = (walker_.lon - parking_spot_.lon) * mlon;
+    const double hdg = parking_spot_.heading * DEG2RAD_D;
+    // Aircraft-local frame: fwd (+nose / -tail), right (+starboard / -port)
+    const double fwd = dn * std::cos(hdg) + de * std::sin(hdg);
+    const double right = de * std::cos(hdg) - dn * std::sin(hdg);
+    struct Pt { WalkStation st; double f, r; };
+    static constexpr Pt pts[] = {
+        {WalkStation::Nose,      +2.6,  0.0},
+        {WalkStation::LeftWing,  +0.2, -3.2},
+        {WalkStation::RightWing, +0.2, +3.2},
+        {WalkStation::Gear,      +0.6, +1.2},
+        {WalkStation::Gear,      +0.6, -1.2},
+        {WalkStation::Tail,      -3.8,  0.0},
+        {WalkStation::Door,      -0.4, -1.0},
+    };
+    WalkStation best = WalkStation::Door;
+    double best_d = 1e9;
+    for (const auto &p : pts) {
+        const double d = std::hypot(fwd - p.f, right - p.r);
+        if (d < best_d) { best_d = d; best = p.st; }
+    }
+    out_dist_m = static_cast<float>(best_d);
+    return best;
+}
+
+void GameFrontend::step_walk(const PlatformWindow &win, double dt) {
+    if (win.key_pressed(KEY_ESC)) {
+        if (inspecting_) inspecting_ = false;
+        else walking_ = false;
+        return;
+    }
+    if (win.key_pressed(KEY_E) && distance_to_plane() < 9.0f) {
+        if (!inspecting_) {
+            float sd = 0.0f;
+            active_station_ = nearest_walk_station(sd);
+            walk_checked_[static_cast<int>(active_station_)] = true;
+        }
+        inspecting_ = !inspecting_;
+    }
+    if (inspecting_) {
+        read_pointer(win);
+        if ((!win.mouse_left_down() && !win.mouse_right_down()) || contains({1160, 145, 720, 795})) return;
+    }
+    if (win.mouse_left_down() || win.mouse_right_down()) {
+        walker_.heading = std::fmod(walker_.heading + win.mouse_dx() * .19 + 360.0, 360.0);
+        walker_.pitch = std::clamp(walker_.pitch - win.mouse_dy() * .16, -75.0, 75.0);
+    }
+    if (inspecting_) return;
+    walker_.heading = std::fmod(walker_.heading +
+        (int(win.key_down(KEY_RIGHT)) - int(win.key_down(KEY_LEFT))) * 80.0 * dt + 360.0, 360.0);
+    walker_.pitch = std::clamp(walker_.pitch +
+        (int(win.key_down(KEY_UP)) - int(win.key_down(KEY_DOWN))) * 65.0 * dt, -75.0, 75.0);
+    const int f = int(win.key_down(KEY_W)) - int(win.key_down(KEY_S));
+    const int s = int(win.key_down(KEY_D)) - int(win.key_down(KEY_A));
+    if (!f && !s) return;
+    const double travel = dt * (win.key_down(KEY_SHIFT) ? 3.2 : 1.65) / std::hypot(f, s);
+    const double angle = walker_.heading * DEG2RAD_D;
+    double mlat, mlon;
+    nspain::meters_per_degree(walker_.lat, mlat, mlon);
+    const double lat = walker_.lat + (f * std::cos(angle) - s * std::sin(angle)) * travel / mlat;
+    const double lon = walker_.lon + (f * std::sin(angle) + s * std::cos(angle)) * travel / mlon;
+    const double dist = nspain::haversine_m(lat, lon, parking_spot_.lat, parking_spot_.lon);
+    if (dist > 180 || (dist < 1.9 && dist < distance_to_plane()) || pack_->is_near_building(lat, lon, 0.3)) return;
+    walker_.lat = lat;
+    walker_.lon = lon;
+    walker_.alt = pack_->sample_elevation(lat, lon) + 1.68;
+}
+
+void GameFrontend::board(AircraftAndHud &aircraft, double ambient_temp_c) {
+    walking_ = inspecting_ = false;
+    flight_active_ = true;
+    was_grounded_ = true;
+    active_leg_ = 0;
+    dep_airport_id_ = parked_id_;
+    flight_elapsed_s_ = flight_airborne_total_s_ = flight_dist_m_ = 0.0;
+    flight_start_fuel_ = care_.left_fuel_gal + care_.right_fuel_gal;
+    prev_lat_ = parking_spot_.lat;
+    prev_lon_ = parking_spot_.lon;
+    save_elapsed_ = last_sink_ = airborne_seconds_ = 0.0;
+    last_g_ = 1.0;
+    has_touchdown_ = false;
+    td_banner_s_ = 0.0;
+    // Open the Systems & Checklist Kneeboard automatically if boarding cold-and-dark so startup is crystal clear
+    kneeboard_open_ = !care_.engine_running;
+    // Always board at the parked location; taxi manually to the runway for departure.
+    aircraft.start_owned_flight(parking_spot_.lat, parking_spot_.lon, parking_spot_.alt,
+        parking_spot_.heading, care_, ambient_temp_c, false);
+}
+
+bool GameFrontend::can_park(const AircraftAndHud &aircraft) const {
+    if (!flight_active_ || !aircraft.jsb_state().on_ground || aircraft.state().speed_mps > 1.8 ||
+        aircraft.state().slew_fast) return false;
+    // Must taxi clear of the active runway before parking and stepping outside.
+    double re = 0.0, mu = 0.0, rough = 0.0;
+    std::string rid;
+    if (pack_->query_runway(aircraft.state().lat_deg, aircraft.state().lon_deg, re, mu, rough, rid))
+        return false;
+    double distance = 0;
+    return pack_->find_nearest_airport(aircraft.state().lat_deg, aircraft.state().lon_deg, &distance) && distance <= 900.0;
+}
+
+void GameFrontend::park(AircraftAndHud &aircraft, const AirportInfo &airport) {
+    aircraft.sync_care_snapshot(care_);
+    flight_active_ = false;
+    kneeboard_open_ = false;
+    parked_id_ = airport.id;
+    last_park_epoch_ = static_cast<int64_t>(std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()));
+
+    // Log completed flight & stamp the Aragon Airfield Passport if the aircraft actually flew
+    if (flight_airborne_total_s_ >= 10.0) {
+        FlightLogEntry entry;
+        entry.dep_id = dep_airport_id_.empty() ? airport.id : dep_airport_id_;
+        entry.arr_id = airport.id;
+        entry.grade = has_touchdown_ ? td_grade_ : "LOGGED";
+        entry.minutes = std::max(1.0, flight_elapsed_s_ / 60.0);
+        entry.distance_nm = flight_dist_m_ / nm_m;
+        entry.fuel_gal = std::max(0.0, flight_start_fuel_ - (care_.left_fuel_gal + care_.right_fuel_gal));
+        entry.touchdown_fpm = has_touchdown_ ? td_fpm_ : 0.0;
+        entry.crosswind_kt = has_touchdown_ ? td_xwind_kt_ : 0.0;
+        logbook_.insert(logbook_.begin(), entry);
+        if (logbook_.size() > 20) logbook_.resize(20);
+
+        PassportStamp *st = find_stamp(airport.id);
+        if (!st) {
+            passport_.push_back({airport.id, 0, 9999.0});
+            st = &passport_.back();
+        }
+        st->visits += 1;
+        if (has_touchdown_ && td_fpm_ > 0.0 && td_fpm_ < st->best_fpm) st->best_fpm = td_fpm_;
+    }
+
+    // Keep the aircraft right where the pilot taxied and parked it (no teleporting).
+    const auto &s = aircraft.state();
+    parking_spot_ = {s.lat_deg, s.lon_deg, sample_aircraft_ground(*pack_, s.lat_deg, s.lon_deg, s.heading_deg) + 1.38, s.heading_deg, 0};
+    has_custom_park_ = true;
+    focus_airport(airport, 30.0f);
+    page_ = Page::World;
+    aircraft.state().menu_open = aircraft.state().paused = true;
+    open_airport(airport, &aircraft.last_air());
+    save_profile();
+}
+
+void GameFrontend::step_flight(AircraftAndHud &aircraft, double dt) {
+    if (!flight_active_) return;
+    aircraft.sync_care_snapshot(care_);
+    if (aircraft.state().paused || aircraft.state().slew_fast) return;
+
+    flight_elapsed_s_ += dt;
+    if (td_banner_s_ > 0.0) td_banner_s_ = std::max(0.0, td_banner_s_ - dt);
+    if (aircraft.systems_.is_engine_running()) hours_ += dt / 3600.0;
+
+    const auto &flight = aircraft.jsb_state();
+    const double step_m = nspain::haversine_m(prev_lat_, prev_lon_, flight.lat_deg, flight.lon_deg);
+    if (step_m < 500.0) flight_dist_m_ += step_m;
+    prev_lat_ = flight.lat_deg;
+    prev_lon_ = flight.lon_deg;
+
+    // Feed live VFR route waypoint bearing directly into the cockpit Autopilot NAV bus!
+    if (active_leg_ < route_.size()) {
+        const auto &wp = route_[active_leg_];
+        aircraft.state().ap_nav_brg_deg = bearing(flight.lat_deg, flight.lon_deg, wp.lat, wp.lon);
+        aircraft.state().ap_nav_valid = true;
+    } else {
+        aircraft.state().ap_nav_valid = false;
+    }
+
+    // Surface-aware wear during ground roll (gravel/rough grass wear tires & nick prop at high RPM)
+    if (flight.on_ground) {
+        double re = 0.0, mu = 0.0, rough = 0.12;
+        std::string rid;
+        const bool on_rwy = pack_->query_runway(flight.lat_deg, flight.lon_deg, re, mu, rough, rid);
+        const double spd = flight.ground_speed_mps;
+        if (spd > 2.0) {
+            const double surf_mult = on_rwy ? (0.4 + rough * 3.0) : 2.2;
+            care_.tire_wear = std::min(1.0, care_.tire_wear + spd * surf_mult * 0.000018 * dt);
+            if ((aircraft.state().parking_brake || aircraft.fdm_.controls().brake_left > 0.2) && spd > 3.0)
+                care_.brake_wear = std::min(1.0, care_.brake_wear + spd * 0.00012 * dt);
+            if (flight.rpm > 1800.0 && (rough > 0.14 || !on_rwy))
+                care_.prop_nicks = std::min(1.0, care_.prop_nicks + 0.00035 * dt);
+        }
+    } else {
+        flight_airborne_total_s_ += dt;
+        // Bugs & rain slowly build windshield grime in flight
+        if (flight.agl_m < 600.0 || aircraft.last_air().precipitation_mm_hr > 0.2)
+            care_.windshield_dirt = std::min(1.0, care_.windshield_dirt + 0.00012 * dt);
+    }
+
+    // Touchdown detection, debrief grading & realistic gear/tire/airframe consequences
+    if (flight.on_ground && !was_grounded_ && airborne_seconds_ > 2.0) {
+        const double sink_mps = std::abs(std::min(0.0, last_sink_));
+        const double fpm = sink_mps * 196.8504;
+        const double hdg = flight.heading_deg * DEG2RAD_D;
+        const double xwind_mps = std::abs(aircraft.last_air().wind_east_mps * std::cos(hdg) -
+                                          aircraft.last_air().wind_north_mps * std::sin(hdg));
+        td_fpm_ = fpm;
+        td_xwind_kt_ = xwind_mps * 1.94384;
+        td_g_ = std::max(1.0, last_g_);
+
+        std::string rid;
+        double re = 0.0, mu = 0.0, rough = 0.0;
+        const bool on_rwy = pack_->query_runway(flight.lat_deg, flight.lon_deg, re, mu, rough, rid);
+        const AirportInfo *ap = pack_->find_nearest_airport(flight.lat_deg, flight.lon_deg, nullptr);
+        td_surface_ = (on_rwy && ap && !ap->surface.empty()) ? ap->surface : (on_rwy ? "runway" : "off-field");
+        if (fpm < 120.0) td_grade_ = "GREASED";
+        else if (fpm < 240.0) td_grade_ = "SMOOTH";
+        else if (fpm < 420.0) td_grade_ = "FIRM";
+        else td_grade_ = "HARD - INSPECT GEAR";
+
+        has_touchdown_ = true;
+        td_banner_s_ = 14.0;
+        total_landings_ += 1;
+        if (fpm < best_landing_fpm_) best_landing_fpm_ = fpm;
+
+        // Hard or off-field touchdowns wear tires, knock gear alignment, and damage airframe
+        if (sink_mps > 2.0 || !on_rwy) {
+            const double excess = std::max(0.0, sink_mps - 2.0) + (on_rwy ? 0.0 : 0.8);
+            care_.tire_wear = std::min(1.0, care_.tire_wear + excess * 0.08);
+            const double pull_dir = (flight.roll_deg >= 0.0) ? 1.0 : -1.0;
+            care_.gear_alignment = std::clamp(care_.gear_alignment + pull_dir * excess * 0.14, -1.0, 1.0);
+        }
+        if (sink_mps > 3.0) {
+            care_.airframe_damage = std::min(1.0, care_.airframe_damage + (sink_mps - 3.0) * 0.10);
+        }
+    }
+
+    airborne_seconds_ = flight.on_ground ? 0.0 : airborne_seconds_ + dt;
+    if (aircraft.systems_.has_overtemp_failure() || aircraft.systems_.has_oil_starvation_failure())
+        care_.airframe_damage = std::max(care_.airframe_damage, 0.85);
+
+    aircraft.damage_ = care_.airframe_damage;
+    aircraft.tire_wear_ = care_.tire_wear;
+    aircraft.brake_wear_ = care_.brake_wear;
+    aircraft.gear_alignment_ = care_.gear_alignment;
+    aircraft.prop_nicks_ = care_.prop_nicks;
+    aircraft.windshield_dirt_ = care_.windshield_dirt;
+
+    was_grounded_ = flight.on_ground;
+    last_sink_ = flight.vsi_mps;
+    last_g_ = flight.g_load;
+    if (active_leg_ < route_.size()) {
+        const auto &p = route_[active_leg_];
+        if (nspain::haversine_m(flight.lat_deg, flight.lon_deg, p.lat, p.lon) < 650.0) ++active_leg_;
+    }
+    save_elapsed_ += dt;
+    if (save_elapsed_ >= 15.0) {
+        save_profile();
+        save_elapsed_ = 0.0;
+    }
+}
+
+void GameFrontend::read_pointer(const PlatformWindow &win) {
+    const auto v = win.presentation_rect(w, h);
+    pointer_ = {float(win.mouse_x() - v.x) * w / std::max(1, v.w),
+                float(win.mouse_y() - v.y) * h / std::max(1, v.h)};
+    click_ = win.mouse_left_clicked();
+}
+
+bool GameFrontend::contains(PixelRect area) const {
+    return inside(area, pointer_);
+}
+
+void GameFrontend::label(AircraftAndHud &ui, float x, float y, float size, const char *value, bool muted) {
+    const float scale = size / 52.0f;
+    const float color = muted ? .70f : .95f;
+    for (const auto *p = reinterpret_cast<const unsigned char *>(value); *p; ++p) {
+        int ch = *p;
+        if (ch == 0xc3 && p[1] >= 0x80 && p[1] <= 0xbf) ch = 0xc0 + (*++p - 0x80);
+        const int i = ch < 127 && ch >= 32 ? ch - 32 : ch >= 192 && ch <= 255 ? 95 + ch - 192 : '?' - 32;
+        if (ch != ' ') {
+            const float u = (i % 16) / 16.0f, v = (i / 16) / 10.0f;
+            const float x0 = x - 3 * scale, y0 = y - 6 * scale;
+            const float x1 = x0 + 64 * scale, y1 = y0 + 72 * scale;
+            const auto quad = [&](float px, float py, float tu, float tv) {
+                return AircraftAndHud::HudVert{px, py, tu, tv, color, color + .025f, color + .04f, 1};
+            };
+            const auto a = quad(x0,y0,u,v), b = quad(x1,y0,u+1.0f/16,v);
+            const auto c = quad(x1,y1,u+1.0f/16,v+.1f), d = quad(x0,y1,u,v+.1f);
+            ui.hud_verts_.insert(ui.hud_verts_.end(), {a,b,c,a,c,d});
+        }
+        x += frontend_glyph_advance[i] * scale;
+    }
+}
+
+void GameFrontend::panel(AircraftAndHud &ui, PixelRect a) {
+    ui.hud_rect(a.x, a.y, a.w, a.h, .047f, .078f, .108f, .97f);
+    ui.hud_border(a.x, a.y, a.w, a.h, 1, .24f, .35f, .42f, .83f);
+}
+
+bool GameFrontend::button(AircraftAndHud &ui, PixelRect a, const char *value, bool enabled, bool selected) {
+    const bool hover = enabled && contains(a);
+    if (hover || (selected && enabled)) ui.hud_rect(a.x, a.y, a.w, a.h, .11f, .28f, .31f, 1);
+    else ui.hud_rect(a.x, a.y, a.w, a.h, .074f, .122f, .155f, 1);
+    ui.hud_border(a.x, a.y, a.w, a.h, 1, selected ? .37f : .25f, selected ? .78f : .42f, .48f, enabled ? .85f : .35f);
+    label(ui, a.x + 13, a.y + (a.h - 18) * .5f, 18, value, !enabled);
+    if (!hover || !click_) return false;
+    click_ = false;
+    return true;
+}
+
+void GameFrontend::draw_globe() {
+    const PixelRect a = map_area;
+    glViewport(a.x, h - a.y - a.h, a.w, a.h);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_BLEND);
+    glUseProgram(backdrop_);
+    glUniform4f(relief_bounds_uniform_, relief_bounds_.x, relief_bounds_.y, relief_bounds_.z, relief_bounds_.w);
+    glUniform1i(region_count_uniform_, region_count_);
+    glUniform1f(aspect_uniform_, float(a.w) / a.h);
+    glUniform3f(globe_uniform_, float(globe_lat_ * DEG2RAD_D), float(globe_lon_ * DEG2RAD_D), globe_radius * globe_zoom_);
+    glBindTextureUnit(0, land_);
+    glBindTextureUnit(1, relief_);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, bounds_);
+    glBindVertexArray(vao_);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glBindVertexArray(0);
+}
+
+void GameFrontend::draw_menu(AircraftAndHud &aircraft, SkyAndClouds &sky, const PlatformWindow &win,
+                             bool preparing_airfield, int &time_of_day,
+                             RegionalAtmosphere *reg_atmo, double sim_time_sec) {
+    read_pointer(win);
+    sky.begin_native_cockpit_pass();
+    glClearColor(.029f, .049f, .072f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    aircraft.hud_verts_.clear();
+    aircraft.hud_rect(0, 0, w, 82, .048f, .079f, .106f, 1);
+    aircraft.hud_rect(0, 81, w, 1, .24f, .35f, .42f, .78f);
+    label(aircraft, 64, 27, 26, "OpenSky VFR");
+    if (button(aircraft, {380, 17, 130, 48}, "World", true, page_ == Page::World)) page_ = Page::World;
+    if (button(aircraft, {520, 17, 152, 48}, "Logbook", true, page_ == Page::Logbook)) page_ = Page::Logbook;
+    if (button(aircraft, {682, 17, 140, 48}, "Settings", true, page_ == Page::Settings)) page_ = Page::Settings;
+    if (button(aircraft, {832, 17, 140, 48}, "Controls", true, page_ == Page::Controls)) page_ = Page::Controls;
+    if (button(aircraft, {1582, 17, 160, 48}, "World editor")) request_ = Request::Editor;
+    if (button(aircraft, {1754, 17, 102, 48}, "Quit")) request_ = Request::Quit;
+    if (flight_active_) {
+        if (button(aircraft, {1070, 17, 174, 48}, "Resume flight", true, true) || win.key_pressed(KEY_ESC))
+            aircraft.st_.menu_open = aircraft.st_.paused = false;
+        const bool park_ok = can_park(aircraft);
+        double re = 0.0, mu = 0.0, rough = 0.0;
+        std::string rid;
+        const bool on_rwy = aircraft.jsb_state().on_ground &&
+                            pack_->query_runway(aircraft.state().lat_deg, aircraft.state().lon_deg, re, mu, rough, rid);
+        if (button(aircraft, {1256, 17, 306, 48},
+                   on_rwy ? "Taxi off runway to park" : "Park and step outside", park_ok))
+            request_ = Request::Park;
+    }
+    if (preparing_airfield) {
+        panel(aircraft, {640, 444, 640, 164});
+        label(aircraft, 668, 474, 36, "Preparing the airfield");
+        label(aircraft, 668, 536, 20, "Loading ground detail around your parking spot.", true);
+    } else if (page_ == Page::World) draw_world(aircraft, win, reg_atmo, &sky.atmo(), sim_time_sec);
+    else if (page_ == Page::Logbook) draw_logbook(aircraft);
+    else if (page_ == Page::Settings) draw_settings(aircraft, time_of_day, reg_atmo);
+    else draw_controls(aircraft);
+    glViewport(0, 0, w, h);
+    aircraft.flush_hud(w, h, font_);
+}
+
+void GameFrontend::draw_world(AircraftAndHud &ui, const PlatformWindow &win,
+                              const RegionalAtmosphere *reg_atmo, const AtmosphereState *atmo, double sim_time_sec) {
+    label(ui, 64, 111, 44, "World");
+    label(ui, 66, 166, 21, "Inspect your Skyhawk, check live regional winds, and plan a VFR leg.", true);
+    char line[192];
+    std::snprintf(line, sizeof(line), "%zu installed region%s  |  Passport %zu / %zu airfields",
+                  pack_->regions().size(), pack_->regions().size() == 1 ? "" : "s",
+                  passport_.size(), pack_->airports().size());
+    label(ui, 790, 168, 18, line, true);
+
+    const auto *parked = parked_airport();
+    if (button(ui, {64, 986, 149, 47}, "Globe view")) globe_zoom_ = 1.0f;
+    if (button(ui, {225, 986, 194, 47}, "Find aircraft", parked)) {
+        focus_airport(*parked, 90.0f);
+        airport_page_ = 0;
+    }
+    if (button(ui, {431, 986, 62, 47}, "-")) globe_zoom_ = std::max(1.0f, globe_zoom_ / 1.8f);
+    if (button(ui, {505, 986, 62, 47}, "+")) globe_zoom_ = std::min(180.0f, globe_zoom_ * 1.8f);
+    if (button(ui, {579, 986, 235, 47}, add_waypoint_ ? "Cancel map point" : "Add map point", !flight_active_, add_waypoint_))
+        add_waypoint_ = !add_waypoint_;
+    label(ui, 837, 1000, 16, add_waypoint_ ? "Click inside installed terrain" : "Drag to move the globe", true);
+    if (win.key_pressed(KEY_ESC)) add_waypoint_ = false;
+
+    if (!win.mouse_left_down()) map_dragging_ = false;
+    if (map_dragging_ && !win.mouse_left_clicked()) {
+        const double scale = .19 / globe_zoom_;
+        globe_lat_ = std::clamp(globe_lat_ + win.mouse_dy() * scale, -88.0, 88.0);
+        const double lon_scale = scale / std::max(.21, std::cos(globe_lat_ * DEG2RAD_D));
+        globe_lon_ = std::remainder(globe_lon_ - win.mouse_dx() * lon_scale, 360.0);
+    }
+
+    GlobeProjection projection(globe_lat_, globe_lon_, globe_zoom_);
+    draw_globe();
+    ui.hud_border(map_area.x, map_area.y, map_area.w, map_area.h, 1, .29f, .42f, .50f, .8f);
+
+    if (parked) {
+        Vec3 from = globe_xyz(parked->lat, parked->lon);
+        for (const auto &p : route_) {
+            Vec3 to = globe_xyz(p.lat, p.lon);
+            const float angle = std::acos(std::clamp(dot(from, to), -1.0f, 1.0f));
+            const float sin_angle = std::sin(angle);
+            auto previous = projection.project(from);
+            const int segments = std::clamp(int(angle * projection.radius / 6.0f), 4, 256);
+            for (int i = 1; i <= segments; ++i) {
+                const float t = float(i) / segments;
+                Vec3 sample = (sin_angle > .0001f)
+                    ? (from * std::sin((1-t)*angle) + to * std::sin(t*angle)) / sin_angle
+                    : normalize(from * (1-t) + to * t);
+                auto next = projection.project(sample);
+                if (previous && next && inside(map_area, *previous) && inside(map_area, *next))
+                    ui.hud_line(*previous, *next, 2.5f, {.98f, .70f, .33f});
+                previous = next;
+            }
+            if (previous && inside(map_area, *previous))
+                ui.hud_rect(previous->x-3, previous->y-3, 6, 6, .98f, .70f, .33f, 1);
+            from = to;
+        }
+    }
+
+    const AirportInfo *hit = nullptr;
+    float closest = 17.0f;
+    for (const auto &ap : pack_->airports()) {
+        const bool is_parked = parked && ap.id == parked->id;
+        const bool selected = ap.id == selected_id_;
+        if (globe_zoom_ < 8 && !is_parked && !selected) continue;
+        auto p = projection.project(globe_xyz(ap.lat, ap.lon));
+        if (!p || !inside({map_area.x+10, map_area.y+10, map_area.w-20, map_area.h-20}, *p)) continue;
+        const int radius = is_parked ? 7 : 4;
+        const bool stamped = find_stamp(ap.id) != nullptr;
+        ui.hud_rect(p->x-radius, p->y-radius, radius*2, radius*2, .05f, .13f, .15f, 1);
+        ui.hud_rect(p->x-radius+1, p->y-radius+1, (radius-1)*2, (radius-1)*2,
+            is_parked ? .96f : (stamped ? .32f : .40f),
+            is_parked ? .68f : (stamped ? .92f : .82f),
+            stamped ? .42f : .57f, 1);
+        if ((selected || is_parked) && p->x < map_area.x + map_area.w - 185) {
+            ui.hud_rect(p->x+9, p->y-13, is_parked ? 172 : 107, 24, .028f, .062f, .088f, .96f);
+            std::snprintf(line, sizeof(line), "%s%s", is_parked ? "C172S / " : "", ap.id.c_str());
+            label(ui, p->x+15, p->y-9, 15, line);
+        }
+        const float distance = std::hypot(p->x - pointer_.x, p->y - pointer_.y);
+        if (distance < closest) { closest = distance; hit = &ap; }
+    }
+    if (click_ && contains(map_area)) {
+        if (add_waypoint_ && !flight_active_) {
+            if (auto p = projection.unproject(pointer_)) {
+                const auto [lat,lon] = globe_geo(*p);
+                if (pack_->find_region_at(lat, lon)) {
+                    std::snprintf(line, sizeof(line), "Point %zu", route_.size() + 1);
+                    add_point({line, lat, lon});
+                    add_waypoint_ = false;
+                } else status_ = "This point is outside the installed scenery.";
+            }
+        } else if (hit) {
+            selected_id_ = hit->id;
+            if (globe_zoom_ < 8) focus_airport(*hit, 75.0f);
+        } else map_dragging_ = true;
+        click_ = false;
+    }
+
+    // Top-right: Parked Aircraft Ownership Card
+    panel(ui, {1292,225,564,218});
+    label(ui, 1318, 244, 17, flight_active_ ? "LAST PARKED AT" : "YOUR AIRCRAFT  (EC-VFR)", true);
+    label(ui, 1318, 270, 28, "Cessna 172S Skyhawk");
+    if (parked) {
+        const bool at_home = parked == home_airport();
+        std::snprintf(line, sizeof(line), "%s: %s", at_home ? "Home hangar" : "Temporary base",
+                      at_home ? "Castejón de Sos" : parked->name.c_str());
+        label(ui, 1318, 308, 18, line);
+    } else label(ui, 1318, 308, 18, parked_id_.empty()
+        ? "Install the region for Castejón de Sos."
+        : "Install the parked aircraft's region.", true);
+    std::snprintf(line, sizeof(line), "Fuel %.0f gal  |  Oil %.1f qt  |  Bat %.0f%%  |  %.1f hr",
+                  care_.left_fuel_gal + care_.right_fuel_gal, care_.oil_quarts,
+                  care_.battery_soc * 100.0, hours_);
+    label(ui, 1318, 339, 16, line, true);
+    std::snprintf(line, sizeof(line), "%s  |  %s%s",
+                  care_.engine_running ? "Engine running" : "Cold & dark",
+                  (care_.chocks_on || care_.tie_downs_on || care_.pitot_cover_on) ? "Secured outside" : "Ready to roll",
+                  care_.oil_hours >= 10.0 ? "  |  Oil change due" : "");
+    label(ui, 1318, 363, 15, line, true);
+    if (button(ui, {1318, 389, 512, 42}, "Enter airport on foot (Walkaround)", parked && !flight_active_, true))
+        request_ = Request::Walk;
+
+    // Middle-right: Installed Airfields + Live Local Weather Briefing
+    panel(ui, {1292,455,564,296});
+    label(ui, 1318, 471, 21, "Installed airfields");
+    const auto &airports = pack_->airports();
+    const int pages = std::max(1, (int(airports.size()) + 3) / 4);
+    if (button(ui, {1738,462,40,30}, "<", airport_page_ > 0)) --airport_page_;
+    if (button(ui, {1790,462,40,30}, ">", airport_page_+1 < pages)) ++airport_page_;
+    for (int i=0; i<4 && size_t(airport_page_*4+i)<airports.size(); ++i) {
+        const auto &ap = airports[airport_page_*4+i];
+        const bool stamped = find_stamp(ap.id) != nullptr;
+        std::snprintf(line, sizeof(line), "%s %-7s %.28s  (%.0fm)",
+                      stamped ? "*" : " ", ap.id.c_str(), ap.name.c_str(), ap.elev_m);
+        if (button(ui, {1318, 504+i*36, 512, 31}, line, true, ap.id == selected_id_))
+            focus_airport(ap, std::max(48.0f, globe_zoom_));
+    }
+    const auto *selected = pack_->find_airport(selected_id_);
+    if (selected) {
+        const double len_m = std::max(100.0, nspain::haversine_m(selected->rwy_lat_a, selected->rwy_lon_a,
+                                                                selected->rwy_lat_b, selected->rwy_lon_b));
+        const char *srf = selected->surface.empty() ? "strip" : selected->surface.c_str();
+        if (reg_atmo && atmo) {
+            const float wx_est = std::clamp((atmo->cloud_cov - 0.16f) / 0.78f, 0.0f, 1.0f);
+            const LocalAirSample wx = reg_atmo->sample_at(selected->lat, selected->lon, selected->elev_m + 10.0,
+                                                          atmo->sun_dir, sim_time_sec, wx_est);
+            const double w_kt = std::hypot(wx.wind_east_mps, wx.wind_north_mps) * 1.94384;
+            const int w_from = int(std::lround(std::fmod(std::atan2(-wx.wind_east_mps, -wx.wind_north_mps) * RAD2DEG_D + 360.0, 360.0))) % 360;
+            std::snprintf(line, sizeof(line), "%s %.0fm | %03d/%.0fkt | %.0fC | QNH %.0f | %s",
+                          srf, len_m, w_from, w_kt, wx.oat_c, wx.qnh_hpa,
+                          is_full_service_airport(selected->id) ? "Hangar" : "Field kit");
+        } else {
+            std::snprintf(line, sizeof(line), "Surface: %s  %.0fm  |  Elev %.0fm  |  %s",
+                          srf, len_m, selected->elev_m,
+                          is_full_service_airport(selected->id) ? "Full hangar" : "Remote strip");
+        }
+        label(ui, 1318, 656, 15, line, true);
+    }
+    if (button(ui, {1318, 692, 512, 38}, "Add selected airfield to route",
+               parked && selected && !flight_active_ && (selected != parked || !route_.empty())))
+        add_point({selected->id, selected->lat, selected->lon});
+
+    // Bottom-right: VFR Route + Today's VFR Outing
+    panel(ui, {1292,763,564,270});
+    double total = 0;
+    if (parked) {
+        double a = parked->lat, b = parked->lon;
+        for (const auto &p : route_) { total += nspain::haversine_m(a,b,p.lat,p.lon); a=p.lat; b=p.lon; }
+    }
+    std::snprintf(line, sizeof(line), "VFR route     %.1f NM", total / nm_m);
+    label(ui, 1318, 779, 21, line);
+    if (button(ui, {1738,770,40,30}, "<", route_page_ > 0)) --route_page_;
+    if (button(ui, {1790,770,40,30}, ">", (route_page_+1)*4 < int(route_.size()))) ++route_page_;
+    const AirportInfo *outing = suggest_vfr_outing();
+    if (route_.empty()) {
+        if (outing && parked) {
+            const double dist_nm = nspain::haversine_m(parked->lat, parked->lon, outing->lat, outing->lon) / nm_m;
+            const int brg = int(std::lround(bearing(parked->lat, parked->lon, outing->lat, outing->lon))) % 360;
+            label(ui, 1318, 820, 17, "Today's VFR outing:");
+            std::snprintf(line, sizeof(line), "%s (%s) - %.0f NM (%03d T)",
+                          outing->name.c_str(), outing->id.c_str(), dist_nm, brg);
+            label(ui, 1318, 850, 16, line, true);
+            std::snprintf(line, sizeof(line), "Elev %.0fm | %s%s",
+                          outing->elev_m, outing->surface.empty() ? "strip" : outing->surface.c_str(),
+                          find_stamp(outing->id) ? " (visited)" : " (new passport stamp!)");
+            label(ui, 1318, 878, 15, line, true);
+        } else {
+            label(ui, 1318, 828, 18, "Add an airfield or a visual waypoint.", true);
+        }
+    }
+    for (int i = 0; i < 4 && size_t(route_page_*4+i) < route_.size(); ++i) {
+        const int index = route_page_*4+i;
+        const auto &p = route_[index];
+        std::snprintf(line, sizeof(line), "%02d   %s    %+.3f  %+.3f", index+1, p.label.c_str(), p.lat, p.lon);
+        label(ui, 1320, 818+i*32, 16, line);
+        if (button(ui, {1784, 812+i*32, 46, 27}, "X", !flight_active_)) {
+            route_.erase(route_.begin()+index);
+            route_page_ = std::min(route_page_, route_.empty() ? 0 : int((route_.size()-1)/4));
+            save_profile();
+            break;
+        }
+    }
+    if (button(ui, {1318, 978, 150, 36}, "Clear route", !route_.empty() && !flight_active_)) {
+        route_.clear();
+        route_page_ = 0;
+        save_profile();
+    }
+    if (outing && button(ui, {1484, 978, 346, 36}, "Load today's VFR outing", !flight_active_)) {
+        route_.clear();
+        add_point({outing->id, outing->lat, outing->lon});
+        focus_airport(*outing, 55.0f);
+    }
+    if (!status_.empty()) label(ui, 67, 200, 16, status_.c_str());
+}
+
+void GameFrontend::draw_logbook(AircraftAndHud &ui) {
+    label(ui, 64, 111, 44, "Logbook & Passport");
+    label(ui, 66, 166, 21, "Your Cessna 172S maintenance ledger, flight log, and Aragon airfield stamps.", true);
+
+    char line[192];
+    // Left panel: Aircraft Maintenance Status + Flight Logbook
+    panel(ui, {64, 225, 930, 800});
+    label(ui, 92, 250, 26, "Aircraft Care & Maintenance (EC-VFR)");
+    std::snprintf(line, sizeof(line), "Engine Time: %.1f hr   |   Landings: %d   |   Best Touchdown: %s",
+                  hours_, total_landings_,
+                  best_landing_fpm_ < 9000.0 ? "" : "none yet");
+    if (best_landing_fpm_ < 9000.0) {
+        std::snprintf(line, sizeof(line), "Engine Time: %.1f hr   |   Landings: %d   |   Best Touchdown: %.0f fpm",
+                      hours_, total_landings_, best_landing_fpm_);
+    }
+    label(ui, 92, 294, 18, line, true);
+
+    const auto health_row = [&](int row, const char *left_txt, const char *right_txt) {
+        const int y = 336 + row * 34;
+        label(ui, 92, y, 17, left_txt);
+        label(ui, 540, y, 17, right_txt);
+    };
+    char rcol[96];
+    std::snprintf(line, sizeof(line), "Oil: %.1f / 8.0 qt  (%.1f / 10.0 hr)%s",
+                  care_.oil_quarts, care_.oil_hours, care_.oil_hours >= 10.0 ? "  DUE" : "");
+    std::snprintf(rcol, sizeof(rcol), "Battery (24V): %.0f%%", care_.battery_soc * 100.0);
+    health_row(0, line, rcol);
+
+    std::snprintf(line, sizeof(line), "Cylinders: %.0f%%  (shock wear %.0f%%)",
+                  (1.0 - care_.cylinder_wear) * 100.0, care_.shock_cooling * 100.0);
+    std::snprintf(rcol, sizeof(rcol), "Spark Plugs: %.0f%% clean", (1.0 - care_.spark_fouling) * 100.0);
+    health_row(1, line, rcol);
+
+    std::snprintf(line, sizeof(line), "Airframe: %.0f%%   |   Propeller: %.0f%%",
+                  (1.0 - care_.airframe_damage) * 100.0, (1.0 - care_.prop_nicks) * 100.0);
+    std::snprintf(rcol, sizeof(rcol), "Fuel Sumps: %s", care_.sump_water > 0.12 ? "WATER DETECTED" : "Clear");
+    health_row(2, line, rcol);
+
+    std::snprintf(line, sizeof(line), "Tires: %.0f%%   |   Brakes: %.0f%%",
+                  (1.0 - care_.tire_wear) * 100.0, (1.0 - care_.brake_wear) * 100.0);
+    std::snprintf(rcol, sizeof(rcol), "Gear Align: %s",
+                  std::abs(care_.gear_alignment) < 0.08 ? "True" : (care_.gear_alignment > 0 ? "Pulls Right" : "Pulls Left"));
+    health_row(3, line, rcol);
+
+    std::snprintf(line, sizeof(line), "Secured: Chocks %s | Pitot %s | Tie-downs %s",
+                  care_.chocks_on ? "ON" : "off",
+                  care_.pitot_cover_on ? "COVERED" : "clear",
+                  care_.tie_downs_on ? "TIED" : "off");
+    label(ui, 92, 478, 16, line, true);
+
+    ui.hud_rect(92, 514, 874, 1, .21f, .32f, .39f, .85f);
+    label(ui, 92, 534, 24, "Recent Flights");
+    if (logbook_.empty()) {
+        label(ui, 92, 584, 18, "No completed flights logged yet.", true);
+        label(ui, 92, 618, 17, "Take off, land at any Aragon strip, taxi clear of the runway, and park to log a leg.", true);
+    } else {
+        label(ui, 92, 574, 15, "ROUTE                  TIME     DIST     FUEL    TOUCHDOWN        GRADE", true);
+        for (size_t i = 0; i < logbook_.size() && i < 11; ++i) {
+            const auto &e = logbook_[i];
+            std::snprintf(line, sizeof(line), "%-7s -> %-7s   %4.0fm   %5.1fNM  %4.1fgal  %4.0f fpm (%2.0fkt)  %s",
+                          e.dep_id.c_str(), e.arr_id.c_str(), e.minutes, e.distance_nm,
+                          e.fuel_gal, e.touchdown_fpm, e.crosswind_kt, e.grade.c_str());
+            label(ui, 92, 606 + static_cast<float>(i) * 35.0f, 16, line);
+        }
+    }
+
+    // Right panel: Aragon Airfield Passport
+    panel(ui, {1020, 225, 836, 800});
+    const auto &airports = pack_->airports();
+    std::snprintf(line, sizeof(line), "Aragon Airfield Passport   (%zu / %zu visited)",
+                  passport_.size(), airports.size());
+    label(ui, 1048, 250, 25, line);
+    const int per_page = 12;
+    const int pages = std::max(1, (int(airports.size()) + per_page - 1) / per_page);
+    if (button(ui, {1738, 246, 40, 32}, "<", passport_page_ > 0)) --passport_page_;
+    if (button(ui, {1790, 246, 40, 32}, ">", passport_page_ + 1 < pages)) ++passport_page_;
+    label(ui, 1048, 294, 15, "Click any airfield to focus it on the World map.  * = Visited & Parked", true);
+
+    for (int i = 0; i < per_page && size_t(passport_page_ * per_page + i) < airports.size(); ++i) {
+        const auto &ap = airports[passport_page_ * per_page + i];
+        const PassportStamp *st = find_stamp(ap.id);
+        const char *srf = ap.surface.empty() ? "strip" : ap.surface.c_str();
+        if (st) {
+            std::snprintf(line, sizeof(line), "* %-7s %-26.26s  %-7s %4.0fm | %dx  best %.0f fpm",
+                          ap.id.c_str(), ap.name.c_str(), srf, ap.elev_m, st->visits,
+                          st->best_fpm < 9000.0 ? st->best_fpm : 0.0);
+        } else {
+            std::snprintf(line, sizeof(line), "  %-7s %-26.26s  %-7s %4.0fm | unvisited",
+                          ap.id.c_str(), ap.name.c_str(), srf, ap.elev_m);
+        }
+        if (button(ui, {1048, 334 + i * 54, 780, 44}, line, true, st != nullptr)) {
+            focus_airport(ap, 65.0f);
+            page_ = Page::World;
+        }
+    }
+}
+
+void GameFrontend::draw_settings(AircraftAndHud &ui, int &time_of_day, RegionalAtmosphere *reg_atmo) {
+    label(ui, 64, 111, 44, "Settings");
+    label(ui, 66, 166, 21, "Tune performance, cockpit POV feel, audio, clarity, and live weather.", true);
+    panel(ui, {64,225,1100,720});
+    label(ui, 91, 246, 24, "Graphics & Streaming");
+    auto &s = ui.graphics_settings_;
+    bool changed = false;
+    auto setting = [&](int row, const char *name, const char *value) {
+        const int y = 296 + row * 72;
+        ui.hud_rect(91,y+49,1046,1,.21f,.32f,.39f,.85f);
+        label(ui, 91, y+10, 20, name);
+        label(ui, 763, y+10, 19, value);
+        if (button(ui, {697,y,44,40}, "<")) { changed = true; return -1; }
+        if (button(ui, {1093,y,44,40}, ">")) { changed = true; return 1; }
+        return 0;
+    };
+    static const char *presets[] = {"Low (F1 / Cooler)", "Medium (F2 / 60 FPS)", "High (F3 / Balanced)", "Ultra (F4 / dGPU)"};
+    static const char *weather[] = {"Follow preset", "Low", "Medium", "High"};
+    static const char *aa[] = {"Spatial FXAA", "Balanced TAA", "Crisp TAA"};
+    static const char *clarity[] = {"Crisp VFR", "Natural", "Hazy"};
+    char value[48];
+    s.quality_preset = (s.quality_preset + setting(0, "Performance preset", presets[s.quality_preset]) + 4) % 4;
+    std::snprintf(value, sizeof(value), "%d%%", s.pixel_percent);
+    s.pixel_percent = std::clamp(s.pixel_percent + 5 * setting(1, "Render resolution budget", value), 40, 100);
+    s.aa_mode = (s.aa_mode + setting(2, "Anti-aliasing", aa[s.aa_mode]) + 3) % 3;
+    s.atmosphere_clarity = (s.atmosphere_clarity + setting(3, "Atmosphere clarity", clarity[s.atmosphere_clarity]) + 3) % 3;
+    std::snprintf(value, sizeof(value), "%d%%", s.terrain_lod_percent);
+    s.terrain_lod_percent = std::clamp(s.terrain_lod_percent + 25 * setting(4, "Terrain LOD radius", value), 75, 200);
+    if (setting(5, "Online PNOA streaming", s.terrain_streaming ? "On / IGN PNOA" : "Off / installed packs"))
+        s.terrain_streaming = !s.terrain_streaming;
+    s.weather_detail = (s.weather_detail + setting(6, "Cloud & weather detail", weather[s.weather_detail]) + 4) % 4;
+    if (setting(7, "Cockpit detail / native res", s.cockpit_native ? (s.aircraft_detail ? "Native + High" : "Native + Std") : "Scaled")) {
+        if (!s.cockpit_native) { s.cockpit_native = true; s.aircraft_detail = 0; }
+        else if (s.aircraft_detail == 0) { s.aircraft_detail = 1; }
+        else { s.cockpit_native = false; s.aircraft_detail = 0; }
+    }
+
+    panel(ui, {1192,225,664,720});
+    label(ui, 1218, 246, 24, "Cockpit POV & Audio");
+    auto rsetting = [&](int row, const char *name, const char *val) {
+        const int y = 296 + row * 68;
+        ui.hud_rect(1218, y + 47, 612, 1, .21f, .32f, .39f, .85f);
+        label(ui, 1218, y + 9, 19, name);
+        label(ui, 1598, y + 9, 18, val);
+        if (button(ui, {1540, y, 42, 38}, "<")) { changed = true; return -1; }
+        if (button(ui, {1788, y, 42, 38}, ">")) { changed = true; return 1; }
+        return 0;
+    };
+    static const char *head_modes[] = {"Off", "Subtle", "Realistic"};
+    std::snprintf(value, sizeof(value), "%d deg", s.cockpit_fov_deg);
+    s.cockpit_fov_deg = std::clamp(s.cockpit_fov_deg + 2 * rsetting(0, "Cockpit vertical FOV", value), 42, 64);
+    s.head_motion_mode = (s.head_motion_mode + rsetting(1, "Head G-feel & turn look", head_modes[s.head_motion_mode]) + 3) % 3;
+    std::snprintf(value, sizeof(value), "%d%%", s.audio_volume_percent);
+    s.audio_volume_percent = std::clamp(s.audio_volume_percent + 5 * rsetting(2, "Master audio volume", value), 0, 100);
+
+    label(ui, 1218, 514, 24, "Time of day");
+    int time_index = time_of_day < 0 ? 0 : (time_of_day == 10 ? 11 : time_of_day + 1);
+    if (button(ui, {1218, 558, 48, 44}, "<")) {
+        time_index = (time_index + 11) % 12;
+        changed = true;
+    }
+    if (button(ui, {1782, 558, 48, 44}, ">")) {
+        time_index = (time_index + 1) % 12;
+        changed = true;
+    }
+    time_of_day = time_index == 0 ? -1 : (time_index == 11 ? 10 : time_index - 1);
+    ui.graphics_settings_.time_of_day = time_of_day;
+    const char *time_label = time_of_day < 0 ? "Advancing 5-hour day / night cycle"
+        : (time_of_day == 10 ? "Fixed night" : kTodLabels[time_of_day]);
+    label(ui, 1284, 570, 17, time_label);
+    label(ui, 1218, 624, 16, "Cycle mode runs dawn through a short night every 5 hours.", true);
+    if (reg_atmo) {
+        ui.hud_rect(1218, 668, 612, 1, .21f, .32f, .39f, .85f);
+        label(ui, 1218, 690, 24, "Weather scenario");
+        static constexpr const char *kWxModes[7] = {
+            "Live / Auto Dynamic VFR",
+            "Pyrenean Thermals (Fair VFR)",
+            "Cierzo NW (Mountain Wave & Rotors)",
+            "Foehn Sur (Orographic Cap Clouds)",
+            "Dawn Valley Fog (Basin IMC)",
+            "Pyrenean Storm Front (Heavy Rain)",
+            "Winter Icing & Snow (Frost & Ice)"
+        };
+        int mode_idx = reg_atmo->manual_weather_override() ? (1 + static_cast<int>(reg_atmo->regime())) : 0;
+        mode_idx = std::clamp(mode_idx, 0, 6);
+        int delta = 0;
+        if (button(ui, {1218, 738, 48, 44}, "<")) delta = -1;
+        if (button(ui, {1782, 738, 48, 44}, ">")) delta = +1;
+        if (delta != 0) {
+            mode_idx = (mode_idx + delta + 7) % 7;
+            if (mode_idx == 0) {
+                reg_atmo->set_manual_weather_override(false);
+                reg_atmo->set_regime(WindRegime::PYRENEAN_THERMAL);
+            } else {
+                reg_atmo->set_manual_weather_override(true);
+                reg_atmo->set_regime(static_cast<WindRegime>(mode_idx - 1));
+            }
+        }
+        label(ui, 1284, 750, 17, kWxModes[mode_idx]);
+        label(ui, 1218, 804, 16, "Press M in flight to cycle weather; U mutes audio.", true);
+        label(ui, 1218, 836, 16, "Output: 1920x1080 | F1-F4 switch preset live.", true);
+    }
+    if (changed) save_graphics_settings(s);
+}
+
+void GameFrontend::draw_loading_screen(AircraftAndHud &ui, int win_w, int win_h,
+                                       const char *title, const char *stage, float progress01) {
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, win_w, win_h);
+    glDisable(GL_DEPTH_TEST);
+    glClearColor(0.032f, 0.052f, 0.070f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    ui.hud_verts_.clear();
+    panel(ui, {460, 390, 1000, 270});
+    label(ui, 504, 428, 30, title ? title : "OpenSky VFR - Preparing Flight");
+    label(ui, 504, 484, 20, stage ? stage : "Streaming terrain & world data...", true);
+    const float p = std::clamp(progress01, 0.0f, 1.0f);
+    ui.hud_rect(504, 540, 912, 22, 0.09f, 0.14f, 0.19f, 0.95f);
+    ui.hud_rect(506, 542, std::max(8.0f, 908.0f * p), 18, 0.24f, 0.64f, 0.78f, 0.98f);
+    char pct[48];
+    std::snprintf(pct, sizeof(pct), "%d%%  |  VRAM-safe terrain streaming", static_cast<int>(std::lround(p * 100.0f)));
+    label(ui, 504, 584, 17, pct, true);
+    ui.flush_hud(1920.0f, 1080.0f, font_);
+}
+
+void GameFrontend::draw_controls(AircraftAndHud &ui) {
+    label(ui, 64, 111, 44, "Controls");
+    label(ui, 66, 169, 20, "Walk around your Skyhawk to inspect & service it, start up at parking, and taxi to the runway.", true);
+    panel(ui, {64, 220, 846, 760});
+    panel(ui, {942, 220, 914, 760});
+    label(ui, 90, 245, 28, "Walkaround & Engine Care");
+    label(ui, 90, 294, 19, "W / A / S / D + Shift   Walk around aircraft (6 inspection spots)");
+    label(ui, 90, 332, 19, "Drag / Arrows              Look around");
+    label(ui, 90, 370, 19, "E                                  Inspect nearest part (Nose/Wings/Gear/Tail/Door)");
+    label(ui, 90, 408, 19, "Enter                           Board aircraft while inspecting");
+    label(ui, 90, 446, 19, "Esc                               Close panel / return to World");
+    ui.hud_rect(90, 492, 790, 1, .21f, .32f, .39f, .85f);
+    label(ui, 90, 512, 24, "Cockpit Systems (In Flight)");
+    label(ui, 90, 554, 19, "Tab                              Toggle clickable Systems & Checklist Kneeboard");
+    label(ui, 90, 592, 19, "K                                  Quick Start / Clean Shutdown helper");
+    label(ui, 90, 630, 19, "1 / 2                            Master (BAT+ALT)  /  Avionics Master");
+    label(ui, 90, 668, 19, "3 / Hold 4                    Cycle Magnetos (OFF/R/L/BOTH)  /  Crank Starter");
+    label(ui, 90, 706, 19, "5 / 6                            Mixture Lean / Rich (pull to 0% for shutdown)");
+    label(ui, 90, 744, 19, "7 / 8                            Carb Heat  /  Prime (stopped) or Pitot Heat (running)");
+    label(ui, 90, 798, 18, "Remove chocks, tie-downs & pitot cover before takeoff!", true);
+    label(ui, 90, 830, 18, "Full hangar service at Castejon, Santa Cilia, Huesca & Zaragoza.", true);
+    label(ui, 90, 862, 18, "Remote strips have a field kit only - maintain before mountain legs.", true);
+    label(ui, 90, 894, 18, "After landing, taxi off the runway, shut down, and park to log the flight.", true);
+
+    label(ui, 968, 245, 28, "Flying & Camera");
+    label(ui, 968, 294, 19, "Right-drag mouse     Look around (any camera view)");
+    label(ui, 968, 334, 19, "C / R                          Cycle view (Cockpit/Chase/Free) / center");
+    label(ui, 968, 374, 19, "W / S                         Increase / reduce throttle");
+    label(ui, 968, 414, 19, "A / D                         Roll left / right");
+    label(ui, 968, 454, 19, "Up / Down               Pitch down / up");
+    label(ui, 968, 494, 19, "Q / E                         Rudder left / right (nosewheel steering)");
+    label(ui, 968, 534, 19, "X                                Release parking brake / wheel brakes");
+    label(ui, 968, 574, 19, "F / V                          Flaps down / up");
+    label(ui, 968, 614, 19, "Y                                Toggle mouse yoke (holds position; R centers)");
+    label(ui, 968, 654, 19, "T                                Toggle in-flight controls tutorial");
+    label(ui, 968, 694, 19, "PgUp / PgDn           Seat height (or Free Cam up/down, Chase zoom)");
+    label(ui, 968, 734, 19, "Home / End             Seat fore/aft (or Free Cam forward/back)");
+    label(ui, 968, 774, 19, "Left / Right             Seat left/right (or Free Cam / Chase orbit)");
+    label(ui, 968, 814, 19, "Backspace / Esc     Reset seat/cam   |   Pause & Menu");
+    label(ui, 968, 870, 18, "Tip: Lean mixture (5) above 1,500 m MSL for full Pyrenean climb.", true);
+    label(ui, 968, 902, 18, "Warm oil past 110 F before full power to preserve cylinder health.", true);
+}
+
+void GameFrontend::draw_walk(AircraftAndHud &ui, const PlatformWindow &win,
+                             const RegionalAtmosphere *reg_atmo, const AtmosphereState *atmo, double sim_time_sec) {
+    read_pointer(win);
+    ui.hud_verts_.clear();
+    char line[192];
+    const auto *home = parked_airport();
+    const bool full_svc = home ? is_full_service_airport(home->id) : true;
+
+    // Top-left: Airport + Service Tier + Live Local Weather
+    if (home) {
+        panel(ui, {28, 28, 580, 128});
+        std::snprintf(line, sizeof(line), "%s  -  %s", home->id.c_str(), home->name.c_str());
+        label(ui, 48, 42, 21, line);
+        label(ui, 48, 76, 16, full_svc
+            ? "Full Hangar Service (free oil change, tires, overhaul, charger)"
+            : "Remote Strip - Field Kit Only (top-ups, sumps, plugs, patches)", true);
+        if (reg_atmo && atmo) {
+            const float wx_est = std::clamp((atmo->cloud_cov - 0.16f) / 0.78f, 0.0f, 1.0f);
+            const LocalAirSample wx = reg_atmo->sample_at(parking_spot_.lat, parking_spot_.lon,
+                                                          parking_spot_.alt, atmo->sun_dir, sim_time_sec, wx_est);
+            const double w_kt = std::hypot(wx.wind_east_mps, wx.wind_north_mps) * 1.94384;
+            const int w_from = int(std::lround(std::fmod(std::atan2(-wx.wind_east_mps, -wx.wind_north_mps) * RAD2DEG_D + 360.0, 360.0))) % 360;
+            std::snprintf(line, sizeof(line), "WX: Wind %03d/%.0f kt | OAT %.0f C | QNH %.0f%s",
+                          w_from, w_kt, wx.oat_c, wx.qnh_hpa, wx.precipitation_mm_hr > 0.2 ? " | RAIN" : "");
+            label(ui, 48, 108, 16, line, true);
+        }
+    }
+
+    // Top-right (when walking outside): Live Walkaround Checklist strip
+    if (!inspecting_) {
+        panel(ui, {1360, 28, 532, 232});
+        label(ui, 1384, 44, 20, "Walkaround Checklist (EC-VFR)");
+        std::snprintf(line, sizeof(line), "[%c] Nose: Oil %.1f qt (%.1f hr)  Prop %.0f%%",
+                      (walk_checked_[0] && care_.oil_quarts >= 5.5) ? 'x' : ' ',
+                      care_.oil_quarts, care_.oil_hours, (1.0 - care_.prop_nicks) * 100.0);
+        label(ui, 1384, 78, 15, line, care_.oil_quarts >= 5.5);
+        std::snprintf(line, sizeof(line), "[%c] L Wing: %.1f gal | Pitot %s | Sumps %s",
+                      (!care_.pitot_cover_on && care_.sump_water < 0.12) ? 'x' : ' ',
+                      care_.left_fuel_gal, care_.pitot_cover_on ? "COVER ON!" : "clear",
+                      care_.sump_water > 0.12 ? "WATER!" : "clean");
+        label(ui, 1384, 104, 15, line, !care_.pitot_cover_on && care_.sump_water < 0.12);
+        std::snprintf(line, sizeof(line), "[%c] R Wing: %.1f gal | Tie-downs %s",
+                      (!care_.tie_downs_on) ? 'x' : ' ',
+                      care_.right_fuel_gal, care_.tie_downs_on ? "TIED" : "removed");
+        label(ui, 1384, 130, 15, line, !care_.tie_downs_on);
+        std::snprintf(line, sizeof(line), "[%c] Gear: Chocks %s | Tires %.0f%% | Brakes %.0f%%",
+                      (!care_.chocks_on && care_.tire_wear < 0.6) ? 'x' : ' ',
+                      care_.chocks_on ? "IN PLACE" : "removed",
+                      (1.0 - care_.tire_wear) * 100.0, (1.0 - care_.brake_wear) * 100.0);
+        label(ui, 1384, 156, 15, line, !care_.chocks_on);
+        std::snprintf(line, sizeof(line), "[%c] Tail & Door: Airframe %.0f%% | Bat %.0f%% | Glass %.0f%%",
+                      (care_.airframe_damage < 0.25 && care_.battery_soc > 0.35) ? 'x' : ' ',
+                      (1.0 - care_.airframe_damage) * 100.0, care_.battery_soc * 100.0,
+                      (1.0 - care_.windshield_dirt) * 100.0);
+        label(ui, 1384, 182, 15, line, care_.battery_soc > 0.35);
+        if (!walk_notice_.empty()) {
+            label(ui, 1384, 214, 15, walk_notice_.c_str());
+        } else {
+            label(ui, 1384, 214, 15, "Walk to Nose, Wings, Gear, Tail, or Door and press E.", true);
+        }
+    }
+
+    static constexpr const char *kStationNames[6] = {
+        "Nose & Cowling", "Left Wing & Pitot", "Right Wing & Tie-Downs",
+        "Landing Gear & Chocks", "Tail & Controls", "Cabin Door & Battery"
+    };
+    static constexpr const char *kStationShort[6] = {"Nose", "L Wing", "R Wing", "Gear", "Tail", "Door"};
+    static constexpr const char *kStationHint[6] = {
+        "check oil dipstick, spark plugs & propeller",
+        "check left fuel, drain sump & pitot cover",
+        "check right fuel, drain sump & tie-downs",
+        "check tires, brakes, alignment & wheel chocks",
+        "check control surfaces & airframe structure",
+        "check battery, clean windshield & board"
+    };
+
+    const float distance = distance_to_plane();
+    float st_dist = 99.0f;
+    const WalkStation near_st = nearest_walk_station(st_dist);
+
+    if (!inspecting_) {
+        panel(ui, {540, 920, 840, 118});
+        if (distance < 9.0f) {
+            std::snprintf(line, sizeof(line), "%s   |   %.1f m",
+                          kStationNames[static_cast<int>(near_st)], st_dist);
+            label(ui, 566, 938, 22, line);
+            std::snprintf(line, sizeof(line), "E  Inspect (%s)", kStationHint[static_cast<int>(near_st)]);
+            label(ui, 566, 976, 17, line);
+            label(ui, 566, 1004, 15, "WASD Walk around aircraft   /   Drag or arrows Look   /   Esc World", true);
+        } else {
+            std::snprintf(line, sizeof(line), "Cessna 172S (EC-VFR)   |   %.0f m", distance);
+            label(ui, 566, 940, 22, line);
+            label(ui, 566, 982, 17, "WASD Walk toward aircraft   /   Shift Run   /   Drag or arrows Look   /   Esc World", true);
+        }
+        ui.hud_rect(w/2-4, h/2, 9, 1, .94f, .98f, 1, .8f);
+        ui.hud_rect(w/2, h/2-4, 1, 9, .94f, .98f, 1, .8f);
+    } else {
+        // 6-Station Spatial Walkaround & Servicing Clipboard
+        panel(ui, {1160, 145, 720, 795});
+        label(ui, 1188, 168, 28, "Cessna 172S Walkaround");
+        label(ui, 1188, 206, 16, full_svc
+            ? "Home / Regional Hangar - full servicing available (all free)"
+            : "Remote Strip - Field Kit only (major overhaul/swap at Castejon, LECI, LEHC, LEZG)", true);
+
+        // Station selector tabs (all 6 spots directly reachable)
+        for (int i = 0; i < 6; ++i) {
+            const bool sel = (static_cast<int>(active_station_) == i);
+            if (button(ui, {1188 + i * 111, 240, 105, 36}, kStationShort[i], true, sel)) {
+                active_station_ = static_cast<WalkStation>(i);
+                walk_checked_[i] = true;
+            }
+        }
+        ui.hud_rect(1188, 288, 664, 1, .21f, .32f, .39f, .85f);
+        label(ui, 1188, 302, 22, kStationNames[static_cast<int>(active_station_)]);
+
+        const double total_fuel = care_.left_fuel_gal + care_.right_fuel_gal;
+        switch (active_station_) {
+            case WalkStation::Nose: {
+                std::snprintf(line, sizeof(line), "Oil Dipstick: %.1f / 8.0 qt   |   Oil Age: %.1f / 10.0 hr%s",
+                              care_.oil_quarts, care_.oil_hours, care_.oil_hours >= 10.0 ? "  (CHANGE DUE)" : "");
+                label(ui, 1188, 344, 18, line);
+                std::snprintf(line, sizeof(line), "Cylinders: %.0f%%   |   Spark Plugs: %.0f%% clean   |   Propeller: %.0f%%",
+                              (1.0 - care_.cylinder_wear) * 100.0, (1.0 - care_.spark_fouling) * 100.0,
+                              (1.0 - care_.prop_nicks) * 100.0);
+                label(ui, 1188, 376, 17, line, true);
+
+                if (button(ui, {1188, 418, 322, 44}, "Top up oil (+1 qt)", care_.oil_quarts < 7.95)) {
+                    care_.oil_quarts = std::min(8.0, care_.oil_quarts + 1.0);
+                    save_profile();
+                }
+                if (button(ui, {1530, 418, 322, 44}, full_svc ? "Oil & filter change" : "Oil change (hangar only)",
+                           full_svc && (care_.oil_hours > 0.2 || care_.oil_quarts < 7.5))) {
+                    care_.oil_quarts = 7.6;
+                    care_.oil_hours = 0.0;
+                    save_profile();
+                }
+                if (button(ui, {1188, 474, 322, 44}, "Clean spark plugs (field ok)", care_.spark_fouling > 0.01)) {
+                    care_.spark_fouling = 0.0;
+                    save_profile();
+                }
+                if (button(ui, {1530, 474, 322, 44}, full_svc ? "Dress / replace prop" : "File minor prop nicks",
+                           care_.prop_nicks > 0.01)) {
+                    care_.prop_nicks = full_svc ? 0.0 : std::max(0.0, care_.prop_nicks - 0.35);
+                    save_profile();
+                }
+                if (button(ui, {1188, 530, 664, 44},
+                           full_svc ? "Overhaul engine cylinders (hangar)" : "Engine overhaul (return to full-service airport)",
+                           full_svc && (care_.cylinder_wear > 0.01 || care_.shock_cooling > 0.01))) {
+                    care_.cylinder_wear = 0.0;
+                    care_.shock_cooling = 0.0;
+                    save_profile();
+                }
+                label(ui, 1188, 592, 16, "Keep oil between 6 and 8 qt. Warm oil >110 F before full power.", true);
+                break;
+            }
+            case WalkStation::LeftWing: {
+                std::snprintf(line, sizeof(line), "Left Tank: %.1f / 26.5 US gal   |   Total: %.1f gal",
+                              care_.left_fuel_gal, total_fuel);
+                label(ui, 1188, 344, 18, line);
+                const bool can_add_l = care_.left_fuel_gal < 26.45 && (full_svc || remote_fuel_added_ < 10.0);
+                if (button(ui, {1188, 384, 210, 44}, "-5 gal Left", care_.left_fuel_gal > 0.05)) {
+                    care_.left_fuel_gal = std::max(0.0, care_.left_fuel_gal - 5.0);
+                    save_profile();
+                }
+                if (button(ui, {1415, 384, 210, 44}, full_svc ? "+5 gal Left" : "+5 gal (jerrycan)", can_add_l)) {
+                    const double add = std::min(5.0, 26.5 - care_.left_fuel_gal);
+                    care_.left_fuel_gal += add;
+                    if (!full_svc) remote_fuel_added_ += add;
+                    save_profile();
+                }
+                if (button(ui, {1642, 384, 210, 44}, full_svc ? "Fill Left (26.5)" : "Fill (hangar only)",
+                           full_svc && care_.left_fuel_gal < 26.45)) {
+                    care_.left_fuel_gal = 26.5;
+                    save_profile();
+                }
+                std::snprintf(line, sizeof(line), "Left Fuel Sump: %s",
+                              care_.sump_water > 0.12 ? "WATER DETECTED - drain before flight!" : "Clean avgas (no water)");
+                label(ui, 1188, 448, 17, line, care_.sump_water <= 0.12);
+                if (button(ui, {1188, 482, 664, 44}, "Drain fuel sumps (clear condensation / water)", care_.sump_water > 0.01)) {
+                    care_.sump_water = 0.0;
+                    save_profile();
+                }
+                std::snprintf(line, sizeof(line), "Pitot Tube Cover: %s",
+                              care_.pitot_cover_on ? "FITTED (airspeed indicator will read 0!)" : "REMOVED (clear)");
+                label(ui, 1188, 546, 17, line, !care_.pitot_cover_on);
+                if (button(ui, {1188, 580, 664, 44},
+                           care_.pitot_cover_on ? "Remove red pitot cover" : "Fit red pitot cover (for parking)",
+                           true, care_.pitot_cover_on)) {
+                    care_.pitot_cover_on = !care_.pitot_cover_on;
+                    save_profile();
+                }
+                break;
+            }
+            case WalkStation::RightWing: {
+                std::snprintf(line, sizeof(line), "Right Tank: %.1f / 26.5 US gal   |   Total: %.1f gal",
+                              care_.right_fuel_gal, total_fuel);
+                label(ui, 1188, 344, 18, line);
+                const bool can_add_r = care_.right_fuel_gal < 26.45 && (full_svc || remote_fuel_added_ < 10.0);
+                if (button(ui, {1188, 384, 210, 44}, "-5 gal Right", care_.right_fuel_gal > 0.05)) {
+                    care_.right_fuel_gal = std::max(0.0, care_.right_fuel_gal - 5.0);
+                    save_profile();
+                }
+                if (button(ui, {1415, 384, 210, 44}, full_svc ? "+5 gal Right" : "+5 gal (jerrycan)", can_add_r)) {
+                    const double add = std::min(5.0, 26.5 - care_.right_fuel_gal);
+                    care_.right_fuel_gal += add;
+                    if (!full_svc) remote_fuel_added_ += add;
+                    save_profile();
+                }
+                if (button(ui, {1642, 384, 210, 44}, full_svc ? "Fill Both Tanks" : "Fill (hangar only)",
+                           full_svc && total_fuel < 52.9)) {
+                    care_.left_fuel_gal = care_.right_fuel_gal = 26.5;
+                    save_profile();
+                }
+                if (button(ui, {1188, 446, 664, 44},
+                           care_.sump_water > 0.12 ? "Drain right fuel sump (WATER DETECTED)" : "Check / drain right sump (clear)",
+                           care_.sump_water > 0.01)) {
+                    care_.sump_water = 0.0;
+                    save_profile();
+                }
+                std::snprintf(line, sizeof(line), "Wing Tie-Down Ropes: %s",
+                              care_.tie_downs_on ? "SECURED (remove before taxi)" : "REMOVED (secure in gusty wind!)");
+                label(ui, 1188, 514, 17, line, !care_.tie_downs_on);
+                if (button(ui, {1188, 548, 664, 44},
+                           care_.tie_downs_on ? "Untie wing tie-downs" : "Secure wing tie-downs (protect in wind)",
+                           true, care_.tie_downs_on)) {
+                    care_.tie_downs_on = !care_.tie_downs_on;
+                    save_profile();
+                }
+                label(ui, 1188, 606, 15, "Tip: Fly lighter fuel out of high-altitude grass strips like Castejon (900m).", true);
+                break;
+            }
+            case WalkStation::Gear: {
+                std::snprintf(line, sizeof(line), "Tires: %.0f%%   |   Brakes: %.0f%%   |   Alignment: %s",
+                              (1.0 - care_.tire_wear) * 100.0, (1.0 - care_.brake_wear) * 100.0,
+                              std::abs(care_.gear_alignment) < 0.08 ? "True" :
+                              (care_.gear_alignment > 0 ? "Pulls Right" : "Pulls Left"));
+                label(ui, 1188, 344, 18, line);
+                std::snprintf(line, sizeof(line), "Wheel Chocks: %s",
+                              care_.chocks_on ? "IN PLACE (aircraft cannot roll until removed)" : "REMOVED");
+                label(ui, 1188, 384, 17, line, !care_.chocks_on);
+                if (button(ui, {1188, 418, 664, 46},
+                           care_.chocks_on ? "Remove wheel chocks" : "Place wheel chocks (for parking)",
+                           true, care_.chocks_on)) {
+                    care_.chocks_on = !care_.chocks_on;
+                    save_profile();
+                }
+                const bool need_gear = care_.tire_wear > 0.02 || care_.brake_wear > 0.02 || std::abs(care_.gear_alignment) > 0.03;
+                if (button(ui, {1188, 482, 664, 46},
+                           full_svc ? "Replace tires, brake pads & align gear (hangar)"
+                                    : "Field patch tires & adjust brakes (up to 75%)",
+                           need_gear)) {
+                    if (full_svc) {
+                        care_.tire_wear = 0.0;
+                        care_.brake_wear = 0.0;
+                        care_.gear_alignment = 0.0;
+                    } else {
+                        care_.tire_wear = std::min(care_.tire_wear, 0.25);
+                        care_.brake_wear = std::min(care_.brake_wear, 0.25);
+                        care_.gear_alignment *= 0.4;
+                    }
+                    save_profile();
+                }
+                label(ui, 1188, 548, 16, "Hard landings and gravel strips wear tires and knock gear alignment.", true);
+                break;
+            }
+            case WalkStation::Tail: {
+                std::snprintf(line, sizeof(line), "Airframe Structure: %.0f%%   |   Engine Time: %.1f hr",
+                              (1.0 - care_.airframe_damage) * 100.0, hours_);
+                label(ui, 1188, 344, 18, line);
+                label(ui, 1188, 380, 17, "Elevator, rudder & trim tab: free and correct.", true);
+                if (button(ui, {1188, 424, 664, 46},
+                           care_.airframe_damage > 0.01
+                               ? (full_svc ? "Full airframe inspection & repair (hangar)" : "Field airframe patch (up to 75%)")
+                               : "Airframe clean - no repairs needed",
+                           care_.airframe_damage > 0.01)) {
+                    care_.airframe_damage = full_svc ? 0.0 : std::min(care_.airframe_damage, 0.25);
+                    save_profile();
+                }
+                label(ui, 1188, 492, 16, "Always secure tie-downs in gusts >16 kt to prevent tail & control wear.", true);
+                break;
+            }
+            case WalkStation::Door: {
+                std::snprintf(line, sizeof(line), "24V Battery: %.0f%%   |   Windshield Clarity: %.0f%%",
+                              care_.battery_soc * 100.0, (1.0 - care_.windshield_dirt) * 100.0);
+                label(ui, 1188, 344, 18, line);
+                std::snprintf(line, sizeof(line), "Cockpit left as: %s  |  Master %s  |  Mags %s",
+                              care_.engine_running ? "Running" : "Cold & Dark",
+                              care_.master_on ? "ON" : "OFF",
+                              care_.magnetos == 0 ? "OFF" : (care_.magnetos == 3 ? "BOTH" : "L/R"));
+                label(ui, 1188, 378, 16, line, true);
+                if (button(ui, {1188, 418, 322, 44},
+                           full_svc ? "Charge 24V battery (GPU)" : "Field jump-charge (55%)",
+                           care_.battery_soc < (full_svc ? 0.96 : 0.54))) {
+                    care_.battery_soc = full_svc ? 0.98 : std::max(care_.battery_soc, 0.55);
+                    save_profile();
+                }
+                if (button(ui, {1530, 418, 322, 44}, "Clean windshield glass", care_.windshield_dirt > 0.02)) {
+                    care_.windshield_dirt = 0.0;
+                    save_profile();
+                }
+                const bool secured = care_.chocks_on || care_.pitot_cover_on || care_.tie_downs_on;
+                if (button(ui, {1188, 476, 664, 44},
+                           secured ? "Quick Pre-Flight: remove chocks, pitot cover & tie-downs"
+                                   : "Quick Post-Flight: fit chocks, pitot cover & tie-downs")) {
+                    care_.chocks_on = care_.pitot_cover_on = care_.tie_downs_on = !secured;
+                    if (!care_.chocks_on) {
+                        for (bool &c : walk_checked_) c = true;
+                    }
+                    save_profile();
+                }
+                label(ui, 1188, 536, 16, "Remember to switch Master OFF before parking or the battery will drain.", true);
+                break;
+            }
+        }
+
+        // Bottom persistent Boarding & Return footer on every station tab
+        ui.hud_rect(1188, 664, 664, 1, .21f, .32f, .39f, .85f);
+        if (care_.chocks_on || care_.pitot_cover_on || care_.tie_downs_on || care_.sump_water > 0.12) {
+            std::snprintf(line, sizeof(line), "Heads-up: %s%s%s%s",
+                          care_.chocks_on ? "[Chocks ON] " : "",
+                          care_.pitot_cover_on ? "[Pitot Cover ON] " : "",
+                          care_.tie_downs_on ? "[Tied Down] " : "",
+                          care_.sump_water > 0.12 ? "[Sump Water]" : "");
+            label(ui, 1188, 678, 16, line);
+        } else {
+            label(ui, 1188, 678, 16, "Exterior clear for boarding. Cold & dark? Press Tab or K inside cockpit.", true);
+        }
+        const bool can_board = care_.airframe_damage < 0.85;
+        if (button(ui, {1188, 714, 664, 54},
+                   can_board ? "Board aircraft at parking (Enter)" : "Airframe too damaged - repair before boarding",
+                   can_board, true) ||
+            (win.key_pressed(KEY_ENTER) && can_board)) {
+            request_ = Request::Board;
+        }
+        if (button(ui, {1188, 782, 322, 46}, "Back to walkaround (Esc)")) inspecting_ = false;
+        if (button(ui, {1530, 782, 322, 46}, "Return to World map")) { inspecting_ = false; walking_ = false; }
+    }
+    ui.flush_hud(w, h, font_);
+}
+
+void GameFrontend::draw_navigation(AircraftAndHud &ui, const PlatformWindow &win) {
+    if (!flight_active_) return;
+    read_pointer(win);
+    ui.hud_verts_.clear();
+    char line[192];
+
+    const bool show_yoke = ui.state().mouse_yoke_enabled && ui.state().view_mode != 2;
+    const bool on_gnd = ui.jsb_state().on_ground;
+    panel(ui, {28, 28, 768, ui.state().runway_tracking || show_yoke ? 128 : 96});
+    label(ui, 48, 44, 17, "Tab: Systems  K: Quick Start/Stop  T: Tutorial  C: View  Esc: Menu", true);
+    label(ui, 48, 76, 17, on_gnd
+        ? (show_yoke
+            ? "TAXI ASSIST ON | Trackpad/A-D: steer  W/S: gas/brake  Click/R: straight  Y: yoke"
+            : "TAXI ASSIST ON | A/D: steer  W/S: gas/brake  Y: trackpad yoke  R: straight")
+        : (show_yoke
+            ? "FLIGHT ASSIST ON | Trackpad/A-D: bank/pitch hold  Click/R: level  Y: yoke"
+            : "FLIGHT ASSIST ON | A/D: bank  Up/Dn: pitch  Y: trackpad yoke  R: level"), true);
+    if (ui.state().runway_tracking)
+        label(ui, 48, 108, 17, "Runway centreline assist ON   /   A-D, Q-E or trackpad: manual steer", true);
+    if (show_yoke) {
+        constexpr float x = 740, y = 92, radius = 38;
+        const bool at_limit = std::abs(ui.mouse_yoke_roll_) > 0.94 || std::abs(ui.mouse_yoke_pitch_) > 0.94;
+        const float br = at_limit ? 0.98f : 0.50f;
+        const float bg = at_limit ? 0.68f : 0.72f;
+        const float bb = at_limit ? 0.28f : 0.76f;
+        ui.hud_border(x - radius, y - radius, 2 * radius, 2 * radius, at_limit ? 2.0f : 1.0f, br, bg, bb, 0.92f);
+        ui.hud_rect(x - radius, y, 2 * radius, 1, .50f, .70f, .74f, .45f);
+        ui.hud_rect(x, y - radius, 1, 2 * radius, .50f, .70f, .74f, .45f);
+        // Show magnetic neutral detent box (radius * 0.16) so trackpad leveling is immediately visible.
+        const float det = radius * 0.16f;
+        ui.hud_border(x - det, y - det, 2 * det, 2 * det, 1, .45f, .86f, .82f, .65f);
+        const float marker_x = x + (radius - 4) * static_cast<float>(ui.mouse_yoke_roll_);
+        const float marker_y = y + (radius - 4) * static_cast<float>(ui.mouse_yoke_pitch_);
+        ui.hud_rect(marker_x - 3.5f, marker_y - 3.5f, 7, 7, at_limit ? 1.0f : .62f, at_limit ? .74f : .94f, at_limit ? .32f : .91f, 1.0f);
+        // Subtle floating center-screen trackpad reticle: springs smoothly to center when finger leaves trackpad!
+        {
+            const float ax = GAME_OUTPUT_W * 0.50f;
+            const float ay = GAME_OUTPUT_H * 0.50f;
+            const float px = ax + static_cast<float>(ui.mouse_yoke_roll_) * 125.0f;
+            const float py = ay + static_cast<float>(ui.mouse_yoke_pitch_) * 100.0f;
+            const bool centered = std::abs(ui.mouse_yoke_roll_) < 0.015 && std::abs(ui.mouse_yoke_pitch_) < 0.015;
+            const float cr = centered ? 0.42f : 0.65f, cg = centered ? 0.94f : 0.90f, cb = centered ? 0.78f : 1.0f;
+            ui.hud_border(ax - 20.0f, ay - 20.0f, 40.0f, 40.0f, 1.5f, cr, cg, cb, 0.45f);
+            ui.hud_rect(ax - 5.0f, ay - 0.5f, 10.0f, 1.0f, cr, cg, cb, 0.55f);
+            ui.hud_rect(ax - 0.5f, ay - 5.0f, 1.0f, 10.0f, cr, cg, cb, 0.55f);
+            if (!centered) {
+                ui.hud_line({ax, ay}, {px, py}, 1.5f, {cr, cg, cb});
+                ui.hud_rect(px - 4.0f, py - 4.0f, 8.0f, 8.0f, 0.98f, 0.96f, 0.65f, 0.92f);
+            }
+        }
+    }
+
+    // Live Symptom & Aircraft Care Caution Banner (only shown when something needs attention!)
+    const auto &sys = ui.systems_;
+    std::string caution;
+    if (ui.is_chocked_or_tied() && ui.jsb_state().on_ground)
+        caution = "CHOCKS / TIE-DOWNS FITTED - Press Esc -> Park & step outside to remove!";
+    else if (sys.is_pitot_blocked() && (ui.state().speed_mps > 8.0 || !ui.jsb_state().on_ground))
+        caution = sys.is_pitot_cover_on()
+            ? "PITOT COVER LEFT ON - Airspeed indicator inoperative! Abort or fly attitude."
+            : "PITOT ICED OVER - Press 8 for Pitot Heat!";
+    else if (ui.windscreen_frost() > 0.25f || ui.airframe_ice01() > 0.20f)
+        caution = "STRUCTURAL & WINDSCREEN ICING - Turn Pitot Heat ON (8) & exit freezing cloud!";
+    else if (ui.last_air().in_storm_cell)
+        caution = "SEVERE STORM CELL - Heavy rain, lightning & downdrafts! Divert around shaft.";
+    else if (ui.last_air().in_lee_rotor)
+        caution = "MOUNTAIN LEE ROTOR - Strong turbulence & sink! Gain altitude clear of ridge.";
+    else if (sys.has_overtemp_failure() || sys.has_oil_starvation_failure())
+        caution = "ENGINE FAILURE (OVERTEMP / OIL) - Land and service at an airfield.";
+    else if (sys.is_sputtering())
+        caution = "ENGINE SPUTTERING (WATER IN FUEL SUMPS) - Drain sumps on walkaround.";
+    else if (sys.get_carb_ice_level() > 0.18)
+        caution = "CARBURETOR ICE - RPM dropping! Press 7 for Carb Heat.";
+    else if (sys.is_engine_running() && sys.get_oil_temp_f() < 110.0 && ui.state().throttle > 0.72)
+        caution = "COLD OIL (<110 F) - Reduce throttle until engine warms to avoid wear.";
+    else if (sys.is_engine_running() && sys.get_oil_press_psi() < 32.0)
+        caution = "LOW OIL PRESSURE - Check oil quantity on walkaround.";
+    else if (sys.get_master_battery() && sys.get_battery_soc() < 0.18)
+        caution = "LOW 24V BATTERY - Start engine for alternator or charge on walkaround.";
+    else if (care_.airframe_damage >= 0.5)
+        caution = "AIRFRAME DAMAGED - Engine power reduced. Inspect & repair at an airport.";
+
+    if (!caution.empty()) {
+        panel(ui, {28, 170, 748, 56});
+        label(ui, 48, 189, 17, caution.c_str());
+    }
+
+    // Touchdown Debrief Banner (auto-clears after 14 s)
+    if (td_banner_s_ > 0.0 && has_touchdown_) {
+        panel(ui, {560, 822, 800, 102});
+        std::snprintf(line, sizeof(line), "TOUCHDOWN:  %.0f fpm   |   %.1f kt X-wind   |   %s   |   %s",
+                      td_fpm_, td_xwind_kt_, td_surface_.c_str(), td_grade_.c_str());
+        label(ui, 584, 842, 19, line);
+        label(ui, 584, 880, 16, "Taxi clear of the runway, shut down (K), then Esc -> Park to log this flight.", true);
+    }
+
+    // Clickable In-Flight Systems & Checklist Kneeboard (Tab)
+    if (kneeboard_open_) {
+        const int kx = 28, ky = caution.empty() ? 174 : 238;
+        panel(ui, {kx, ky, 590, 566});
+        label(ui, kx + 22, ky + 18, 22, "Cockpit Systems & Checklist");
+        if (button(ui, {kx + 458, ky + 12, 112, 32}, "Hide (Tab)")) kneeboard_open_ = false;
+
+        // Live Engine & Electrical Telemetry
+        const auto &fs = ui.jsb_state();
+        std::snprintf(line, sizeof(line), "RPM %4.0f | Oil %.1fqt %.0fF %.0fpsi | CHT %.0fF",
+                      fs.rpm, sys.get_oil_quarts(), sys.get_oil_temp_f(), sys.get_oil_press_psi(), sys.get_cht_f());
+        label(ui, kx + 22, ky + 56, 16, line);
+        std::snprintf(line, sizeof(line), "Bus %.1fV (Bat %.0f%%) | Mix %.0f%% | CarbIce %.0f%% | Plugs %.0f%%",
+                      sys.get_bus_volts(), sys.get_battery_soc() * 100.0, ui.state().mixture * 100.0,
+                      sys.get_carb_ice_level() * 100.0, (1.0 - sys.get_spark_fouling()) * 100.0);
+        label(ui, kx + 22, ky + 84, 15, line, true);
+        std::snprintf(line, sizeof(line), "Fuel: L %.1f / R %.1f gal  |  Flow %.1f gph  |  Flaps %.0f deg",
+                      sys.get_left_tank_gal(), sys.get_right_tank_gal(),
+                      sys.get_fuel_flow_gph(), sys.get_flaps_actual_deg());
+        label(ui, kx + 22, ky + 110, 15, line, true);
+
+        // Clickable Cockpit Controls (mirror keys 1..8 and K)
+        if (button(ui, {kx + 22, ky + 144, 174, 38},
+                   sys.get_master_battery() ? "[1] Master: ON" : "[1] Master: OFF", true, sys.get_master_battery())) {
+            const bool next = !sys.get_master_battery();
+            ui.systems_.set_master_battery(next);
+            ui.systems_.set_master_alternator(next);
+            ui.systems_.set_light_switch(0, next);
+        }
+        if (button(ui, {kx + 208, ky + 144, 174, 38},
+                   sys.get_avionics_master() ? "[2] Avionics: ON" : "[2] Avionics: OFF", true, sys.get_avionics_master())) {
+            ui.systems_.set_avionics_master(!sys.get_avionics_master());
+        }
+        static constexpr const char *kMagNames[5] = {"OFF", "R", "L", "BOTH", "START"};
+        std::snprintf(line, sizeof(line), "[3] Mags: %s", kMagNames[std::clamp(sys.get_magnetos(), 0, 4)]);
+        if (button(ui, {kx + 394, ky + 144, 174, 38}, line, true, sys.get_magnetos() == 3)) {
+            ui.systems_.set_magnetos((sys.get_magnetos() + 1) % 4);
+        }
+
+        if (button(ui, {kx + 22, ky + 192, 174, 38}, "[5] Mix -10%", ui.state().mixture > 0.01)) {
+            ui.state().mixture = std::max(0.0, ui.state().mixture - 0.10);
+        }
+        if (button(ui, {kx + 208, ky + 192, 174, 38}, "[6] Mix +10%", ui.state().mixture < 0.99)) {
+            ui.state().mixture = std::min(1.0, ui.state().mixture + 0.10);
+        }
+        static constexpr const char *kFuelNames[4] = {"OFF", "LEFT", "BOTH", "RIGHT"};
+        std::snprintf(line, sizeof(line), "Fuel: %s", kFuelNames[std::clamp(sys.get_fuel_selector(), 0, 3)]);
+        if (button(ui, {kx + 394, ky + 192, 174, 38}, line, true, sys.get_fuel_selector() == 2)) {
+            ui.systems_.cycle_fuel_selector();
+        }
+
+        if (button(ui, {kx + 22, ky + 240, 174, 38},
+                   sys.get_carb_heat() > 0.5 ? "[7] CarbHt: ON" : "[7] CarbHt: OFF", true, sys.get_carb_heat() > 0.5)) {
+            ui.systems_.set_carb_heat(sys.get_carb_heat() > 0.5 ? 0.0 : 1.0);
+        }
+        if (!sys.is_engine_running()) {
+            std::snprintf(line, sizeof(line), "[8] Prime (%d)", sys.get_primer_strokes());
+            if (button(ui, {kx + 208, ky + 240, 174, 38}, line, true, sys.get_primer_strokes() >= 2))
+                ui.systems_.actuate_primer();
+        } else {
+            if (button(ui, {kx + 208, ky + 240, 174, 38},
+                       sys.get_pitot_heat_switch() ? "[8] PitotHt: ON" : "[8] PitotHt: OFF", true, sys.get_pitot_heat_switch()))
+                ui.systems_.set_pitot_heat_switch(!sys.get_pitot_heat_switch());
+        }
+        if (button(ui, {kx + 394, ky + 240, 174, 38},
+                   sys.is_starter_cranking() ? "Cranking..." : "[4] Hold Start",
+                   !sys.is_engine_running() && sys.get_master_battery(), sys.is_starter_cranking())) {
+            // Clicking Start arms magnetos=4 briefly; holding key 4 cranks continuously
+            ui.systems_.set_magnetos(4);
+        }
+
+        if (button(ui, {kx + 22, ky + 292, 546, 42},
+                   sys.is_engine_running() ? "[K] Clean Shutdown (idle-cutoff, mags & master OFF)"
+                                           : "[K] Quick Start Engine (helper)",
+                   true, !sys.is_engine_running())) {
+            ui.quick_start_or_shutdown();
+        }
+
+        // Dynamic Contextual Checklist (Start / Run-Up / Shutdown)
+        ui.hud_rect(kx + 22, ky + 348, 546, 1, .21f, .32f, .39f, .85f);
+        if (!sys.is_engine_running()) {
+            label(ui, kx + 22, ky + 362, 18, "Cold-and-Dark Start Checklist:");
+            std::snprintf(line, sizeof(line), "[%c] 1. Exterior chocks & pitot cover removed", !ui.is_chocked_or_tied() && !sys.is_pitot_cover_on() ? 'x' : ' ');
+            label(ui, kx + 22, ky + 394, 15, line, !ui.is_chocked_or_tied() && !sys.is_pitot_cover_on());
+            std::snprintf(line, sizeof(line), "[%c] 2. Fuel Selector BOTH & Master ON (key 1)", sys.get_fuel_selector() == 2 && sys.get_master_battery() ? 'x' : ' ');
+            label(ui, kx + 22, ky + 422, 15, line, sys.get_fuel_selector() == 2 && sys.get_master_battery());
+            std::snprintf(line, sizeof(line), "[%c] 3. Mixture Rich (key 6) & Prime 2x if cold (key 8)", ui.state().mixture >= 0.8 ? 'x' : ' ');
+            label(ui, kx + 22, ky + 450, 15, line, ui.state().mixture >= 0.8);
+            std::snprintf(line, sizeof(line), "[%c] 4. Hold key 4 to crank starter (or press K Quick Start)", sys.is_engine_running() ? 'x' : ' ');
+            label(ui, kx + 22, ky + 478, 15, line, false);
+            label(ui, kx + 22, ky + 514, 15, "After start: switch Avionics ON (key 2) and warm oil >110 F.", true);
+        } else if (ui.jsb_state().on_ground) {
+            label(ui, kx + 22, ky + 362, 18, "Run-Up & Before-Takeoff Checklist:");
+            std::snprintf(line, sizeof(line), "[%c] 1. Oil temp >110 F & pressure green (%.0f F / %.0f psi)",
+                          sys.get_oil_temp_f() >= 110.0 && sys.get_oil_press_psi() >= 40.0 ? 'x' : ' ',
+                          sys.get_oil_temp_f(), sys.get_oil_press_psi());
+            label(ui, kx + 22, ky + 394, 15, line, sys.get_oil_temp_f() >= 110.0);
+            std::snprintf(line, sizeof(line), "[%c] 2. Magnetos BOTH (test L/R drop with key 3 at 1700 RPM)", sys.get_magnetos() == 3 ? 'x' : ' ');
+            label(ui, kx + 22, ky + 422, 15, line, sys.get_magnetos() == 3);
+            std::snprintf(line, sizeof(line), "[%c] 3. Carb Heat OFF (key 7) & Avionics ON (key 2)",
+                          sys.get_carb_heat() < 0.1 && sys.get_avionics_master() ? 'x' : ' ');
+            label(ui, kx + 22, ky + 450, 15, line, sys.get_carb_heat() < 0.1 && sys.get_avionics_master());
+            std::snprintf(line, sizeof(line), "[%c] 4. Release brake (X), taxi onto clear runway, rotate 55 kt",
+                          !ui.state().parking_brake ? 'x' : ' ');
+            label(ui, kx + 22, ky + 478, 15, line, !ui.state().parking_brake);
+            label(ui, kx + 22, ky + 514, 15, "After landing: clear runway, press K to shut down, then Esc -> Park.", true);
+        } else {
+            label(ui, kx + 22, ky + 362, 18, "In-Flight Engine Management:");
+            label(ui, kx + 22, ky + 394, 15, "- Lean mixture (5) above 1,500 m MSL for Pyrenean climbs.", true);
+            label(ui, kx + 22, ky + 422, 15, "- Pull Carb Heat (7) before low-power descents in moist air.", true);
+            label(ui, kx + 22, ky + 450, 15, "- Reduce power gradually on descent to avoid shock cooling.", true);
+            label(ui, kx + 22, ky + 478, 15, "- Turn Pitot Heat ON (8) in freezing clouds or precipitation.", true);
+            label(ui, kx + 22, ky + 514, 15, "- Land smoothly, clear runway, shut down (K), then Esc -> Park.", true);
+        }
+    }
+
+    if (tutorial_open_) {
+        panel(ui, {1346, 28, 546, 366});
+        label(ui, 1368, 44, 21, "Flight Controls Tutorial");
+        if (button(ui, {1786, 38, 86, 30}, "Hide (T)")) tutorial_open_ = false;
+        const bool on_ground = ui.jsb_state().on_ground;
+        label(ui, 1368, 84, 16, !sys.is_engine_running()
+            ? "1. STARTUP: Press Tab for Checklist, or press K Quick Start"
+            : (on_ground ? "1. TAXI & TAKEOFF: X releases brake, W adds power, Q/E steer"
+                         : "1. CRUISE: W/S throttle, 5/6 mixture, F/V flaps"), false);
+        label(ui, 1368, 112, 16, on_ground
+            ? "   Taxi onto the clear runway, rotate at 55 kt. Park off runway."
+            : "   After landing, taxi clear of runway, press K, then Esc -> Park.", true);
+        label(ui, 1368, 148, 16, "2. YOKE & FLIGHT CONTROLS:");
+        label(ui, 1368, 176, 16, "   Y toggles mouse yoke (holds deflection, R centers).", true);
+        label(ui, 1368, 202, 16, "   Mouse down = pitch UP | Keyboard: A/D, Up/Down, Q/E.", true);
+        label(ui, 1368, 238, 16, "3. ENGINE & SYSTEMS (Tab Kneeboard):");
+        label(ui, 1368, 266, 16, "   1 Master | 2 Avn | 3 Mags | 4 Start | 5/6 Mix | 7 Carb | 8 Prime", true);
+        label(ui, 1368, 302, 16, "4. CAMERA & SEAT ADJUSTMENT:");
+        label(ui, 1368, 330, 16, "   RMB drag: look | C: view | PgUp/Dn Home/End Arrows: seat/cam", true);
+        label(ui, 1368, 356, 16, "   Backspace resets seat/cam | T hides tutorial.", true);
+    }
+
+    // Integrated Cockpit KAP-140 2-Axis Autopilot Strip (powered by Master + Avionics bus, drives real 3D yoke/trim!)
+    if (!ui.jsb_state().on_ground && sys.get_master_battery() && sys.get_avionics_master()) {
+        auto &st = ui.state();
+        constexpr int ax = 1140, ay = 946;
+        panel(ui, {ax, ay, 752, 91});
+        label(ui, ax + 16, ay + 10, 15, "KAP-140 COCKPIT AUTOPILOT  (coupled to 3D Yoke & Trim)", true);
+        if (button(ui, {ax + 16, ay + 38, 82, 40}, st.ap_master ? "AP ON" : "AP OFF", true, st.ap_master)) {
+            st.ap_master = !st.ap_master;
+            if (st.ap_master) {
+                st.ap_hdg_deg = std::round(st.heading_deg);
+                st.ap_alt_ft = std::round((st.alt_msl_m * 3.28084) / 100.0) * 100.0;
+            }
+        }
+        std::snprintf(line, sizeof(line), "HDG %03d", (int(std::round(st.ap_hdg_deg)) % 360 + 360) % 360);
+        if (button(ui, {ax + 108, ay + 38, 108, 40}, line, true, st.ap_master && st.ap_hdg_hold && !st.ap_nav_hold)) {
+            st.ap_hdg_hold = true;
+            st.ap_nav_hold = false;
+            st.ap_master = true;
+        }
+        if (button(ui, {ax + 222, ay + 38, 40, 40}, "-", true)) st.ap_hdg_deg = std::fmod(st.ap_hdg_deg + 350.0, 360.0);
+        if (button(ui, {ax + 268, ay + 38, 40, 40}, "+", true)) st.ap_hdg_deg = std::fmod(st.ap_hdg_deg + 10.0, 360.0);
+
+        std::snprintf(line, sizeof(line), "ALT %.0f", st.ap_alt_ft);
+        if (button(ui, {ax + 322, ay + 38, 120, 40}, line, true, st.ap_master && st.ap_alt_hold)) {
+            st.ap_alt_hold = !st.ap_alt_hold;
+            st.ap_master = true;
+        }
+        if (button(ui, {ax + 448, ay + 38, 42, 40}, "-5", true)) st.ap_alt_ft = std::max(1500.0, st.ap_alt_ft - 500.0);
+        if (button(ui, {ax + 496, ay + 38, 42, 40}, "+5", true)) st.ap_alt_ft = std::min(13500.0, st.ap_alt_ft + 500.0);
+
+        if (button(ui, {ax + 552, ay + 38, 184, 40},
+                   st.ap_nav_valid ? (st.ap_nav_hold ? "NAV: TRACKING" : "NAV: DIRECT WP") : "NAV: NO ROUTE",
+                   st.ap_nav_valid, st.ap_master && st.ap_nav_hold && st.ap_nav_valid)) {
+            st.ap_nav_hold = !st.ap_nav_hold;
+            st.ap_master = true;
+        }
+    }
+
+    if (ui.state().parking_brake && !ui.is_chocked_or_tied()) {
+        panel(ui, {1240, 946, 652, 91});
+        label(ui, 1261, 974, 19, sys.is_engine_running()
+            ? "Parking brake set. X releases it, W adds power."
+            : "Engine stopped (cold & dark). Press Tab for Checklist or K to start.");
+    }
+    if (route_.empty()) {
+        ui.flush_hud(w, h, font_);
+        return;
+    }
+    panel(ui, {28, 946, 558, 91});
+    if (active_leg_ < route_.size()) {
+        const auto &p = route_[active_leg_];
+        const auto &s = ui.state();
+        const auto brg = int(std::lround(bearing(s.lat_deg, s.lon_deg, p.lat, p.lon))) % 360;
+        std::snprintf(line, sizeof(line), "VFR  %zu/%zu   %s   %03d T   %.1f NM",
+                      active_leg_ + 1, route_.size(), p.label.c_str(),
+                      brg, nspain::haversine_m(s.lat_deg, s.lon_deg, p.lat, p.lon) / nm_m);
+    } else std::snprintf(line, sizeof(line), "VFR route complete");
+    label(ui, 49, 974, 19, line);
+    ui.flush_hud(w, h, font_);
+}
+
+} // namespace nsim

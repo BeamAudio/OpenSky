@@ -1,0 +1,72 @@
+#version 460 core
+layout(local_size_x = 64) in;
+
+struct BldgGpu {
+    vec4 pos_yaw;    // x=east_m, y=ground_m, z=north_m, w=yaw_rad
+    vec4 scale_arch; // x=width_m, y=height_m, z=depth_m, w=archetype(0..5)
+    vec4 roof_ao;    // x=roof_r, y=roof_g, z=roof_b, w=canyon_ao
+};
+
+struct DrawCmd {
+    uint count;
+    uint instanceCount;
+    uint firstIndex;
+    int  baseVertex;
+    uint baseInstance;
+};
+
+layout(std430, binding = 0) readonly buffer AllBldgs { BldgGpu bldgs[]; };
+layout(std430, binding = 1) buffer DrawCmds { DrawCmd cmds[6]; };
+layout(std430, binding = 2) writeonly buffer VisIndices { uint vis_idx[]; };
+layout(std430, binding = 3) buffer ShadowDrawCmds { DrawCmd scmds[6]; };
+layout(std430, binding = 4) buffer Lod1DrawCmd { DrawCmd lod1_cmd; };
+layout(std430, binding = 5) writeonly buffer Lod1Indices { uint lod1_idx[]; };
+
+uniform uint u_total_bldgs;
+uniform uint u_max_per_arch;
+uniform uint u_max_lod1;
+uniform vec3 u_cam_enu;       // x=cam_east, y=cam_alt, z=cam_north
+uniform float u_max_dist_m;   // LOD0 outer radius
+uniform float u_far_dist_m;   // LOD1 outer radius (22km -> zero disappearing cities!)
+uniform vec4 u_frustum[5];
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= u_total_bldgs) return;
+
+    BldgGpu b = bldgs[id];
+    float dx = b.pos_yaw.x - u_cam_enu.x;
+    float dn = b.pos_yaw.z - u_cam_enu.z;
+    float d2 = dx * dx + dn * dn;
+    if (d2 > u_far_dist_m * u_far_dist_m) return;
+
+    float curv = d2 / (2.0 * 6378137.0);
+    vec3 center = vec3(dx, (b.pos_yaw.y - u_cam_enu.y) + b.scale_arch.y * 0.5 - curv, -dn);
+    float rad = max(b.scale_arch.x, max(b.scale_arch.y, b.scale_arch.z)) * 0.85 + 6.0;
+    for (int i = 0; i < 5; i++) {
+        if (dot(u_frustum[i].xyz, center) + u_frustum[i].w < -rad) return;
+    }
+
+    float d = sqrt(d2);
+    // Tier 0: Full 3D Spanish Architecture + Directional Shadows (0 .. u_max_dist_m)
+    if (d <= u_max_dist_m) {
+        uint arch = min(5u, uint(b.scale_arch.w + 0.5));
+        uint slot = atomicAdd(cmds[arch].instanceCount, 1u);
+        if (slot < u_max_per_arch) {
+            vis_idx[arch * u_max_per_arch + slot] = id;
+            atomicAdd(scmds[arch].instanceCount, 1u);
+        } else {
+            atomicAdd(cmds[arch].instanceCount, 0xFFFFFFFFu);
+        }
+    }
+    // Tier 1: Ultra-Low-LOD 10-Tri Far City Blocks (u_max_dist_m*0.80 .. 22km -> seamless cross-fade!)
+    if (d >= u_max_dist_m * 0.80) {
+        if (d > 11000.0 && max(b.scale_arch.x, b.scale_arch.z) < 8.0 && b.scale_arch.y < 7.0) return;
+        uint lslot = atomicAdd(lod1_cmd.instanceCount, 1u);
+        if (lslot < u_max_lod1) {
+            lod1_idx[lslot] = id;
+        } else {
+            atomicAdd(lod1_cmd.instanceCount, 0xFFFFFFFFu);
+        }
+    }
+}

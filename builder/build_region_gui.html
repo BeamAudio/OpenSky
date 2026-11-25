@@ -1,0 +1,559 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Northern Spain VFR — Regional Pack & Weather Compiler</title>
+<style>
+  :root{
+    --bg:#06101b;
+    --panel:#0b1624;
+    --border:#2a6a8a;
+    --accent:#ffd166;
+    --accent-dim:#ffeaa8;
+    --text:#d0d0d0;
+    --muted:#5f8ea3;
+    --ok:#4ade80;
+    --err:#f87171;
+    --font: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--font);font-size:13px}
+  body{display:flex;flex-direction:column;overflow:hidden}
+  header{background:#030a11;border-bottom:1px solid var(--border);padding:10px 16px;display:flex;align-items:center;gap:12px;flex-shrink:0}
+  header h1{font-size:14px;font-weight:600;letter-spacing:0.5px}
+  header span{font-size:11px;color:var(--muted)}
+  #app{flex:1;display:flex;flex-direction:column}
+  .notebook{flex:1;display:flex;overflow:hidden}
+  .tabbar{width:210px;background:#0b1624;border-right:1px solid var(--border);display:flex;flex-direction:column;flex-shrink:0}
+  .tabbar button{flex:1;background:transparent;border:none;border-bottom:1px solid #14273a;color:var(--muted);padding:12px 14px;text-align:left;cursor:pointer;font:inherit}
+  .tabbar button:hover{background:#0f2d3d;color:#b8e6ff}
+  .tabbar button.active{background:#14273a;color:#fff;border-left:3px solid var(--accent)}
+  .tabcontent{flex:1;overflow:auto;padding:12px;display:none}
+  .tabcontent.active{display:block}
+  h2{font-size:13px;color:#b8e6ff;margin-bottom:8px;border-bottom:1px solid #14273a;padding-bottom:4px}
+  .panel{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:10px}
+  .panel label{font-size:11.5px;color:var(--muted);display:flex;align-items:center;gap:6px;cursor:pointer}
+  .panel input[type=checkbox]{width:14px;height:14px;accent-color:var(--accent)}
+  .row{display:flex;gap:8px;align-items:center;margin-bottom:7px;flex-wrap:wrap}
+  .row label{flex-shrink:0}
+  input,select{background:#071220;border:1px solid #1f405a;color:#fff;padding:6px 8px;border-radius:4px;font:inherit;width:150px}
+  select{cursor:pointer}
+  input[type=text]{flex:1;min-width:140px}
+  .small{font-size:11px;color:var(--muted);margin-top:2px}
+  .btn{background:#14273a;border:1px solid var(--border);color:#fff;padding:7px 14px;border-radius:4px;cursor:pointer;font:inherit;font-weight:500}
+  .btn:hover{background:#1e3a5a;border-color:#3a8bc0}
+  .btn:disabled{opacity:.45;cursor:not-allowed}
+  .btn.primary{background:var(--accent);color:#0a1628;border-color:var(--accent)}
+  .btn.primary:hover{background:#ffe08a}
+  .btn.danger{background:#7a1f1f;border-color:#a33}
+  .btn.danger:hover{background:#a33}
+  .btn-group{display:flex;gap:6px;flex-wrap:wrap}
+  .mapwrap{background:#030a11;border:1px solid var(--border);border-radius:8px;position:relative;overflow:hidden;margin-bottom:8px;aspect-ratio:1280/860;width:100%}
+  .mapwrap img{display:block;width:100%;height:100%;object-fit:fill;cursor:crosshair;user-select:none}
+  #covhl{position:absolute;border:2px dashed #ffd166;background:rgba(255,209,102,.10);pointer-events:none;display:none}
+  #covpin{position:absolute;width:12px;height:12px;margin:-6px 0 0 -6px;border:2px solid #22d3ee;border-radius:50%;box-shadow:0 0 8px #000;pointer-events:none;display:none}
+  .toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px;font-size:11.5px;color:var(--muted)}
+  .toolbar label{display:flex;align-items:center;gap:4px;cursor:pointer;color:#b8e6ff}
+  .toolbar select{width:auto;padding:3px 6px;font-size:11.5px}
+  .badge{display:inline-block;padding:1px 7px;border-radius:4px;font-size:10px;font-weight:700;text-transform:uppercase;background:#14273a;color:#ffd166;border:1px solid #ffd166}
+  .modcard{background:#071220;border:1px solid #1f405a;border-radius:6px;padding:8px;margin-bottom:6px}
+  .modhead{display:flex;justify-content:space-between;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:4px}
+  .zdot{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px;vertical-align:middle}
+  .treewrap{border:1px solid var(--border);border-radius:6px;overflow:auto;max-height:220px}
+  table{width:100%;border-collapse:collapse;font-size:12px}
+  th{background:#0f2d3d;color:#b8e6ff;padding:6px 8px;text-align:left;font-size:11px;border-bottom:1px solid var(--border)}
+  td{padding:5px 8px;border-bottom:1px solid #14273a;color:#c8d4e0;cursor:pointer}
+  tr:hover td{background:#14273a}
+  td.kind{color:var(--muted)}
+  td.size{color:#9fb3c8;text-align:right}
+  .logwrap{background:#030a11;border:1px solid var(--border);border-radius:6px;flex-shrink:0;height:210px;display:flex;flex-direction:column}
+  .logwrap .bar{background:#0f2d3d;color:var(--muted);font-size:11px;padding:4px 8px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between}
+  #log{flex:1;background:#030a11;color:#c8d4e0;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:11px;padding:8px;overflow:auto;line-height:1.45;white-space:pre-wrap}
+  .logline{margin:0 0 3px 0}
+  .ok{color:var(--ok)} .err{color:var(--err)} .hdr{color:#8be9ff;font-weight:600}
+  .hint{font-size:11px;color:var(--muted);margin-top:6px}
+  .statuspill{display:inline-block;padding:1px 8px;border-radius:10px;font-size:10.5px;border:1px solid;background:#0a1628}
+  .status.idle{border-color:#2a6a8a;color:#5f8ea3}
+  .status.busy{border-color:#ffd166;color:#ffd166;animation:pulse 1.5s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.55}}
+  .preview{margin-top:10px;border:1px solid var(--border);border-radius:6px;background:#030a11;overflow:hidden}
+  .preview img{max-width:100%;max-height:220px;display:block;margin:auto}
+  .preview .cap{padding:6px 10px;font-size:11px;color:var(--muted);border-top:1px solid #14273a}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  @media(max-width:900px){.grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<header>
+  <div style="font-size:12px;letter-spacing:.6px">Northern Spain VFR</div>
+  <span>Regional Pack &amp; Weather Compiler</span>
+</header>
+<div id="app">
+  <div class="notebook">
+    <div class="tabbar">
+      <button class="tab active" data-tab="pack">Compiler + live previews</button>
+      <button class="tab" data-tab="weather">Weather library (.nswx)</button>
+    </div>
+    <div class="tabcontent active" id="tab-pack">
+      <div class="grid">
+        <div style="display:flex;flex-direction:column;gap:10px">
+          <div class="panel">
+            <div style="font-weight:600;color:#b8e6ff;margin-bottom:6px">Area of interest (select or set bbox)</div>
+            <div class="row">
+              <label style="flex-shrink:0">Preset</label>
+              <select id="preset" style="flex:1"></select>
+              <label><input type="checkbox" id="custom"> Custom bbox (lon_min lat_min lon_max lat_max)</label>
+            </div>
+            <div class="row">
+              <label style="flex-shrink:0">bbox</label>
+              <input type="text" id="bbox" value="-1.20 41.55 0.65 42.65">
+            </div>
+          </div>
+          <div class="panel">
+            <div style="font-weight:600;color:#b8e6ff;margin-bottom:6px">Detail / quality</div>
+            <div class="row">
+              <label style="flex-shrink:0">Quality</label>
+              <select id="quality" style="flex:1"></select>
+              <div id="qualitydesc" class="small" style="flex:1"></div>
+            </div>
+          </div>
+          <div class="panel">
+            <div style="font-weight:600;color:#b8e6ff;margin-bottom:6px">Baking steps (optional post-processing)</div>
+            <label style="display:block;margin:3px 0"><input type="checkbox" id="bakeweather" checked> Bake weather library (.nswx) first</label>
+            <label style="display:block;margin:3px 0"><input type="checkbox" id="bakecities" checked> Pre-bake cities + 10-TOD shadows/night RT</label>
+            <label style="display:block;margin:3px 0"><input type="checkbox" id="bakescenery"> Pre-bake OSM roads/buildings (.nsscn)</label>
+            <label style="display:block;margin:3px 0"><input type="checkbox" id="nonight"> Skip night lights bake</label>
+          </div>
+          <div class="panel">
+            <div class="btn-group" style="margin-bottom:6px">
+              <button class="btn" onclick="dryRun()">Preview plan (dry run)</button>
+              <button class="btn primary" id="btnBuild" onclick="buildPack()">Build pack</button>
+              <button class="btn" style="background:#0f3a2e;border-color:#4ade80;color:#d1fae5" onclick="launchSim()">Fly in Sim</button>
+              <button class="btn" onclick="openPacks()">Open packs/</button>
+            </div>
+            <div class="hint">Builds run server-side; log streams below. Cancelling is not supported — wait for completion.</div>
+          </div>
+          <div class="panel" style="display:flex;flex-direction:column;gap:6px">
+            <div style="display:flex;justify-content:space-between;align-items:center">
+              <div style="font-weight:600;color:#b8e6ff">Installed Modules &amp; Tile Quality</div>
+              <div class="btn-group">
+                <button class="btn" onclick="refreshModules()">Refresh</button>
+                <button class="btn" onclick="generatePreviews()">Render Heatmaps</button>
+              </div>
+            </div>
+            <div id="modulecards" class="small">Loading installed modules...</div>
+            <div class="treewrap">
+              <table id="zoomtable">
+                <thead><tr><th>Layer / Zoom</th><th>Tiles</th><th>Res (m/px)</th><th style="text-align:right">Size</th></tr></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+            <details style="margin-top:4px">
+              <summary class="small" style="cursor:pointer;color:#b8e6ff">Raw files in packs/ (click row to inspect image)</summary>
+              <div class="treewrap" style="margin-top:6px;max-height:150px">
+                <table id="packtable">
+                  <thead><tr><th style="width:42%">File</th><th>Contents</th><th style="width:72px">Size</th></tr></thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+            </details>
+          </div>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:10px">
+          <div class="panel" style="margin-bottom:0">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+              <div style="font-weight:600;color:#b8e6ff">Tile Coverage &amp; Quality Map (click anywhere to inspect tiles)</div>
+              <div id="covstats" class="small">—</div>
+            </div>
+            <div class="toolbar">
+              <select id="covregion" onchange="loadCoverage()"></select>
+              <label><input type="checkbox" class="covlayer" value="imagery" checked onchange="loadCoverage()"> Ortho</label>
+              <label><input type="checkbox" class="covlayer" value="elevation" onchange="loadCoverage()"> DEM</label>
+              <label><input type="checkbox" class="covlayer" value="surface" onchange="loadCoverage()"> Surface</label>
+              <label><input type="checkbox" class="covlayer" value="cities" checked onchange="loadCoverage()"> Cities 500m</label>
+              <label><input type="checkbox" class="covlayer" value="online" checked onchange="loadCoverage()"> Online Cache</label>
+              <select id="covzoom" onchange="loadCoverage()">
+                <option value="">All Z</option>
+                <option value="10">Z10</option><option value="11">Z11</option><option value="12">Z12</option>
+                <option value="13">Z13</option><option value="14">Z14</option><option value="15">Z15</option>
+                <option value="16">Z16</option><option value="17">Z17</option><option value="18">Z18</option>
+                <option value="19">Z19</option><option value="20">Z20</option>
+              </select>
+            </div>
+            <div class="mapwrap" id="covwrap">
+              <img id="covimg" alt="Tile Coverage Map" draggable="false">
+              <div id="covhl"></div>
+              <div id="covpin"></div>
+            </div>
+            <div class="hint" id="covhint">Gold dashed box = selected build preset/bbox. Left-click map to inspect ortho/DEM/baked-night/online tiles at coordinate.</div>
+          </div>
+          <div class="preview" style="margin-top:0">
+            <div style="padding:8px 12px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #14273a">
+              <div style="font-weight:600;color:#b8e6ff;font-size:12px">Tile Inspector</div>
+              <div id="previewname" class="small">—</div>
+            </div>
+            <div style="padding:8px;display:flex;align-items:center;justify-content:center;min-height:220px;color:var(--muted);font-size:12px" id="previewbox">
+              Click anywhere on the coverage map above to inspect Ortho, DEM, Baked City Night, and Online Cache tiles at that coordinate.
+            </div>
+            <div id="previewcap" class="cap">—</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="tabcontent" id="tab-weather">
+      <div class="panel">
+        <div style="font-weight:600;color:#b8e6ff;margin-bottom:6px">ERA5-calibrated mesoscale state library (.nswx)</div>
+        <div class="small">Builds <code>packs/es_aragon_weather.nswx</code> from real ERA5 reanalysis (Open-Meteo archive), solved offline (terrain flow, waves, slope circulation, LCL clouds).</div>
+        <div class="btn-group" style="margin-top:10px">
+          <button class="btn" onclick="wxSelftest()">Self-test weather solvers</button>
+          <button class="btn primary" onclick="wxBake(false)">Bake weather library (fetch/cache ERA5)</button>
+          <button class="btn" onclick="wxBake(true)">Bake weather library (offline/cache only)</button>
+          <button class="btn" onclick="generatePreviews()">Generate weather previews</button>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="logwrap">
+    <div class="bar">
+      <span id="logtitle">Build log (step by step)</span>
+      <span><span class="statuspill status idle" id="status">idle</span></span>
+    </div>
+    <div id="log"></div>
+  </div>
+</div>
+
+<script>
+const LOG = document.getElementById('log');
+const STATUS = document.getElementById('status');
+let logLines = [];
+function log(text, cls=''){
+  const d = document.createElement('div');
+  d.className = 'logline ' + cls;
+  d.textContent = text;
+  LOG.appendChild(d);
+  LOG.scrollTop = LOG.scrollHeight;
+}
+function clearLog(){ LOG.innerHTML=''; logLines=[]; }
+function setBusy(b){
+  STATUS.className = 'statuspill status ' + (b?'busy':'idle');
+  STATUS.textContent = b ? 'busy' : 'idle';
+  document.getElementById('btnBuild').disabled = b;
+  document.querySelectorAll('button').forEach(b=>{ if(b!==document.getElementById('btnBuild')) b.disabled=b; });
+}
+
+async function api(method, path, body){
+  const opts = { method, headers: {} };
+  if(body) opts.headers['Content-Type']='application/json', opts.body = JSON.stringify(body);
+  const r = await fetch('/api'+path, opts);
+  if(!r.ok) throw new Error((await r.text()).trim()||`HTTP ${r.status}`);
+  const ct = r.headers.get('content-type')||'';
+  return ct.includes('application/json') ? r.json() : r.text();
+}
+
+let PRESET_MAP = {};
+let COV_VIEW_BBOX = [-9.8, 39.8, 4.6, 44.2];
+let LOG_SEQ = 0;
+let WAS_BUSY = false;
+
+async function pollLogs(){
+  try{
+    const res = await api('GET', '/api/logs?since=' + LOG_SEQ);
+    if(typeof res.seq === 'number') LOG_SEQ = res.seq;
+    for(const line of (res.lines || [])){
+      const cls = line.includes('ERROR') || line.includes('FAIL') ? 'err' : (line.startsWith('===') ? 'hdr' : (line.includes('[done] exit code 0') || line.includes('[PASS]') ? 'ok' : ''));
+      log(line, cls);
+    }
+    setBusy(Boolean(res.busy));
+    if(WAS_BUSY && !res.busy){
+      await refreshModules();
+      await refreshPacks();
+      await loadCoverage();
+    }
+    WAS_BUSY = Boolean(res.busy);
+  }catch(e){}
+}
+setInterval(pollLogs, 750);
+
+async function loadMeta(){
+  const [presets, quality] = await Promise.all([api('GET','/api/presets'), api('GET','/api/quality')]);
+  PRESET_MAP = presets || {};
+  const ps = document.getElementById('preset');
+  ps.innerHTML = '';
+  for(const [key, p] of Object.entries(PRESET_MAP)){
+    const o = document.createElement('option'); o.value = key; o.textContent = p.name || key; ps.appendChild(o);
+  }
+  const qs = document.getElementById('quality');
+  qs.innerHTML = '';
+  for(const [key, q] of Object.entries(quality)){
+    const o = document.createElement('option'); o.value = key; o.textContent = key; qs.appendChild(o);
+  }
+  document.getElementById('bbox').disabled = !document.getElementById('custom').checked;
+  onPreset();
+  onQuality();
+}
+function onPreset(){
+  const p = document.getElementById('preset').value;
+  if(PRESET_MAP[p] && PRESET_MAP[p].bbox && !document.getElementById('custom').checked){
+    document.getElementById('bbox').value = PRESET_MAP[p].bbox.join(' ');
+  }
+  drawMap();
+}
+function onQuality(){
+  const q = document.getElementById('quality').value;
+  api('GET','/api/quality/'+encodeURIComponent(q)).then(qd=>{
+    document.getElementById('qualitydesc').textContent = qd.desc || '';
+  });
+}
+document.getElementById('preset').addEventListener('change', onPreset);
+document.getElementById('quality').addEventListener('change', onQuality);
+document.getElementById('custom').addEventListener('change', ()=>{
+  document.getElementById('bbox').disabled = !document.getElementById('custom').checked;
+  if(!document.getElementById('custom').checked) onPreset();
+  else drawMap();
+});
+document.getElementById('bbox').addEventListener('input', drawMap);
+
+function getBbox(){
+  const custom = document.getElementById('custom').checked;
+  let nums = null;
+  if(custom){
+    const parts = document.getElementById('bbox').value.trim().split(/\s+/);
+    if(parts.length === 4) nums = parts.map(parseFloat);
+  } else {
+    const key = document.getElementById('preset').value;
+    if(PRESET_MAP[key] && Array.isArray(PRESET_MAP[key].bbox)) nums = PRESET_MAP[key].bbox;
+  }
+  if(!nums || nums.length !== 4 || nums.some(isNaN)) return null;
+  return nums;
+}
+
+function drawMap(){
+  const hl = document.getElementById('covhl');
+  const bb = getBbox();
+  if(!bb || !COV_VIEW_BBOX){ hl.style.display='none'; return; }
+  const [vx0, vy0, vx1, vy1] = COV_VIEW_BBOX;
+  const [lon0, lat0, lon1, lat1] = bb;
+  const x0 = Math.max(0, Math.min(1, (lon0 - vx0) / (vx1 - vx0)));
+  const x1 = Math.max(0, Math.min(1, (lon1 - vx0) / (vx1 - vx0)));
+  const y0 = Math.max(0, Math.min(1, 1 - (lat1 - vy0) / (vy1 - vy0)));
+  const y1 = Math.max(0, Math.min(1, 1 - (lat0 - vy0) / (vy1 - vy0)));
+  if(x1 <= x0 || y1 <= y0){ hl.style.display='none'; return; }
+  hl.style.display = 'block';
+  hl.style.left = (x0 * 100).toFixed(2) + '%';
+  hl.style.top = (y0 * 100).toFixed(2) + '%';
+  hl.style.width = ((x1 - x0) * 100).toFixed(2) + '%';
+  hl.style.height = ((y1 - y0) * 100).toFixed(2) + '%';
+}
+
+async function loadCoverage(){
+  const rid = document.getElementById('covregion').value || '';
+  const layers = Array.from(document.querySelectorAll('.covlayer:checked')).map(c=>c.value).join(',') || 'imagery';
+  const z = document.getElementById('covzoom').value || '';
+  const params = new URLSearchParams({layers});
+  if(rid) params.set('region', rid);
+  if(z) params.set('z', z);
+  try{
+    const res = await api('GET', '/api/coverage?' + params.toString());
+    if(res.view_bbox) COV_VIEW_BBOX = res.view_bbox;
+    document.getElementById('covimg').src = '/api/preview/img/' + encodeURIComponent(res.image) + '?t=' + Date.now();
+    document.getElementById('covstats').textContent = `${res.regions} pack(s) | ${res.online_tiles} online tiles`;
+    drawMap();
+  }catch(e){
+    document.getElementById('covstats').textContent = e.message;
+  }
+}
+
+document.getElementById('covimg').addEventListener('click', async e=>{
+  const img = e.currentTarget;
+  const r = img.getBoundingClientRect();
+  if(r.width <= 0 || r.height <= 0) return;
+  const fx = (e.clientX - r.left) / r.width;
+  const fy = (e.clientY - r.top) / r.height;
+  const [vx0, vy0, vx1, vy1] = COV_VIEW_BBOX;
+  const lon = vx0 + fx * (vx1 - vx0);
+  const lat = vy1 - fy * (vy1 - vy0);
+  const pin = document.getElementById('covpin');
+  pin.style.display = 'block';
+  pin.style.left = (fx * 100).toFixed(2) + '%';
+  pin.style.top = (fy * 100).toFixed(2) + '%';
+  const rid = document.getElementById('covregion').value || '';
+  const p = new URLSearchParams({lat: lat.toFixed(5), lon: lon.toFixed(5)});
+  if(rid) p.set('region', rid);
+  try{
+    const info = await api('GET', '/api/inspect_point?' + p.toString());
+    document.getElementById('previewname').textContent = `${info.lat}, ${info.lon} (${info.pack || info.covering_preset || 'uninstalled'})`;
+    document.getElementById('previewbox').innerHTML = `<img src="/api/preview/img/${encodeURIComponent(info.image)}?t=${Date.now()}" alt="tile inspector" style="max-height:240px">`;
+    const parts = [];
+    if(info.covering_preset) parts.push(`Preset '${info.covering_preset}' covers this area (not built yet)`);
+    if(info.ortho_z) parts.push(`Ortho Z${info.ortho_z} (${info.ortho_gsd_m} m/px)`);
+    if(info.dem_z) parts.push(`DEM Z${info.dem_z} (${info.dem_gsd_m} m/px, ${info.elev_range_m ? info.elev_range_m.join('..')+'m' : ''})`);
+    if(info.city_chunk) parts.push(`Baked City chunk ${info.city_chunk}`);
+    if(info.online_z) parts.push(`Online ${info.online_provider} Z${info.online_z} (${info.online_gsd_m} m/px)`);
+    document.getElementById('previewcap').textContent = parts.join(' | ') || 'No tile data at coordinate';
+  }catch(err){
+    document.getElementById('previewcap').textContent = 'Inspect failed: ' + err.message;
+  }
+});
+
+// ---------- actions ----------
+async function dryRun(){ runBuild(true); }
+async function buildPack(){ if(!confirm('Start the build pipeline? This can take a long time.')) return; runBuild(false); }
+async function runBuild(dry){
+  const preset = document.getElementById('preset').value;
+  const quality = document.getElementById('quality').value;
+  const custom = document.getElementById('custom').checked;
+  let bbox = null;
+  if(custom){
+    const p = document.getElementById('bbox').value.trim().split(/\s+/);
+    if(p.length!==4){ alert('bbox must be 4 numbers: lon_min lat_min lon_max lat_max'); return; }
+    bbox = p.map(parseFloat);
+  }
+  const body = { preset, quality, dry_run: dry, custom, bbox,
+    bake_weather: document.getElementById('bakeweather').checked,
+    bake_cities: document.getElementById('bakecities').checked,
+    bake_scenery: document.getElementById('bakescenery').checked,
+    no_night: document.getElementById('nonight').checked };
+  clearLog(); setBusy(true); WAS_BUSY = true;
+  try{ await api('POST','/api/build', body); }
+  catch(err){ log('[ERROR] '+err.message, 'err'); setBusy(false); WAS_BUSY = false; }
+}
+async function wxSelftest(){ runWeather({selftest:true}); }
+async function wxBake(offline){ runWeather({offline}); }
+async function runWeather(body){
+  clearLog(); setBusy(true); WAS_BUSY = true;
+  try{ await api('POST','/api/weather', body); }
+  catch(err){ log('[ERROR] '+err.message, 'err'); setBusy(false); WAS_BUSY = false; }
+}
+async function verifyRegion(rid, packFile){
+  clearLog(); setBusy(true); WAS_BUSY = true;
+  try{ await api('POST','/api/verify', {region_id: rid, pack_file: packFile}); }
+  catch(err){ log('[ERROR] '+err.message, 'err'); setBusy(false); WAS_BUSY = false; }
+}
+async function removeRegion(rid){
+  if(!confirm(`Uninstall region '${rid}' and delete its .nspack / pre-baked files?`)) return;
+  clearLog(); setBusy(true); WAS_BUSY = true;
+  try{ await api('POST','/api/remove', {region_id: rid}); }
+  catch(err){ log('[ERROR] '+err.message, 'err'); setBusy(false); WAS_BUSY = false; }
+}
+
+async function refreshModules(){
+  try{
+    const mod = await api('GET','/api/modules');
+    const cards = document.getElementById('modulecards');
+    const tbody = document.querySelector('#zoomtable tbody');
+    const sel = document.getElementById('covregion');
+    const prevSel = sel.value;
+    cards.innerHTML = ''; tbody.innerHTML = ''; sel.innerHTML = '';
+
+    for(const oSpec of [['__all__', 'All Installed (Spain Map)']].concat((mod.regions||[]).map(r=>[r.region_id, `${r.region_id} (${r.quality.toUpperCase()})`]))){
+      const o = document.createElement('option'); o.value = oSpec[0]; o.textContent = oSpec[1]; sel.appendChild(o);
+    }
+    for(const r of (mod.regions || [])){
+      const cityTxt = r.city_shadows ? `Cities ${r.city_shadows.chunks} chunks (${r.city_shadows.gsd_m} m/px, 3L NightRT)` : 'No baked cities';
+      const wxTxt = r.weather ? `Weather ${r.weather.states} ERA5 states` : 'No weather';
+      const card = document.createElement('div');
+      card.className = 'modcard';
+      card.innerHTML = `
+        <div class="modhead">
+          <div><strong style="color:#fff">${escapeHtml(r.name)}</strong> <span class="badge">${escapeHtml(r.quality)}</span></div>
+          <div class="btn-group">
+            <button class="btn" style="padding:3px 8px;font-size:11px;background:#0f3a2e;border-color:#4ade80;color:#d1fae5" onclick="launchSim('${escapeHtml(r.region_id)}')">Fly</button>
+            <button class="btn" style="padding:3px 8px;font-size:11px" onclick="verifyRegion('${escapeHtml(r.region_id)}','${escapeHtml(r.pack_file)}')">Verify</button>
+            <button class="btn danger" style="padding:3px 8px;font-size:11px" onclick="removeRegion('${escapeHtml(r.region_id)}')">Remove</button>
+          </div>
+        </div>
+        <div class="small" style="color:#c8d4e0">Total <strong>${r.total_mb} MB</strong> | Ortho max <strong>Z${r.max_ortho_z}</strong> (${r.max_ortho_gsd_m} m/px) | DEM max <strong>Z${r.max_dem_z}</strong> (${r.max_dem_gsd_m} m/px) | ${r.airports_count} airports</div>
+        <div class="small">${escapeHtml(cityTxt)} | ${escapeHtml(wxTxt)}</div>`;
+      cards.appendChild(card);
+
+      for(const [lkey, lname] of [['imagery','Ortho'],['elevation','DEM'],['surface','Surface']]){
+        const layer = (r.layers && r.layers[lkey]) || {zooms:[]};
+        for(const zs of layer.zooms){
+          const tr = document.createElement('tr');
+          tr.innerHTML = `<td><span class="zdot" style="background:${escapeHtml(zs.color)}"></span>${escapeHtml(r.region_id)} · ${lname} Z${zs.z}</td><td>${zs.tiles}</td><td>${zs.gsd_m} m</td><td class="size">${zs.mb} MB</td>`;
+          tbody.appendChild(tr);
+        }
+      }
+      if(r.city_shadows){
+        const cs = r.city_shadows;
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td><span class="zdot" style="background:#fb923c"></span>${escapeHtml(r.region_id)} · Baked Cities/3L-Night</td><td>${cs.chunks} chunks</td><td>${cs.gsd_m} m</td><td class="size">${cs.size_mb} MB</td>`;
+        tbody.appendChild(tr);
+      }
+    }
+    const oc = mod.online_cache || {total_tiles:0, total_mb:0, by_provider_zoom:[]};
+    for(const oz of oc.by_provider_zoom){
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td><span class="zdot" style="background:${escapeHtml(oz.color)}"></span>Online (${escapeHtml(oz.provider)}) Z${oz.z}</td><td>${oz.tiles}</td><td>${oz.gsd_m} m</td><td class="size">${oz.mb} MB</td>`;
+      tbody.appendChild(tr);
+    }
+    if(!mod.regions || !mod.regions.length){
+      cards.textContent = 'No regional .nspack installed in packs/. Select a preset (or ALL SPAIN) above and click Build pack.';
+    }
+    if(prevSel && Array.from(sel.options).some(o=>o.value===prevSel)){
+      sel.value = prevSel;
+    } else if(mod.regions && mod.regions.length === 1){
+      sel.value = mod.regions[0].region_id;
+    }
+    await loadCoverage();
+  }catch(e){ log('[ERROR] refresh modules: '+e.message, 'err'); }
+}
+async function launchSim(rid){
+  const target = rid || document.getElementById('covregion').value || '__all__';
+  try{
+    const res = await api('POST','/api/launch_sim', {region_id: target});
+    log('[SIM] Launched flight simulator (' + res.region_id + ')', 'ok');
+  }catch(err){ log('[ERROR] launch sim: '+err.message, 'err'); }
+}
+
+async function refreshPacks(){
+  try{
+    const items = await api('GET','/api/packs');
+    const tbody = document.querySelector('#packtable tbody');
+    tbody.innerHTML = '';
+    for(const it of items){
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td class="kind" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escapeHtml(it.artifact)}</td><td class="kind">${escapeHtml(it.kind)}</td><td class="size">${escapeHtml(it.size)}</td>`;
+      tr.onclick = ()=>{ selectPack(it); };
+      tbody.appendChild(tr);
+    }
+  }catch(e){ log('[ERROR] refresh packs: '+e.message, 'err'); }
+}
+async function generatePreviews(){
+  clearLog(); setBusy(true); WAS_BUSY = true;
+  try{ await api('POST','/api/preview'); }
+  catch(err){ log('[ERROR] '+err.message, 'err'); setBusy(false); WAS_BUSY = false; }
+}
+function selectPack(it){
+  const p = document.getElementById('previewbox');
+  const cap = document.getElementById('previewcap');
+  const name = document.getElementById('previewname');
+  name.textContent = it.artifact;
+  cap.textContent = it.kind;
+  if(it.artifact.toLowerCase().endsWith('.png')){
+    p.innerHTML = `<img src="/api/preview/img/${encodeURIComponent(it.artifact)}?t=${Date.now()}" alt="preview">`;
+  } else {
+    p.innerHTML = `<div style="color:var(--muted);font-size:12px">Click anywhere on the coverage map above to inspect live tiles, or select a .png preview row.</div>`;
+  }
+}
+async function openPacks(){ try{ await api('POST','/api/openpacks'); }catch(e){} }
+
+document.querySelectorAll('.tab').forEach(tab=>{
+  tab.addEventListener('click', ()=>{
+    document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+    document.querySelectorAll('.tabcontent').forEach(t=>t.classList.remove('active'));
+    tab.classList.add('active');
+    document.getElementById('tab-'+tab.dataset.tab).classList.add('active');
+    drawMap();
+  });
+});
+
+function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":"&#39;"}[c])); }
+
+loadMeta();
+refreshModules();
+refreshPacks();
+</script>
+</body>
+</html>

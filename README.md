@@ -1,0 +1,135 @@
+# OpenSky VFR Simulator
+
+OpenSky is an iGPU-first VFR simulator project built around a native **C++20 / OpenGL 4.6** renderer. The first curated flight region is the Pyrenees in Aragón, with a Cessna 172S and a bundled **OpenSky World Editor**. The current runnable target is Linux with X11/GLX; Windows packaging and measured 1080p High support remain release milestones.
+
+The product target is 1920×1080 output at 60 FPS on integrated graphics, with the renderer allowed a bounded internal reconstruction scale. The current Renoir baseline is below that target in several High scenarios; see the delivery plan for gates and milestones.
+
+---
+
+## Architecture
+- `protocol/` — Shared `.nspack` binary pack specification ([pack_format.h](protocol/pack_format.h) / [pack_format.py](protocol/pack_format.py)).
+- `builder/` — Offline regional pack baker ([build_region.py](builder/build_region.py)) ingesting **IGN Spain PNOA**, **IGN MDT05/MDT25**, **OurAirports**, and **OpenStreetMap**. The World Editor also accepts user-licensed XYZ imagery and Terrarium elevation tiles outside Spain, or builds explicit elevation-only regions.
+- `sim_engine/` — C++20/OpenGL renderer with CDLOD terrain, instanced and baked city meshes, vegetation shading, reduced-resolution volumetric clouds, baked solar and night lighting, and reverse-Z terrain depth.
+- `engine/` — WGS84 geometry, C172S systems, mountain wind, OpenTrack UDP and the adapter to upstream JSBSim. The project-authored C172S aircraft data is kept separate from the LGPL library.
+- `game/` — Runtime textures, GLB models, factory C172S configuration and native libraries.
+- `docs/OPENSKY_VFR_DELIVERY_PLAN.md` — Product gates, delivery milestones and engine evolution plan.
+
+---
+
+## Quick Start (Linux)
+
+### 1. Bake a regional pack (Zaragoza LEZG – Huesca LEHC – Pyrenees corridor)
+```bash
+python3 builder/build_region.py --preset zaragoza-pyrenees-quick
+python3 builder/test_pack.py packs/es_aragon_pyrenees.nspack
+```
+For higher detail (`z15–z16` insets, full cruise `z10–z13`):
+```bash
+python3 builder/build_region.py --preset zaragoza-pyrenees
+```
+
+### 2. Build the native C++20 renderer
+```bash
+cd sim_engine && make -j"$(nproc)"
+```
+The build creates upstream JSBSim as a separate LGPL shared library in
+`game/bin/libJSBSim.so.1` and links the simulator to it dynamically. A clean
+build needs CMake 3.18 or newer. `CMAKE=/path/to/cmake` selects a non-default
+installation.
+
+### 3. Run the simulator
+```bash
+./run_sim.sh --online-ortho pnoa
+```
+Flights and visual QA start with online-first IGN PNOA imagery, distance-tiered
+(Z20 within 200 m, Z19 within 500 m, down to Z14 at 20 km). A cached online tile
+replaces the matching pack imagery; the installed imagery remains visible while
+downloads complete and remains the fallback offline. Downloads are asynchronous
+and the decoded tile cache is bounded. `O` toggles online imagery. Use
+`--online-ortho off` to force installed imagery for an offline comparison. The
+four-season review is `./run_sim.sh --season-qa /tmp/opensky-seasons`; a single
+season can be selected with `--season winter|spring|summer|autumn`.
+
+Run `./run_sim.sh --selftest` for the headless verification suite and
+`make -C sim_engine flight-test` for JSBSim trim, controls, terrain contacts,
+and braking checks. For GPU screenshots run
+`./run_sim.sh -- --autotest /tmp/opensky-visual-qa --online-ortho pnoa`.
+`./run_sim.sh -- --quick-profile /tmp/opensky-profile` captures two short High routes
+with startup, frame, GPU and resource traces. Use `--profile <dir>` to record while flying.
+See the [engine audit](docs/2026-11-23_opensky-engine-audit.md) for the compression comparison
+and verification cases.
+See the [current flight and weather audit](docs/2026-11-23_flight-weather-audit.md)
+for the JSBSim wiring, Earth curvature review, weather limitations and next gates.
+
+### Start a flight
+
+Open **World** to find the C172S at its home airport, Castejón de Sos, on a new save. Select an installed
+airfield and add it to your route, or use **Add map point** for a visual
+waypoint. The route appears on the globe and gives a true bearing and distance
+to the active waypoint in flight.
+
+Choose **Enter airport on foot**, then use `WASD` to walk and drag either mouse
+button or use the arrow keys to look around. Press `E` near the aircraft to refuel, repair, or
+board it. **Board at parking** starts from the parking spot. **Start on
+runway** lines the aircraft up for a manual departure. After landing, stop
+near an installed airfield and choose **Park and step outside** from the pause
+menu. That airfield becomes your temporary base, and the next session resumes
+from there. Castejón de Sos remains home. The aircraft's parked location, fuel,
+condition, engine hours, and route are saved locally.
+
+### World Editor
+
+Start it with `./run_builder.sh`. Choose a Northern Spain preset or draw custom bounds. For global regions, choose `local-xyz` and an imagery directory in `<root>/<z>/<x>/<y>.jpg|png|webp` layout, or choose `none` for terrain-only presentation. Elevation can use Terrarium XYZ PNG tiles in the same directory layout. Imported layers require an attribution string; the pack manifest records it. Custom region IDs derive from all four bounds so separate areas do not collide.
+
+For OSM roads and baked settlements outside the bundled Spain extracts, provide a local `.pbf` extract. Spanish region builds bake IGN LiDAR canopy across the full selected region at Z15 by default and derive coarser levels for distance. OSM taxiways and apron polygons are drawn with the airport runway surfaces in every region. In flight, canopy heights share the fixed terrain page cache with the orthophoto and ground elevation.
+
+### Controls
+| Input | Action |
+|---|---|
+| `W` / `S` | Throttle up / down |
+| `A` / `D` | Roll / bank |
+| `↑` / `↓` | Pitch down / up |
+| `Q` / `E` | Rudder left / right |
+| Right-drag mouse | Look around in all camera views (`R` centers view and mouse yoke) |
+| Left-drag mouse | Look around when mouse yoke is off |
+| `Y` | Toggle mouse yoke (off by default); move the mouse to steer and hold the deflection |
+| `R` | Center the mouse yoke and cockpit view |
+| `C` | Cycle camera: Cockpit → Chase → Free Cam |
+| `Page Up` / `Page Down` | Raise / lower the cockpit seat |
+| `Home` / `End` | Move the cockpit seat forward / back |
+| `Backspace` | Reset the cockpit seat position |
+| `Esc` / `Space` | Pause to the World screen |
+| `X` | Release the parking brake, or hold for wheel brakes |
+| Settings | Adjust terrain LOD, online imagery, aircraft and weather detail, super-resolution, AA, and native cockpit resolution |
+| `K` | Toggle cold & dark / running engine |
+| `F` / `V` | Flaps down / up |
+| `9` | Toggle high-speed slew |
+| `F1`–`F4` | Graphics tier: Low (iGPU) → Medium → High → Ultra |
+| `F5` | Live CPU, GPU, memory and frame-time profiler |
+| `F6` | Cycle the four terrain-following weather debug layers |
+| `F7` | Aircraft physics telemetry and projected vectors |
+| `L` | Toggle real UTC sun vs fixed pre-baked TOD |
+| `P` | Cycle 10 pre-baked TODs + night |
+| `B` | Advance weather |
+| `M` | Cycle mesoscale wind regime |
+| `O` | Toggle distance-tiered PNOA online ortho |
+| `H` | Toggle diagnostic overlay |
+
+---
+
+## Delivery status
+
+The output remains 1920×1080. The default graphics setting shades 60% of native pixels (about 1488×837) and reconstructs terrain and sky to output resolution. In cockpit view, the cockpit can bypass that reduced-resolution grid and draw at native output resolution with its own depth buffer and matching AgX/Spain LUT transform. The Graphics Settings menu allows a 40–100% pixel budget, spatial FXAA or two TAA modes, a 75–150% terrain mesh LOD radius, and a cockpit native-resolution toggle. Settings persist in the user's OpenSky config directory. Performance figures in the [engine audit](docs/2026-11-23_opensky-engine-audit.md) were captured before these reconstruction changes and need a fresh comparison before they can describe the new default.
+
+See [the full delivery plan](docs/OPENSKY_VFR_DELIVERY_PLAN.md) for remaining milestones and release gates.
+
+## Attribution (Required)
+- **Orthophoto:** PNOA cedido por © Instituto Geográfico Nacional de España (CC-BY 4.0).
+- **Elevation & Hydrography:** MDT05 / MDT25 & INSPIRE Hidrografía © Instituto Geográfico Nacional de España (CC-BY 4.0); border fallback AWS Terrain Tiles.
+- **Airports & Scenery:** OurAirports (Public Domain), OpenStreetMap contributors (ODbL), ENAIRE AIP.
+- **PBR Ground & Material Textures:** Poly Haven (CC0 1.0 Public Domain).
+
+## License
+Project source is MIT (`LICENSE`). Third-party code, data and assets keep their
+own licenses — see `THIRD_PARTY_LICENSES.md`. Generated OSM-derived packs are
+ODbL share-alike; do not redistribute them under MIT.

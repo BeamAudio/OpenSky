@@ -12,6 +12,26 @@ The game is built around unhurried exploration rather than missions or ownership
 - **Windows 11:** a supported build and installer are not available yet.
 - **Commercial release:** not published. Asset and data redistribution rights still need to clear the gates in [release readiness](docs/RELEASE_READINESS.md).
 
+## Screenshots
+
+Captured from the running game at 1920×1080 with Ultra quality and 500% terrain LOD.
+
+| Castejón de Sos — cockpit | Castejón de Sos — chase view |
+|---|---|
+| ![Cessna cockpit above Castejón de Sos](docs/images/promo_cockpit_castejon.png) | ![Cessna over the Castejón de Sos valley](docs/images/promo_chase_castejon.png) |
+
+| Barcelona coast — cockpit | Barcelona coast — chase view |
+|---|---|
+| ![Cockpit view along Barcelona's coast](docs/images/promo_cockpit_barcelona_beaches.png) | ![Chase view above Barcelona and its harbor](docs/images/promo_chase_barcelona_beaches.png) |
+
+| Platja de Pals | Catalan Pyrenees — cockpit |
+|---|---|
+| ![Chase view over the Costa Brava shoreline at Platja de Pals](docs/images/promo_chase_pals_beach.png) | ![Cockpit view toward the Catalan Pyrenees](docs/images/promo_cockpit_catalan_pyrenees.png) |
+
+| Catalan Pyrenees — chase view | Mediano reservoir |
+|---|---|
+| ![Chase view across the Catalan Pyrenees](docs/images/promo_chase_catalan_pyrenees.png) | ![Cessna above Mediano reservoir in Aragón](docs/images/promo_chase_mediano.png) |
+
 ## Getting started
 
 Players should eventually install a complete desktop release. Until that release is published, contributors can build the Linux development version from source:

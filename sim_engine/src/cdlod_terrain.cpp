@@ -574,7 +574,7 @@ void CdlodTerrain::update_and_render(
 
     // Balanced LOD distance scale keeps sharp L8/L9 near camera while hitting 60 FPS on Renoir iGPUs
     float q_mult = (quality == 0) ? 2.25f : (quality == 1 ? 2.65f : (quality == 2 ? 2.90f : 3.45f));
-    q_mult *= std::clamp(lod_distance_percent, 75, 200) / 100.0f;
+    q_mult *= std::clamp(lod_distance_percent, 75, 500) / 100.0f;
     for (int l = 1; l <= AsyncTerrainStreamer::MAX_LOD; l++) {
         double quad_size = AsyncTerrainStreamer::WORLD_SPAN_M / static_cast<double>(1u << l);
         lod_ranges_[l] = static_cast<float>(quad_size * q_mult);

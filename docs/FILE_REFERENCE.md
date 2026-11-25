@@ -29,6 +29,14 @@ In grouped asset rows, filenames following the first path use the same parent di
 | `docs/FILE_REFERENCE.md` | This maintained file catalog. |
 | `docs/RELEASE_READINESS.md` | Release platform, rights and packaging gates. |
 | `docs/airport-data-sources.md` | Provenance and reuse notes for airport data. |
+| `docs/images/promo_cockpit_barcelona_beaches.png` | Ultra quality cockpit capture above Barcelona's coast. |
+| `docs/images/promo_chase_barcelona_beaches.png` | Ultra quality chase capture above Barcelona and its harbor. |
+| `docs/images/promo_chase_pals_beach.png` | Ultra quality chase capture along the Platja de Pals shoreline. |
+| `docs/images/promo_cockpit_catalan_pyrenees.png` | Ultra quality cockpit capture over the Catalan Pyrenees. |
+| `docs/images/promo_chase_catalan_pyrenees.png` | Ultra quality chase capture over the Catalan Pyrenees. |
+| `docs/images/promo_cockpit_castejon.png` | Ultra quality cockpit capture above the Castejón de Sos valley. |
+| `docs/images/promo_chase_castejon.png` | Ultra quality chase capture above the Castejón de Sos valley. |
+| `docs/images/promo_chase_mediano.png` | Ultra quality chase capture above Mediano reservoir. |
 | `docs/2026-11-23_opensky-engine-audit.md` | Dated engine architecture and performance review. |
 | `docs/2026-11-23_flight-weather-audit.md` | Dated flight model and weather review. |
 | `docs/benchmarks/2026-11-23-renoir-linux.md` | Renoir frame-time measurements and capture settings. |

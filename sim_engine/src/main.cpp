@@ -302,6 +302,7 @@ int main(int argc, char **argv) {
     bool bench_only = false;
     bool cloud_qa = false;
     bool cockpit_qa = false;
+    bool promo_only = false;
     bool season_qa = false;
     std::string req_region;
     std::string req_airport;
@@ -335,6 +336,7 @@ int main(int argc, char **argv) {
         else if (a == "--runtime-check-gpu") runtime_check = runtime_check_gpu = true;
         else if (a == "--outlook-check") runtime_check = outlook_check = true;
         else if (a == "--bench-only") bench_only = true;
+        else if (a == "--promo-only") promo_only = true;
         else if (a == "--debug-overlays") debug_overlays = true;
         else if (a == "--no-audio") no_audio = true;
         else if ((a == "--profile" || a == "--quick-profile") && i + 1 < argc) {
@@ -419,6 +421,16 @@ int main(int argc, char **argv) {
         return 1;
     }
     GraphicsSettings graphics_settings = load_graphics_settings();
+    if (promo_only) {
+        // Promotional captures deliberately render the highest quality tier
+        // and a wider terrain radius without changing the user's saved settings.
+        graphics_settings.quality_preset = 3;
+        graphics_settings.pixel_percent = 100;
+        graphics_settings.aa_mode = 2;
+        graphics_settings.terrain_lod_percent = 500;
+        graphics_settings.weather_detail = 3;
+        graphics_settings.aircraft_detail = 1;
+    }
     const auto profile_file = interactive_run
         ? graphics_settings_path().parent_path() / "fleet.ini" : std::filesystem::path{};
     const auto aircraft_roots = std::vector<std::filesystem::path>{
@@ -509,6 +521,7 @@ int main(int argc, char **argv) {
     profiler.startup_stage("window_and_gl");
 
     int quality = interactive_run ? graphics_settings.quality_preset : 2; // 0=LOW iGPU, 1=MEDIUM, 2=HIGH, 3=ULTRA
+    if (promo_only) quality = 3;
     int tod_slot = (quick_profile || !autotest_dir.empty() || !topdown_dir.empty() || !airport_qa_dir.empty()) ? 2 : graphics_settings.time_of_day;
     // CLI selection enables repeatable QA captures; N cycles the same states during play.
     float wx_advance = 0.28f; // 0.0=Clear, 0.28=Fair SCT, 0.60=Broken, 0.92=Overcast/Rain!
@@ -808,7 +821,7 @@ int main(int argc, char **argv) {
         // Proactive closed-loop thermal + 60 FPS frame-time guard (<80 C ceiling on laptop APUs):
         // smoothly reduces internal resolution, worker burst, cloud rays, and frame ceiling under heat.
         double wall_now = PlatformWindow::now_sec();
-        if (topdown_dir.empty() && airport_qa_dir.empty() && (wall_now - last_thermal_check_t) >= 0.5) {
+        if (!promo_only && topdown_dir.empty() && airport_qa_dir.empty() && (wall_now - last_thermal_check_t) >= 0.5) {
             last_thermal_check_t = wall_now;
             const double temp_c = FlightProfiler::peak_package_temp_c();
             const double avg_ms = profiler.enabled() ? profiler.frame_avg_ms() : cur_avg_ms;
@@ -834,9 +847,10 @@ int main(int argc, char **argv) {
                 thermal_fps_cap = 60.0;
             }
         }
-        const int eff_pixel_pct = (topdown_dir.empty() && airport_qa_dir.empty())
-            ? std::min(render_settings.pixel_percent, thermal_pixel_cap)
-            : render_settings.pixel_percent;
+        const int eff_pixel_pct = promo_only ? render_settings.pixel_percent
+            : ((topdown_dir.empty() && airport_qa_dir.empty())
+                ? std::min(render_settings.pixel_percent, thermal_pixel_cap)
+                : render_settings.pixel_percent);
         const bool walking = frontend.walking() && !route_play.active;
         const auto &walker = frontend.walker();
         const double lat = walking ? walker.lat : st.lat_deg;
@@ -1706,7 +1720,7 @@ int main(int argc, char **argv) {
         tod_slot = 2;
         wx_advance = 0.28f;
 
-        if (!bench_only && !cloud_qa && !cockpit_qa) {
+        if (!bench_only && !cloud_qa && !cockpit_qa && !promo_only) {
         // Export whole-corridor 50km Pyrenees 10-TOD Shadow & Valley Sky-AO Map for direct visual inspection!
         {
             int sw = pack.corridor_dem_w(), sh = pack.corridor_dem_h();
@@ -1745,10 +1759,12 @@ int main(int argc, char **argv) {
             s.slew_fast = false;
             s.view_mode = vmode;
             double gnd = pack.sample_elevation(lat, lon);
+            if (promo_only) transition_world(lat, lon);
             ac_hud.reset_flight(lat, lon, gnd + agl, hdg, 100.0, false);
-            // Drop queued requests from the previous QA site without evicting
-            // resident close pages that may still cover this route.
-            streamer.clear_pending_requests();
+            // Ordinary QA shots share one region anchor. Promo shots move
+            // across large areas, so transition_world reanchors and cancels
+            // stale work while preserving the target site's prewarm requests.
+            if (!promo_only) streamer.clear_pending_requests();
             s.pitch_deg = pitch;
             s.roll_deg = roll;
             s.aileron = ail;
@@ -1765,12 +1781,13 @@ int main(int argc, char **argv) {
             s.look_pitch_deg = look_pitch;
             sky_clouds.reset_temporal_history();
             // Drain all 9 CDLOD split passes (L2 -> L9), TOD shadow refreshes & local tree cells cleanly for steady-state visual inspection!
-            const int warm_frames = cockpit_qa ? 5 : 14;
+            const int warm_frames = cockpit_qa ? 5 : (promo_only ? 20 : 14);
             for (int w = 0; w < warm_frames; w++) {
                 win.poll_events();
                 step_flight(1.0 / 60.0);
                 capture_frame(1.0 / 60.0, draw_hud, 128);
                 if (cockpit_qa) streamer.flush_pending_sync(4, 0.12);
+                else if (promo_only) streamer.flush_pending_sync(8, 0.05);
                 else streamer.flush_pending_sync(24, 0.25);
             }
             std::string p = autotest_dir + "/" + fname;
@@ -1830,6 +1847,37 @@ int main(int argc, char **argv) {
             wx_advance = 0.28f;
             profiler.finish();
             std::printf("[COCKPIT-QA] Cockpit view captures complete -> %s\n", autotest_dir.c_str());
+            return 0;
+        }
+
+        if (promo_only) {
+            if (req_region == "es_catalonia_coast") {
+                snap("promo_cockpit_barcelona_beaches.png", 41.3640, 2.1990, 900.0, 305.0, -2.0, 0,
+                     0.0, 0.0f, -3.0f, 0.0, 0.0, false);
+                snap("promo_chase_barcelona_beaches.png", 41.3640, 2.1990, 900.0, 305.0, -2.0, 1,
+                     0.0, 0.0f, -7.0f, 0.0, 0.0, false);
+                snap("promo_cockpit_pals_beach.png", 41.9929, 3.2011, 500.0, 180.0, -2.0, 0,
+                     0.0, 0.0f, -3.0f, 0.0, 0.0, false);
+                snap("promo_chase_pals_beach.png", 41.9929, 3.2011, 500.0, 180.0, -2.0, 1,
+                     0.0, 0.0f, -7.0f, 0.0, 0.0, false);
+            } else if (req_region == "es_catalonia_pyrenees") {
+                snap("promo_cockpit_catalan_pyrenees.png", 42.3387, 1.4092, 950.0, 350.0, -2.0, 0,
+                     0.0, 0.0f, -3.0f, 0.0, 0.0, false);
+                snap("promo_chase_catalan_pyrenees.png", 42.3387, 1.4092, 950.0, 350.0, -2.0, 1,
+                     0.0, 0.0f, -7.0f, 0.0, 0.0, false);
+            } else {
+                snap("promo_cockpit_mediano.png", 42.31750, 0.20370, 600.0, 18.0, -3.0, 0,
+                     0.0, 0.0f, -4.0f, 0.0, 0.0, false);
+                snap("promo_chase_mediano.png", 42.31750, 0.20370, 600.0, 18.0, -3.0, 1,
+                     0.0, 0.0f, -7.0f, 0.0, 0.0, false);
+                snap("promo_cockpit_castejon.png", 42.53131, 0.47676, 350.0, 315.0, -3.0, 0,
+                     0.0, 0.0f, -4.0f, 0.0, 0.0, false);
+                snap("promo_chase_castejon.png", 42.53131, 0.47676, 350.0, 315.0, -3.0, 1,
+                     0.0, 0.0f, -7.0f, 0.0, 0.0, false);
+            }
+            profiler.finish();
+            std::printf("[PROMO-QA] Scenic cockpit and chase captures complete for %s -> %s\n",
+                        req_region.empty() ? "Aragon" : req_region.c_str(), autotest_dir.c_str());
             return 0;
         }
 

@@ -1,5 +1,7 @@
 # OpenSky VFR Simulator delivery plan
 
+> Historical planning document. For current product rules and engine priorities, see [AGENTS.md](../AGENTS.md) and the [engine handoff](ENGINE_HANDOFF.md).
+
 ## The launch promise
 
 OpenSky VFR Simulator is a PC flight simulator for players who want the pleasure of flying low over recognizable landscapes on an integrated graphics laptop. The factory aircraft is the Cessna 172S. The shipped world is the Pyrenees and its Aragón approach corridor. The bundled **OpenSky World Editor** lets players build, install, and fly their own regional scenery from available sources, without a publisher having to package each location.

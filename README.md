@@ -2,7 +2,7 @@
 
 OpenSky is an iGPU-first VFR simulator project built around a native **C++20 / OpenGL 4.6** renderer. The first curated flight region is the Pyrenees in Aragón, with a Cessna 172S and a bundled **OpenSky World Editor**. The current runnable target is Linux with X11/GLX; Windows packaging and measured 1080p High support remain release milestones.
 
-The product target is 1920×1080 output at 60 FPS on integrated graphics, with the renderer allowed a bounded internal reconstruction scale. The current Renoir baseline is below that target in several High scenarios; see the delivery plan for gates and milestones.
+The product target is 1920×1080 output at 60 FPS on integrated graphics, with the renderer allowed a bounded internal reconstruction scale. The current Renoir baseline is below that target in several High scenarios. See the [engine handoff](docs/ENGINE_HANDOFF.md) for the latest measurements and next work.
 
 ---
 
@@ -12,7 +12,8 @@ The product target is 1920×1080 output at 60 FPS on integrated graphics, with t
 - `sim_engine/` — C++20/OpenGL renderer with CDLOD terrain, instanced and baked city meshes, vegetation shading, reduced-resolution volumetric clouds, baked solar and night lighting, and reverse-Z terrain depth.
 - `engine/` — WGS84 geometry, C172S systems, OpenTrack UDP and the adapter to upstream JSBSim. The project-authored C172S aircraft data is kept separate from the LGPL library.
 - `game/` — Runtime textures, GLB models, factory C172S configuration and native libraries.
-- `docs/OPENSKY_VFR_DELIVERY_PLAN.md` — Product gates, delivery milestones and engine evolution plan.
+- [Engine handoff](docs/ENGINE_HANDOFF.md) — Current state, verification commands, and the next engine milestone.
+- [Earlier delivery plan](docs/OPENSKY_VFR_DELIVERY_PLAN.md) — Historical milestones and engine design notes.
 
 ---
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "aircraft_condition.hpp"
+#include "aircraft_package.hpp"
 
 #include "../../engine/src/c172_systems.hpp"
 #include "../../engine/src/opentrack_udp.hpp"
@@ -97,7 +98,8 @@ public:
     AircraftAndHud() = default;
     ~AircraftAndHud();
 
-    bool init(const PackReader *pack, const std::string &asset_root, const std::string &aircraft_dir, const std::string &shader_root);
+    bool init(const PackReader *pack, const std::string &asset_root, const AircraftPackage &aircraft,
+              const std::string &shader_root);
     bool init_physics(const PackReader *pack, const std::string &aircraft_dir);
     void shutdown();
 
@@ -142,8 +144,8 @@ public:
     void sync_walkaround_damage(const AircraftCareSnapshot &care);
     void quick_start_or_shutdown();
     bool is_chocked_or_tied() const { return chocks_on_ || tie_downs_on_; }
-    const nspain::C172Systems &systems() const { return systems_; }
-    nspain::C172Systems &systems() { return systems_; }
+    const nspain::PistonAircraftSystems &systems() const { return systems_; }
+    nspain::PistonAircraftSystems &systems() { return systems_; }
     Vec3 cockpit_shake_pos() const { return cockpit_shake_pos_; }
     Vec2 cockpit_shake_rot() const { return cockpit_shake_rot_; }
     Vec3 cockpit_look_feel() const { return cockpit_look_feel_; } // x=yaw_deg (look into bank), y=pitch_deg, z=roll_deg
@@ -158,6 +160,7 @@ private:
                           double sim_time_sec, double rudder, double brake_left, double brake_right);
     void resolve_world_collisions(double dt);
     void apply_damage_rig(std::vector<Mat4> &anim, float flaps_rad, float ail, float elv, float trm, float rud) const;
+    std::string visual_node_name(const GlbMeshData &mesh, const char *fallback) const;
     friend class AircraftSession;
     void flush_hud(float width, float height, GLuint font = 0);
     struct HudVert {
@@ -183,9 +186,10 @@ private:
     );
 
     const PackReader *pack_ = nullptr;
+    AircraftPackage aircraft_{};
     nspain::FlightModel fdm_;
     double departure_lat_ = 0, departure_lon_ = 0, departure_heading_ = 0;
-    nspain::C172Systems systems_;
+    nspain::PistonAircraftSystems systems_;
     nspain::OpenTrackUDP opentrack_;
     LocalAirSample last_air_{};
     FlightSimState st_{};

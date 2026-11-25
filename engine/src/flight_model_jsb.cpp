@@ -115,13 +115,13 @@ bool FlightModel::load(const std::string &aircraft_dir) {
         const auto propulsion = exec.GetPropulsion();
         const auto reactions = exec.GetGroundReactions();
         if (propulsion->GetNumEngines() != 1 || propulsion->GetNumTanks() != 2 || reactions->GetNumGearUnits() < 3) {
-            std::fprintf(stderr, "[JSBSIM] The factory C172S requires one engine, two tanks and three wheels\n");
+            std::fprintf(stderr, "[JSBSIM] Aircraft package needs one piston engine, two fuel tanks and at least three gear units\n");
             return false;
         }
         next->piston = dynamic_cast<JSBSim::FGPiston *>(propulsion->GetEngine(0).get());
         if (next->piston) next->prop = dynamic_cast<JSBSim::FGPropeller *>(next->piston->GetThruster());
         if (!next->prop) {
-            std::fprintf(stderr, "[JSBSIM] The factory C172S requires a piston engine and propeller\n");
+            std::fprintf(stderr, "[JSBSIM] Aircraft package needs a piston engine with a propeller\n");
             return false;
         }
         for (int i = 0; i < reactions->GetNumGearUnits(); ++i) reactions->GetGearUnit(i)->SetReport(false);

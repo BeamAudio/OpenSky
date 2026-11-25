@@ -1,6 +1,7 @@
 #include "fleet_profile.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <fstream>
 #include <iomanip>
@@ -17,10 +18,16 @@ bool read_profile(std::istream &in, FleetProfile &profile) {
     int version = 0;
     auto &care = profile.care_;
     size_t route_count = 0;
-    if (!(in >> version) || (version < 1 || version > 3) ||
-        !(in >> std::quoted(profile.parked_id_) >> care.left_fuel_gal >> care.right_fuel_gal >>
-          care.airframe_damage >> profile.hours_ >> route_count) ||
-        route_count > max_route_points || profile.parked_id_.size() > 64) return false;
+    if (!(in >> version) || (version < 1 || version > 4) ||
+        !(in >> std::quoted(profile.parked_id_)) || profile.parked_id_.size() > 64) return false;
+    if (version >= 4) {
+        if (!(in >> std::quoted(profile.aircraft_id_)) || profile.aircraft_id_.empty() || profile.aircraft_id_.size() > 48 ||
+            !std::all_of(profile.aircraft_id_.begin(), profile.aircraft_id_.end(), [](unsigned char c) {
+                return std::isalnum(c) || c == '_' || c == '-';
+            })) return false;
+    }
+    if (!(in >> care.left_fuel_gal >> care.right_fuel_gal >> care.airframe_damage >> profile.hours_)) return false;
+    if (!(in >> route_count) || route_count > max_route_points) return false;
     for (size_t i = 0; i < route_count; ++i) {
         FleetRoutePoint point{};
         if (!(in >> std::quoted(point.label) >> point.lat >> point.lon) ||
@@ -84,14 +91,14 @@ bool read_profile(std::istream &in, FleetProfile &profile) {
         if (!std::isfinite(*value)) return false;
         *value = std::clamp(*value, 0.0, 1.0);
     }
-    care.left_fuel_gal = std::clamp(care.left_fuel_gal, 0.0, 26.5);
-    care.right_fuel_gal = std::clamp(care.right_fuel_gal, 0.0, 26.5);
-    care.oil_quarts = std::clamp(care.oil_quarts, 0.0, 8.0);
+    care.left_fuel_gal = std::clamp(care.left_fuel_gal, 0.0, 150.0);
+    care.right_fuel_gal = std::clamp(care.right_fuel_gal, 0.0, 150.0);
+    care.oil_quarts = std::clamp(care.oil_quarts, 0.0, 40.0);
     care.oil_hours = std::max(0.0, care.oil_hours);
     care.airframe_damage = std::clamp(care.airframe_damage, 0.0, 1.0);
     care.gear_alignment = std::clamp(care.gear_alignment, -1.0, 1.0);
     care.fuel_selector = std::clamp(care.fuel_selector, 0, 3);
-    care.flaps_deg = std::clamp(care.flaps_deg, 0.0, 30.0);
+    care.flaps_deg = std::clamp(care.flaps_deg, 0.0, 60.0);
     care.mixture = std::clamp(care.mixture, 0.0, 1.0);
     profile.hours_ = std::max(0.0, profile.hours_);
     in >> std::ws;
@@ -130,7 +137,8 @@ bool write_fleet_profile(const std::filesystem::path &path, const FleetProfile &
     std::ofstream out(pattern, std::ios::trunc);
     const auto &c = profile.care_;
     const auto &pos = profile.parking_spot_;
-    out << std::setprecision(12) << 3 << '\n' << std::quoted(profile.parked_id_) << '\n'
+    out << std::setprecision(12) << 4 << '\n' << std::quoted(profile.parked_id_) << '\n'
+        << std::quoted(profile.aircraft_id_) << '\n'
         << c.left_fuel_gal << ' ' << c.right_fuel_gal << ' ' << c.airframe_damage << ' ' << profile.hours_ << '\n'
         << profile.route_.size() << '\n';
     for (const auto &p : profile.route_) out << std::quoted(p.label) << ' ' << p.lat << ' ' << p.lon << '\n';

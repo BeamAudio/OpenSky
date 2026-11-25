@@ -22,11 +22,22 @@ constexpr const char *BREAKER_NAMES[CB_COUNT] = {
 };
 } // namespace
 
-C172Systems::C172Systems() {
+PistonAircraftSystems::PistonAircraftSystems() {
     reset_to_running_default();
 }
 
-void C172Systems::reset_to_running_default() {
+void PistonAircraftSystems::configure(const PistonSystemsConfig &config) {
+    config_.left_tank_capacity_gal = std::clamp(config.left_tank_capacity_gal, 1.0, 150.0);
+    config_.right_tank_capacity_gal = std::clamp(config.right_tank_capacity_gal, 1.0, 150.0);
+    config_.oil_capacity_quarts = std::clamp(config.oil_capacity_quarts, 1.0, 40.0);
+    config_.max_flaps_deg = std::clamp(config.max_flaps_deg, 1.0, 60.0);
+    config_.bus_voltage = config.bus_voltage < 20.0 ? 14.0 : 28.0;
+    set_tank_gallons(fuel_left_gal_, fuel_right_gal_);
+    set_oil_state(oil_quarts_, oil_hours_);
+    set_flaps_immediate_deg(flaps_actual_deg_);
+}
+
+void PistonAircraftSystems::reset_to_running_default() {
     master_battery_ = true;
     master_alternator_ = true;
     avionics_master_ = true;
@@ -41,13 +52,13 @@ void C172Systems::reset_to_running_default() {
     flaps_actual_deg_ = 0.0;
 
     battery_soc_ = 0.96;
-    bus_volts_ = 28.0;
+    bus_volts_ = config_.bus_voltage;
     ammeter_amps_ = 2.0;
     load_amps_ = 10.5;
     low_volts_annunciator_ = false;
 
-    fuel_left_gal_ = 21.0;
-    fuel_right_gal_ = 21.0;
+    fuel_left_gal_ = std::min(21.0, config_.left_tank_capacity_gal);
+    fuel_right_gal_ = std::min(21.0, config_.right_tank_capacity_gal);
     fuel_selector_ = FUEL_SEL_BOTH;
     fuel_shutoff_pulled_ = false;
     primer_strokes_ = 0;
@@ -63,7 +74,7 @@ void C172Systems::reset_to_running_default() {
     egt_f_ = 1340.0;
     oil_temp_f_ = 185.0;
     oil_press_psi_ = 74.0;
-    oil_quarts_ = 7.4;
+    oil_quarts_ = std::min(7.4, config_.oil_capacity_quarts);
     oil_hours_ = 0.0;
     vacuum_inhg_ = 5.0;
     spark_fouling_ = 0.0;
@@ -95,7 +106,7 @@ void C172Systems::reset_to_running_default() {
     xpdr_ident_timer_s_ = 0.0;
 }
 
-void C172Systems::reset_cold_and_dark() {
+void PistonAircraftSystems::reset_cold_and_dark() {
     reset_to_running_default();
     master_battery_ = false;
     master_alternator_ = false;
@@ -122,27 +133,27 @@ void C172Systems::reset_cold_and_dark() {
     xpdr_mode_ = XPDR_STBY;
 }
 
-const char *C172Systems::get_breaker_name(int cb_id) {
+const char *PistonAircraftSystems::get_breaker_name(int cb_id) {
     if (cb_id < 0 || cb_id >= CB_COUNT) {
         return "UNKNOWN";
     }
     return BREAKER_NAMES[cb_id];
 }
 
-bool C172Systems::is_breaker_pulled(int cb_id) const {
+bool PistonAircraftSystems::is_breaker_pulled(int cb_id) const {
     if (cb_id < 0 || cb_id >= CB_COUNT) {
         return false;
     }
     return breakers_pulled_[cb_id];
 }
 
-void C172Systems::set_breaker_pulled(int cb_id, bool pulled) {
+void PistonAircraftSystems::set_breaker_pulled(int cb_id, bool pulled) {
     if (cb_id >= 0 && cb_id < CB_COUNT) {
         breakers_pulled_[cb_id] = pulled;
     }
 }
 
-bool C172Systems::toggle_breaker(int cb_id) {
+bool PistonAircraftSystems::toggle_breaker(int cb_id) {
     if (cb_id >= 0 && cb_id < CB_COUNT) {
         breakers_pulled_[cb_id] = !breakers_pulled_[cb_id];
         return breakers_pulled_[cb_id];
@@ -150,15 +161,15 @@ bool C172Systems::toggle_breaker(int cb_id) {
     return false;
 }
 
-void C172Systems::trip_breaker(int cb_id) {
+void PistonAircraftSystems::trip_breaker(int cb_id) {
     set_breaker_pulled(cb_id, true);
 }
 
-bool C172Systems::is_circuit_powered(int cb_id) const {
+bool PistonAircraftSystems::is_circuit_powered(int cb_id) const {
     if (cb_id < 0 || cb_id >= CB_COUNT) {
         return false;
     }
-    if (bus_volts_ < 16.0 || breakers_pulled_[cb_id]) {
+    if (bus_volts_ < config_.bus_voltage * 0.57 || breakers_pulled_[cb_id]) {
         return false;
     }
     if (cb_id == CB_AVIONICS_BUS_1 || cb_id == CB_AVIONICS_BUS_2) {
@@ -167,7 +178,7 @@ bool C172Systems::is_circuit_powered(int cb_id) const {
     return true;
 }
 
-bool C172Systems::is_avionics_bus_powered(int bus_idx) const {
+bool PistonAircraftSystems::is_avionics_bus_powered(int bus_idx) const {
     if (bus_idx == 1) {
         return is_circuit_powered(CB_AVIONICS_BUS_1);
     }
@@ -177,28 +188,28 @@ bool C172Systems::is_avionics_bus_powered(int bus_idx) const {
     return false;
 }
 
-bool C172Systems::is_fuel_pump_active() const {
+bool PistonAircraftSystems::is_fuel_pump_active() const {
     return fuel_pump_switch_ && is_circuit_powered(CB_FUEL_PUMP);
 }
 
-bool C172Systems::is_pitot_heat_active() const {
+bool PistonAircraftSystems::is_pitot_heat_active() const {
     return pitot_heat_switch_ && is_circuit_powered(CB_PITOT_HEAT);
 }
 
-void C172Systems::set_light_switch(int light_idx, bool on) {
+void PistonAircraftSystems::set_light_switch(int light_idx, bool on) {
     if (light_idx >= 0 && light_idx < 5) {
         light_switches_[light_idx] = on;
     }
 }
 
-bool C172Systems::get_light_switch(int light_idx) const {
+bool PistonAircraftSystems::get_light_switch(int light_idx) const {
     if (light_idx >= 0 && light_idx < 5) {
         return light_switches_[light_idx];
     }
     return false;
 }
 
-bool C172Systems::is_light_powered(int light_idx) const {
+bool PistonAircraftSystems::is_light_powered(int light_idx) const {
     static constexpr int LIGHT_CBS[5] = {CB_BCN_LIGHT, CB_LAND_LIGHT, CB_NAV_LIGHT, CB_STRB_LIGHT, CB_INST_LIGHTS};
     if (light_idx < 0 || light_idx >= 5) {
         return false;
@@ -206,59 +217,58 @@ bool C172Systems::is_light_powered(int light_idx) const {
     return light_switches_[light_idx] && is_circuit_powered(LIGHT_CBS[light_idx]);
 }
 
-void C172Systems::set_baro_hpa(double hpa) {
+void PistonAircraftSystems::set_baro_hpa(double hpa) {
     baro_hpa_ = std::clamp(hpa, 940.0, 1055.0);
 }
 
-void C172Systems::set_flaps_target_deg(double deg) {
-    // Snap or clamp to standard C172S detents (0, 10, 20, 30 deg)
-    flaps_target_deg_ = std::clamp(deg, 0.0, 30.0);
+void PistonAircraftSystems::set_flaps_target_deg(double deg) {
+    flaps_target_deg_ = std::clamp(deg, 0.0, config_.max_flaps_deg);
 }
 
-void C172Systems::set_fuel_selector(int pos) {
+void PistonAircraftSystems::set_fuel_selector(int pos) {
     fuel_selector_ = std::clamp(pos, 0, 3);
 }
 
-void C172Systems::cycle_fuel_selector() {
+void PistonAircraftSystems::cycle_fuel_selector() {
     // Cycle LEFT(1) -> BOTH(2) -> RIGHT(3) -> OFF(0) -> LEFT(1)
     fuel_selector_ = (fuel_selector_ + 1) % 4;
 }
 
-void C172Systems::set_tank_gallons(double left_gal, double right_gal) {
-    fuel_left_gal_ = std::clamp(left_gal, 0.0, MAX_TANK_GAL);
-    fuel_right_gal_ = std::clamp(right_gal, 0.0, MAX_TANK_GAL);
+void PistonAircraftSystems::set_tank_gallons(double left_gal, double right_gal) {
+    fuel_left_gal_ = std::clamp(left_gal, 0.0, config_.left_tank_capacity_gal);
+    fuel_right_gal_ = std::clamp(right_gal, 0.0, config_.right_tank_capacity_gal);
 }
 
-void C172Systems::actuate_primer() {
+void PistonAircraftSystems::actuate_primer() {
     primer_strokes_ = std::min(6, primer_strokes_ + 1);
 }
 
-void C172Systems::set_battery_soc(double soc) {
+void PistonAircraftSystems::set_battery_soc(double soc) {
     battery_soc_ = std::clamp(soc, 0.0, 1.0);
 }
 
-void C172Systems::set_oil_state(double quarts, double hours) {
-    oil_quarts_ = std::clamp(quarts, 0.0, 8.0);
+void PistonAircraftSystems::set_oil_state(double quarts, double hours) {
+    oil_quarts_ = std::clamp(quarts, 0.0, config_.oil_capacity_quarts);
     oil_hours_ = std::max(0.0, hours);
 }
 
-void C172Systems::set_wear_state(double spark_fouling, double shock_cooling, double cylinder_wear) {
+void PistonAircraftSystems::set_wear_state(double spark_fouling, double shock_cooling, double cylinder_wear) {
     spark_fouling_ = std::clamp(spark_fouling, 0.0, 1.0);
     shock_cooling_wear_ = std::clamp(shock_cooling, 0.0, 1.0);
     cylinder_wear_ = std::clamp(cylinder_wear, 0.0, 1.0);
 }
 
-void C172Systems::set_sump_water(double water) {
+void PistonAircraftSystems::set_sump_water(double water) {
     sump_water_ = std::clamp(water, 0.0, 1.0);
 }
 
-void C172Systems::set_flaps_immediate_deg(double deg) {
-    const double clamped = std::clamp(deg, 0.0, 30.0);
+void PistonAircraftSystems::set_flaps_immediate_deg(double deg) {
+    const double clamped = std::clamp(deg, 0.0, config_.max_flaps_deg);
     flaps_target_deg_ = clamped;
     flaps_actual_deg_ = clamped;
 }
 
-void C172Systems::set_engine_running_state(bool running, double ambient_temp_c) {
+void PistonAircraftSystems::set_engine_running_state(bool running, double ambient_temp_c) {
     engine_running_ = running;
     starter_cranking_ = false;
     crank_timer_s_ = 0.0;
@@ -281,7 +291,7 @@ void C172Systems::set_engine_running_state(bool running, double ambient_temp_c) 
     }
 }
 
-void C172Systems::swap_com(int idx) {
+void PistonAircraftSystems::swap_com(int idx) {
     const int i = std::clamp(idx - 1, 0, 1);
     if (!is_avionics_bus_powered(i + 1)) {
         return;
@@ -289,12 +299,12 @@ void C172Systems::swap_com(int idx) {
     std::swap(com_active_mhz_[i], com_stby_mhz_[i]);
 }
 
-void C172Systems::tune_com_standby(int idx, double freq_mhz) {
+void PistonAircraftSystems::tune_com_standby(int idx, double freq_mhz) {
     const int i = std::clamp(idx - 1, 0, 1);
     com_stby_mhz_[i] = std::clamp(freq_mhz, 118.000, 136.975);
 }
 
-void C172Systems::step_com_standby(int idx, double delta_mhz) {
+void PistonAircraftSystems::step_com_standby(int idx, double delta_mhz) {
     const int i = std::clamp(idx - 1, 0, 1);
     if (!is_avionics_bus_powered(i + 1)) {
         return;
@@ -305,15 +315,15 @@ void C172Systems::step_com_standby(int idx, double delta_mhz) {
     com_stby_mhz_[i] = std::round(f * 40.0) / 40.0; // 25 kHz spacing
 }
 
-double C172Systems::get_com_active(int idx) const {
+double PistonAircraftSystems::get_com_active(int idx) const {
     return com_active_mhz_[std::clamp(idx - 1, 0, 1)];
 }
 
-double C172Systems::get_com_standby(int idx) const {
+double PistonAircraftSystems::get_com_standby(int idx) const {
     return com_stby_mhz_[std::clamp(idx - 1, 0, 1)];
 }
 
-void C172Systems::swap_nav(int idx) {
+void PistonAircraftSystems::swap_nav(int idx) {
     const int i = std::clamp(idx - 1, 0, 1);
     if (!is_avionics_bus_powered(i + 1)) {
         return;
@@ -321,12 +331,12 @@ void C172Systems::swap_nav(int idx) {
     std::swap(nav_active_mhz_[i], nav_stby_mhz_[i]);
 }
 
-void C172Systems::tune_nav_standby(int idx, double freq_mhz) {
+void PistonAircraftSystems::tune_nav_standby(int idx, double freq_mhz) {
     const int i = std::clamp(idx - 1, 0, 1);
     nav_stby_mhz_[i] = std::clamp(freq_mhz, 108.00, 117.95);
 }
 
-void C172Systems::step_nav_standby(int idx, double delta_mhz) {
+void PistonAircraftSystems::step_nav_standby(int idx, double delta_mhz) {
     const int i = std::clamp(idx - 1, 0, 1);
     if (!is_avionics_bus_powered(i + 1)) {
         return;
@@ -337,40 +347,40 @@ void C172Systems::step_nav_standby(int idx, double delta_mhz) {
     nav_stby_mhz_[i] = std::round(f * 20.0) / 20.0; // 50 kHz spacing
 }
 
-double C172Systems::get_nav_active(int idx) const {
+double PistonAircraftSystems::get_nav_active(int idx) const {
     return nav_active_mhz_[std::clamp(idx - 1, 0, 1)];
 }
 
-double C172Systems::get_nav_standby(int idx) const {
+double PistonAircraftSystems::get_nav_standby(int idx) const {
     return nav_stby_mhz_[std::clamp(idx - 1, 0, 1)];
 }
 
-void C172Systems::set_nav_obs_deg(int idx, int deg) {
+void PistonAircraftSystems::set_nav_obs_deg(int idx, int deg) {
     const int i = std::clamp(idx - 1, 0, 1);
     nav_obs_deg_[i] = ((deg % 360) + 360) % 360;
 }
 
-int C172Systems::get_nav_obs_deg(int idx) const {
+int PistonAircraftSystems::get_nav_obs_deg(int idx) const {
     return nav_obs_deg_[std::clamp(idx - 1, 0, 1)];
 }
 
-double C172Systems::get_nav_cdi(int idx) const {
+double PistonAircraftSystems::get_nav_cdi(int idx) const {
     return nav_cdi_[std::clamp(idx - 1, 0, 1)];
 }
 
-int C172Systems::get_nav_to_from(int idx) const {
+int PistonAircraftSystems::get_nav_to_from(int idx) const {
     return nav_to_from_[std::clamp(idx - 1, 0, 1)];
 }
 
-double C172Systems::get_nav_dme_nm(int idx) const {
+double PistonAircraftSystems::get_nav_dme_nm(int idx) const {
     return nav_dme_nm_[std::clamp(idx - 1, 0, 1)];
 }
 
-std::string C172Systems::get_nav_ident(int idx) const {
+std::string PistonAircraftSystems::get_nav_ident(int idx) const {
     return nav_ident_[std::clamp(idx - 1, 0, 1)];
 }
 
-void C172Systems::update_navigation(double lat_deg, double lon_deg, double alt_msl_m) {
+void PistonAircraftSystems::update_navigation(double lat_deg, double lon_deg, double alt_msl_m) {
     struct VorStation {
         const char *ident;
         double freq_mhz;
@@ -431,18 +441,18 @@ void C172Systems::update_navigation(double lat_deg, double lon_deg, double alt_m
     }
 }
 
-void C172Systems::set_xpdr_mode(int mode) {
+void PistonAircraftSystems::set_xpdr_mode(int mode) {
     xpdr_mode_ = std::clamp(mode, 0, 3);
 }
 
-void C172Systems::cycle_xpdr_mode() {
+void PistonAircraftSystems::cycle_xpdr_mode() {
     if (!is_avionics_bus_powered(1)) {
         return;
     }
     xpdr_mode_ = (xpdr_mode_ + 1) % 4;
 }
 
-void C172Systems::set_xpdr_squawk(int octal_code) {
+void PistonAircraftSystems::set_xpdr_squawk(int octal_code) {
     // Clamp each digit to octal [0..7]
     int d0 = (octal_code / 1000) % 10;
     int d1 = (octal_code / 100) % 10;
@@ -455,7 +465,7 @@ void C172Systems::set_xpdr_squawk(int octal_code) {
     xpdr_squawk_ = d0 * 1000 + d1 * 100 + d2 * 10 + d3;
 }
 
-void C172Systems::step_systems(
+void PistonAircraftSystems::step_systems(
     double dt,
     double throttle01,
     double mixture01,
@@ -481,7 +491,7 @@ void C172Systems::step_systems(
     update(s);
 }
 
-void C172Systems::update(const C172EnvStep &in) {
+void PistonAircraftSystems::update(const C172EnvStep &in) {
     const double dt = std::clamp(in.dt, 0.0, 1.0);
     if (dt <= 0.0) {
         return;
@@ -554,7 +564,7 @@ void C172Systems::update(const C172EnvStep &in) {
         actual_fuel_flow_gph_ = 0.0;
     }
 
-    // 2. Electrical Bus, 24V 14Ah Battery, 28V 60A Alternator & 12 Circuit Breakers
+    // 2. Configured 14/28V single-engine piston bus and 12 circuit breakers.
     const bool alt_online = master_alternator_
         && (!breakers_pulled_[CB_ALT_FIELD])
         && engine_running_
@@ -562,16 +572,16 @@ void C172Systems::update(const C172EnvStep &in) {
 
     // Pre-update bus voltage availability to evaluate powered circuits
     if (alt_online) {
-        bus_volts_ = 28.0;
+        bus_volts_ = config_.bus_voltage;
     } else if (master_battery_ && battery_soc_ > 0.01) {
-        bus_volts_ = 20.5 + 3.9 * battery_soc_;
+        bus_volts_ = config_.bus_voltage * (0.732 + 0.139 * battery_soc_);
     } else {
         bus_volts_ = 0.0;
     }
 
     // Compute active electrical loads gated by their individual circuit breakers
-    double load_a = (bus_volts_ > 16.0) ? 1.8 : 0.0; // Base annunciator/contactor draw
-    if (starter_cranking_) load_a += 65.0; // 24V high-torque starter draw (sags bus voltage realistically!)
+    double load_a = (bus_volts_ > config_.bus_voltage * 0.57) ? 1.8 : 0.0;
+    if (starter_cranking_) load_a += 65.0 * 28.0 / config_.bus_voltage;
     if (is_circuit_powered(CB_AVIONICS_BUS_1)) load_a += 3.6;
     if (is_circuit_powered(CB_AVIONICS_BUS_2)) load_a += 3.0;
     if (is_fuel_pump_active()) load_a += 4.5;
@@ -598,20 +608,21 @@ void C172Systems::update(const C172EnvStep &in) {
     if (alt_online) {
         const double charge_a = master_battery_ ? std::clamp((1.0 - battery_soc_) * 16.0 + 1.2, 0.4, 18.0) : 0.0;
         ammeter_amps_ = charge_a;
-        bus_volts_ = 28.0 - std::max(0.0, load_amps_ + charge_a - 55.0) * 0.15;
+        bus_volts_ = config_.bus_voltage - std::max(0.0, load_amps_ + charge_a - 55.0) * (0.15 * config_.bus_voltage / 28.0);
         if (master_battery_) {
             battery_soc_ = std::clamp(battery_soc_ + (charge_a * (dt / 3600.0)) / 14.0, 0.0, 1.0);
         }
     } else if (master_battery_ && battery_soc_ > 0.01) {
         ammeter_amps_ = -load_amps_;
-        bus_volts_ = std::max(14.0, (20.5 + 3.9 * battery_soc_) - load_amps_ * 0.045);
+        bus_volts_ = std::max(config_.bus_voltage * 0.5,
+            config_.bus_voltage * (0.732 + 0.139 * battery_soc_) - load_amps_ * (0.045 * config_.bus_voltage / 28.0));
         battery_soc_ = std::clamp(battery_soc_ - (load_amps_ * (dt / 3600.0)) / 14.0, 0.0, 1.0);
     } else {
         ammeter_amps_ = 0.0;
         bus_volts_ = 0.0;
     }
 
-    low_volts_annunciator_ = (bus_volts_ < 24.5);
+    low_volts_annunciator_ = (bus_volts_ < config_.bus_voltage * 0.875);
 
     // 3. Carburetor / Induction Icing, Structural Airframe Icing & Pitot Heat
     const double spread_c = std::max(0.0, in.ambient_temp_c - in.dewpoint_c);

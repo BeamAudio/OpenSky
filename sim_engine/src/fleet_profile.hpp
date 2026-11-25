@@ -26,6 +26,7 @@ inline constexpr size_t max_route_points = 12;
 
 struct FleetProfile {
     std::string parked_id_;
+    std::string aircraft_id_ = "c172s";
     std::vector<FleetRoutePoint> route_;
     AircraftLocation parking_spot_{};
     bool has_custom_park_ = false;

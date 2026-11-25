@@ -1,13 +1,24 @@
 CXX      := g++
 CC       := gcc
 CMAKE    ?= cmake
-CXXFLAGS := -std=c++20 -O3 -mtune=native -fno-math-errno -Wall -Wextra -Wno-unused-parameter -Ithird_party -I../engine/src -isystem ../engine/thirdparty/jsbsim/src -I../protocol
-CFLAGS   := -O3 -mtune=native -fno-math-errno -Ithird_party
+PORTABLE ?= 0
+PLAYER_PACKAGE ?= 0
+ifeq ($(PORTABLE),1)
+CPU_TUNE := -mtune=generic
+HOST_SIMD_FLAGS :=
+else
+CPU_TUNE := -mtune=native
 # The target Renoir CPU supports AVX2/FMA. Enable those lanes when the build host
 # supports them; older x86 hosts keep the compiler's portable baseline path.
 HOST_SIMD_FLAGS := $(shell uname -m 2>/dev/null | grep -Eq 'x86_64|amd64' && grep -qm1 '\<avx2\>' /proc/cpuinfo 2>/dev/null && echo '-mavx2 -mfma')
+endif
+CXXFLAGS := -std=c++20 -O3 $(CPU_TUNE) -fno-math-errno -Wall -Wextra -Wno-unused-parameter -Ithird_party -I../engine/src -isystem ../engine/thirdparty/jsbsim/src -I../protocol
+CFLAGS   := -O3 $(CPU_TUNE) -fno-math-errno -Ithird_party
 CXXFLAGS += $(HOST_SIMD_FLAGS) -ffp-contract=fast -fopenmp-simd
 CFLAGS   += $(HOST_SIMD_FLAGS)
+ifeq ($(PLAYER_PACKAGE),1)
+CXXFLAGS += -DOPENSKY_PLAYER_PACKAGE=1
+endif
 LDFLAGS  := -L../game/bin -Wl,-rpath,'$$ORIGIN/../game/bin' -lJSBSim -lX11 -ldl -lpthread -lm
 
 JSBSIM_ROOT := ../engine/thirdparty/jsbsim
@@ -30,6 +41,7 @@ SRCS := \
 	src/living_traffic.cpp \
 	src/airfield_vegetation.cpp \
 	src/audio_engine.cpp \
+	src/aircraft_package.cpp \
 	src/aircraft_hud.cpp \
 	src/game_frontend.cpp \
 	src/aircraft_session.cpp \

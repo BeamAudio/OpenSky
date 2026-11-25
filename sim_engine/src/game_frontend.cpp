@@ -108,7 +108,7 @@ GameFrontend::~GameFrontend() {
 }
 
 bool GameFrontend::init(const PackReader &pack, const std::string &shader_root, const std::string &asset_root,
-                        std::filesystem::path profile_file) {
+                        std::filesystem::path profile_file, const AircraftPackage &aircraft) {
     pack_ = &pack;
     backdrop_ = compile_program_files(shader_root + "/fullscreen.vert", shader_root + "/frontend.frag");
     if (!backdrop_) return false;
@@ -185,7 +185,7 @@ bool GameFrontend::init(const PackReader &pack, const std::string &shader_root, 
     glNamedBufferStorage(bounds_, bounds.size() * sizeof(Vec4), bounds.data(), 0);
     glCreateVertexArrays(1, &vao_);
 
-    session_.init(pack, std::move(profile_file));
+    session_.init(pack, std::move(profile_file), aircraft);
     if (const auto *parked = parked_airport()) focus_airport(*parked, 1.0f);
     return true;
 }
@@ -389,15 +389,17 @@ void GameFrontend::label(AircraftAndHud &ui, float x, float y, float size, const
 }
 
 void GameFrontend::panel(AircraftAndHud &ui, PixelRect a) {
-    ui.hud_rect(a.x, a.y, a.w, a.h, .047f, .078f, .108f, .97f);
-    ui.hud_border(a.x, a.y, a.w, a.h, 1, .24f, .35f, .42f, .83f);
+    ui.hud_rect(a.x, a.y, a.w, a.h, .035f, .061f, .085f, .98f);
+    ui.hud_border(a.x, a.y, a.w, a.h, 1, .20f, .33f, .39f, .9f);
+    ui.hud_rect(a.x + 1, a.y + 1, a.w - 2, 2, .23f, .72f, .61f, .82f);
 }
 
 bool GameFrontend::button(AircraftAndHud &ui, PixelRect a, const char *value, bool enabled, bool selected) {
     const bool hover = enabled && contains(a);
-    if (hover || (selected && enabled)) ui.hud_rect(a.x, a.y, a.w, a.h, .11f, .28f, .31f, 1);
-    else ui.hud_rect(a.x, a.y, a.w, a.h, .074f, .122f, .155f, 1);
-    ui.hud_border(a.x, a.y, a.w, a.h, 1, selected ? .37f : .25f, selected ? .78f : .42f, .48f, enabled ? .85f : .35f);
+    if (hover || (selected && enabled)) ui.hud_rect(a.x, a.y, a.w, a.h, .09f, .25f, .27f, 1);
+    else ui.hud_rect(a.x, a.y, a.w, a.h, .055f, .095f, .125f, 1);
+    ui.hud_border(a.x, a.y, a.w, a.h, 1, selected ? .32f : .22f, selected ? .72f : .37f, .44f, enabled ? .92f : .38f);
+    if (selected && enabled) ui.hud_rect(a.x + 2, a.y + 1, a.w - 4, 2, .35f, .88f, .69f, 1);
     label(ui, a.x + 13, a.y + (a.h - 18) * .5f, 18, value, !enabled);
     if (!hover || !click_) return false;
     click_ = false;
@@ -443,30 +445,43 @@ void GameFrontend::draw_menu(AircraftAndHud &aircraft, SkyAndClouds &sky, const 
                              RegionalAtmosphere *reg_atmo, double sim_time_sec) {
     read_pointer(win);
     sky.begin_native_cockpit_pass();
-    glClearColor(.029f, .049f, .072f, 1.0f);
+    glClearColor(.022f, .039f, .058f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
     aircraft.hud_verts_.clear();
-    aircraft.hud_rect(0, 0, w, 82, .048f, .079f, .106f, 1);
-    aircraft.hud_rect(0, 81, w, 1, .24f, .35f, .42f, .78f);
-    label(aircraft, 64, 27, 26, "OpenSky VFR");
+    aircraft.hud_rect(0, 0, w, 82, .033f, .057f, .078f, 1);
+    aircraft.hud_rect(0, 81, w, 1, .18f, .38f, .40f, .9f);
+    aircraft.hud_rect(64, 18, 46, 46, .055f, .13f, .15f, 1);
+    aircraft.hud_border(64, 18, 46, 46, 1, .28f, .68f, .61f, .9f);
+    const Vec3 brand_accent{.42f, .91f, .72f};
+    aircraft.hud_line({87, 25}, {101, 41}, 2.2f, brand_accent);
+    aircraft.hud_line({101, 41}, {87, 57}, 2.2f, brand_accent);
+    aircraft.hud_line({87, 57}, {73, 41}, 2.2f, brand_accent);
+    aircraft.hud_line({73, 41}, {87, 25}, 2.2f, brand_accent);
+    aircraft.hud_line({87, 31}, {87, 51}, 1.2f, {.77f, .86f, .80f});
+    aircraft.hud_line({77, 41}, {97, 41}, 1.2f, {.77f, .86f, .80f});
+    label(aircraft, 124, 18, 25, "OPENSKY");
+    label(aircraft, 126, 48, 12, "VFR  /  FREE ROAM", true);
     if (button(aircraft, {380, 17, 130, 48}, "World", true, page_ == Page::World)) page_ = Page::World;
     if (button(aircraft, {520, 17, 152, 48}, "Logbook", true, page_ == Page::Logbook)) page_ = Page::Logbook;
     if (button(aircraft, {682, 17, 140, 48}, "Settings", true, page_ == Page::Settings)) page_ = Page::Settings;
     if (button(aircraft, {832, 17, 140, 48}, "Controls", true, page_ == Page::Controls)) page_ = Page::Controls;
-    if (button(aircraft, {1582, 17, 160, 48}, "World editor")) request_ = Request::Editor;
+    if (button(aircraft, {982, 17, 106, 48}, "Credits", true, page_ == Page::Credits)) page_ = Page::Credits;
     if (button(aircraft, {1754, 17, 102, 48}, "Quit")) request_ = Request::Quit;
     if (session_.flight_active_) {
-        if (button(aircraft, {1070, 17, 174, 48}, "Resume flight", true, true) || win.key_pressed(KEY_ESC))
+        if (button(aircraft, {1100, 17, 174, 48}, "Resume flight", true, true) || win.key_pressed(KEY_ESC))
             aircraft.st_.menu_open = aircraft.st_.paused = false;
         const bool park_ok = can_park(aircraft);
         double re = 0.0, mu = 0.0, rough = 0.0;
         std::string rid;
         const bool on_rwy = aircraft.jsb_state().on_ground &&
                             pack_->query_runway(aircraft.state().lat_deg, aircraft.state().lon_deg, re, mu, rough, rid);
-        if (button(aircraft, {1256, 17, 306, 48},
+        if (button(aircraft, {1286, 17, 306, 48},
                    on_rwy ? "Taxi off runway to park" : "Park and step outside", park_ok))
             request_ = Request::Park;
     }
+#ifndef OPENSKY_PLAYER_PACKAGE
+    if (button(aircraft, {1606, 17, 140, 48}, "Region tools")) request_ = Request::Editor;
+#endif
     if (preparing_airfield) {
         panel(aircraft, {640, 444, 640, 164});
         label(aircraft, 668, 474, 36, "Preparing the airfield");
@@ -474,7 +489,8 @@ void GameFrontend::draw_menu(AircraftAndHud &aircraft, SkyAndClouds &sky, const 
     } else if (page_ == Page::World) draw_world(aircraft, win, reg_atmo, &sky.atmo(), sim_time_sec);
     else if (page_ == Page::Logbook) draw_logbook(aircraft);
     else if (page_ == Page::Settings) draw_settings(aircraft, time_of_day, reg_atmo);
-    else draw_controls(aircraft);
+    else if (page_ == Page::Controls) draw_controls(aircraft);
+    else draw_credits(aircraft);
     glViewport(0, 0, w, h);
     aircraft.flush_hud(w, h, font_);
 }
@@ -487,13 +503,16 @@ bool GameFrontend::capture_world(AircraftAndHud &aircraft, SkyAndClouds &sky, co
 
 void GameFrontend::draw_world(AircraftAndHud &ui, const PlatformWindow &win,
                               RegionalAtmosphere *reg_atmo, const AtmosphereState *atmo, double sim_time_sec) {
-    label(ui, 64, 111, 44, "World");
-    label(ui, 66, 166, 21, "Explore airfields, landmarks, local weather, and routes across the region.", true);
+    label(ui, 66, 101, 12, "VFR FREE ROAM  /  REGIONAL MAP", true);
+    label(ui, 64, 132, 38, "Plan your next flight");
+    label(ui, 66, 174, 17, "Pick a runway or landmark, sketch a route, then explore at your own pace.", true);
     char line[192];
-    std::snprintf(line, sizeof(line), "%zu installed region%s  |  Passport %zu / %zu airfields",
+    std::snprintf(line, sizeof(line), "%zu region pack%s  |  %zu / %zu airfields visited",
                   pack_->regions().size(), pack_->regions().size() == 1 ? "" : "s",
                   session_.profile().passport_.size(), pack_->airports().size());
-    label(ui, 790, 168, 18, line, true);
+    ui.hud_rect(790, 151, 450, 34, .04f, .085f, .10f, .94f);
+    ui.hud_border(790, 151, 450, 34, 1, .17f, .36f, .38f, .8f);
+    label(ui, 805, 159, 14, line, true);
 
     const auto *parked = parked_airport();
     constexpr size_t kWorldPlaceCount = sizeof(kWorldPlaces) / sizeof(kWorldPlaces[0]);
@@ -645,8 +664,8 @@ void GameFrontend::draw_world(AircraftAndHud &ui, const PlatformWindow &win,
         if (selected || hovered || (show_places_ && globe_zoom_ >= 24.0f)) {
             const float label_w = static_cast<float>(std::min<size_t>(230, std::char_traits<char>::length(place.name) * 9 + 18));
             const float raw_lx = (p->x + label_w + 16 < map_area.x + map_area.w) ? p->x + 10 : p->x - label_w - 10;
-            const float lx = std::clamp(raw_lx, map_area.x + 4, map_area.x + map_area.w - label_w - 4);
-            const float ly = std::clamp(p->y - 12, map_area.y + 8, map_area.y + map_area.h - 30);
+            const float lx = std::clamp(raw_lx, map_area.x + 4.0f, map_area.x + map_area.w - label_w - 4.0f);
+            const float ly = std::clamp(p->y - 12.0f, map_area.y + 8.0f, map_area.y + map_area.h - 30.0f);
             ui.hud_rect(lx, ly, label_w, 24, .025f, .055f, .070f, .96f);
             ui.hud_border(lx, ly, label_w, 24, 1, color.x, color.y, color.z, .9f);
             label(ui, lx + 7, ly + 4, 14, place.name);
@@ -692,8 +711,11 @@ void GameFrontend::draw_world(AircraftAndHud &ui, const PlatformWindow &win,
 
     // Top-right: Parked Aircraft Ownership Card
     panel(ui, {1292,225,564,218});
-    label(ui, 1318, 244, 17, session_.flight_active_ ? "LAST PARKED AT" : "YOUR AIRCRAFT  (EC-VFR)", true);
-    label(ui, 1318, 270, 28, "Cessna 172S Skyhawk");
+    std::snprintf(line, sizeof(line), "%s%s%s", session_.flight_active_ ? "LAST PARKED AT  |  " : "YOUR AIRCRAFT  |  ",
+                  ui.aircraft_.registration.empty() ? "" : ui.aircraft_.registration.c_str(),
+                  ui.aircraft_.registration.empty() ? "" : "  /  INSTALLED PACKAGE");
+    label(ui, 1318, 244, 17, line, true);
+    label(ui, 1318, 270, 28, ui.aircraft_.name.c_str());
     if (parked) {
         const bool at_home = parked == home_airport();
         std::snprintf(line, sizeof(line), "%s: %s", at_home ? "Home hangar" : "Temporary base",
@@ -711,7 +733,7 @@ void GameFrontend::draw_world(AircraftAndHud &ui, const PlatformWindow &win,
                   (session_.profile().care_.chocks_on || session_.profile().care_.tie_downs_on || session_.profile().care_.pitot_cover_on) ? "Secured outside" : "Ready to roll",
                   session_.profile().care_.oil_hours >= 10.0 ? "  |  Oil change due" : "");
     label(ui, 1318, 363, 15, line, true);
-    if (button(ui, {1318, 389, 512, 42}, "Enter airport on foot (Walkaround)", parked && !session_.flight_active_, true))
+    if (button(ui, {1318, 389, 512, 42}, "Walk to aircraft  |  Walkaround", parked && !session_.flight_active_, true))
         request_ = Request::Walk;
 
     // Middle-right: Airfields or landmarks, with a live local weather briefing for selected airfields.
@@ -935,9 +957,12 @@ void GameFrontend::draw_logbook(AircraftAndHud &ui) {
         label(ui, 540, y, 17, right_txt);
     };
     char rcol[96];
-    std::snprintf(line, sizeof(line), "Oil: %.1f / 8.0 qt  (%.1f / 10.0 hr)%s",
-                  session_.profile().care_.oil_quarts, session_.profile().care_.oil_hours, session_.profile().care_.oil_hours >= 10.0 ? "  DUE" : "");
-    std::snprintf(rcol, sizeof(rcol), "Battery (24V): %.0f%%", session_.profile().care_.battery_soc * 100.0);
+    std::snprintf(line, sizeof(line), "Oil: %.1f / %.1f qt  (%.1f / 10.0 hr)%s",
+                  session_.profile().care_.oil_quarts, ui.aircraft_.oil_capacity_quarts,
+                  session_.profile().care_.oil_hours, session_.profile().care_.oil_hours >= 10.0 ? "  DUE" : "");
+    std::snprintf(rcol, sizeof(rcol), "Battery (%dV): %.0f%%",
+                  static_cast<int>(std::round(ui.aircraft_.bus_voltage * 6.0 / 7.0)),
+                  session_.profile().care_.battery_soc * 100.0);
     health_row(0, line, rcol);
 
     std::snprintf(line, sizeof(line), "Cylinders: %.0f%%  (shock wear %.0f%%)",
@@ -1180,6 +1205,49 @@ void GameFrontend::draw_controls(AircraftAndHud &ui) {
     label(ui, 968, 902, 18, "Warm oil past 110 F before full power to preserve cylinder health.", true);
 }
 
+void GameFrontend::draw_credits(AircraftAndHud &ui) {
+    label(ui, 66, 101, 12, "OPEN SOURCE  /  COMMUNITY BUILT", true);
+    label(ui, 64, 132, 38, "About OpenSky");
+    label(ui, 66, 174, 17, "Flight sim source, regional content, and the rules each piece travels with.", true);
+
+    panel(ui, {64, 225, 860, 326});
+    label(ui, 90, 250, 24, "Open-source engine");
+    label(ui, 90, 294, 18, "OpenSky source is MIT licensed. See LICENSE.");
+    label(ui, 90, 330, 17, "JSBSim is a separate LGPL-2.1-or-later shared library.");
+    label(ui, 90, 366, 17, "Third-party code and assets keep their own licenses.");
+    label(ui, 90, 422, 16, "Source contributions and source-level mods are welcome.", true);
+
+    panel(ui, {950, 225, 906, 326});
+    label(ui, 976, 250, 24, "Scenery, data & attribution");
+    label(ui, 976, 294, 17, "Terrain and imagery: IGN Spain, CC BY 4.0.");
+    label(ui, 976, 328, 17, "Roads, buildings and city data: OpenStreetMap contributors.");
+    label(ui, 976, 362, 17, "OSM-derived packs retain ODbL 1.0 attribution and share-alike.");
+    label(ui, 976, 396, 17, "OurAirports data is public domain; other feeds keep source terms.");
+    label(ui, 976, 440, 16, "Live weather uses Open-Meteo; commercial access needs an eligible plan.", true);
+    label(ui, 976, 478, 15, "Full notices: THIRD_PARTY_LICENSES.md", true);
+
+    panel(ui, {64, 579, 860, 366});
+    label(ui, 90, 604, 24, "Make and install community content");
+    label(ui, 90, 648, 17, "Install regions in ~/.local/share/opensky-vfr/packs.");
+    label(ui, 90, 682, 17, "The simulator discovers region packs from that folder.");
+    label(ui, 90, 716, 17, "Aircraft folders load package data, models, and a JSBSim flight model.");
+    label(ui, 90, 750, 17, "Systems currently support one piston engine and two fuel tanks.");
+    label(ui, 90, 784, 17, "Lua aircraft scripts are planned; complex systems still need engine work.");
+    label(ui, 90, 828, 17, "Mods must include their own source, asset, and data license notes.");
+    label(ui, 90, 874, 16, "Guide: docs/MODDING.md", true);
+
+    panel(ui, {950, 579, 906, 366});
+    label(ui, 976, 604, 24, "Simulation use");
+    label(ui, 976, 648, 17, "OpenSky is for simulation and entertainment only.");
+    label(ui, 976, 682, 17, "It is not certified for real-world navigation or flight training.");
+    label(ui, 976, 716, 17, "Use current official charts, weather and aircraft procedures.");
+    ui.hud_rect(976, 777, 854, 1, .18f, .34f, .38f, .85f);
+    label(ui, 976, 805, 16, "Community aircraft and regions are independent works.", true);
+    label(ui, 976, 839, 16, "Their authors are responsible for rights to included content.", true);
+
+    label(ui, 66, 1002, 14, "OpenSky VFR  |  Built for curious pilots, careful modders, and scenic flights.", true);
+}
+
 void GameFrontend::draw_walk(AircraftAndHud &ui, const PlatformWindow &win,
                              const RegionalAtmosphere *reg_atmo, const AtmosphereState *atmo, double sim_time_sec) {
     read_pointer(win);
@@ -1298,15 +1366,16 @@ void GameFrontend::draw_walk(AircraftAndHud &ui, const PlatformWindow &win,
         const double total_fuel = session_.profile().care_.left_fuel_gal + session_.profile().care_.right_fuel_gal;
         switch (active_station_) {
             case WalkStation::Nose: {
-                std::snprintf(line, sizeof(line), "Oil Dipstick: %.1f / 8.0 qt   |   Oil Age: %.1f / 10.0 hr%s",
-                              session_.profile().care_.oil_quarts, session_.profile().care_.oil_hours, session_.profile().care_.oil_hours >= 10.0 ? "  (CHANGE DUE)" : "");
+                std::snprintf(line, sizeof(line), "Oil Dipstick: %.1f / %.1f qt   |   Oil Age: %.1f / 10.0 hr%s",
+                              session_.profile().care_.oil_quarts, ui.aircraft_.oil_capacity_quarts,
+                              session_.profile().care_.oil_hours, session_.profile().care_.oil_hours >= 10.0 ? "  (CHANGE DUE)" : "");
                 label(ui, 1188, 344, 18, line);
                 std::snprintf(line, sizeof(line), "Cylinders: %.0f%%   |   Spark Plugs: %.0f%% clean   |   Propeller: %.0f%%",
                               (1.0 - session_.profile().care_.cylinder_wear) * 100.0, (1.0 - session_.profile().care_.spark_fouling) * 100.0,
                               (1.0 - session_.profile().care_.prop_nicks) * 100.0);
                 label(ui, 1188, 376, 17, line, true);
 
-                if (button(ui, {1188, 418, 322, 44}, "Top up oil (+1 qt)", session_.profile().care_.oil_quarts < 7.95)) {
+                if (button(ui, {1188, 418, 322, 44}, "Top up oil (+1 qt)", session_.profile().care_.oil_quarts < ui.aircraft_.oil_capacity_quarts - 0.05)) {
                     session_.service(AircraftService::TopOil);
                 }
                 if (button(ui, {1530, 418, 322, 44}, full_svc ? "Oil & filter change" : "Oil change (hangar only)",
@@ -1325,12 +1394,14 @@ void GameFrontend::draw_walk(AircraftAndHud &ui, const PlatformWindow &win,
                            full_svc && (session_.profile().care_.cylinder_wear > 0.01 || session_.profile().care_.shock_cooling > 0.01))) {
                     session_.service(AircraftService::Overhaul);
                 }
-                label(ui, 1188, 592, 16, "Keep oil between 6 and 8 qt. Warm oil >110 F before full power.", true);
+                std::snprintf(line, sizeof(line), "Keep oil above %.1f qt. Warm oil >110 F before full power.",
+                              ui.aircraft_.oil_capacity_quarts * 0.75);
+                label(ui, 1188, 592, 16, line, true);
                 break;
             }
             case WalkStation::LeftWing: {
-                std::snprintf(line, sizeof(line), "Left Tank: %.1f / 26.5 US gal   |   Total: %.1f gal",
-                              session_.profile().care_.left_fuel_gal, total_fuel);
+                std::snprintf(line, sizeof(line), "Left Tank: %.1f / %.1f US gal   |   Total: %.1f gal",
+                              session_.profile().care_.left_fuel_gal, ui.aircraft_.left_tank_capacity_gal, total_fuel);
                 label(ui, 1188, 344, 18, line);
                 const bool can_add_l = session_.can_add_fuel(true);
                 if (button(ui, {1188, 384, 210, 44}, "-5 gal Left", session_.profile().care_.left_fuel_gal > 0.05)) {
@@ -1339,8 +1410,10 @@ void GameFrontend::draw_walk(AircraftAndHud &ui, const PlatformWindow &win,
                 if (button(ui, {1415, 384, 210, 44}, full_svc ? "+5 gal Left" : "+5 gal (jerrycan)", can_add_l)) {
                     session_.adjust_fuel(true, true);
                 }
-                if (button(ui, {1642, 384, 210, 44}, full_svc ? "Fill Left (26.5)" : "Fill (hangar only)",
-                           full_svc && session_.profile().care_.left_fuel_gal < 26.45)) {
+                char fill_label[64];
+                std::snprintf(fill_label, sizeof(fill_label), "Fill Left (%.1f)", ui.aircraft_.left_tank_capacity_gal);
+                if (button(ui, {1642, 384, 210, 44}, full_svc ? fill_label : "Fill (hangar only)",
+                           full_svc && session_.profile().care_.left_fuel_gal < ui.aircraft_.left_tank_capacity_gal - 0.05)) {
                     session_.service(AircraftService::FillLeft);
                 }
                 std::snprintf(line, sizeof(line), "Left Fuel Sump: %s",
@@ -1360,8 +1433,8 @@ void GameFrontend::draw_walk(AircraftAndHud &ui, const PlatformWindow &win,
                 break;
             }
             case WalkStation::RightWing: {
-                std::snprintf(line, sizeof(line), "Right Tank: %.1f / 26.5 US gal   |   Total: %.1f gal",
-                              session_.profile().care_.right_fuel_gal, total_fuel);
+                std::snprintf(line, sizeof(line), "Right Tank: %.1f / %.1f US gal   |   Total: %.1f gal",
+                              session_.profile().care_.right_fuel_gal, ui.aircraft_.right_tank_capacity_gal, total_fuel);
                 label(ui, 1188, 344, 18, line);
                 const bool can_add_r = session_.can_add_fuel(false);
                 if (button(ui, {1188, 384, 210, 44}, "-5 gal Right", session_.profile().care_.right_fuel_gal > 0.05)) {
@@ -1371,7 +1444,8 @@ void GameFrontend::draw_walk(AircraftAndHud &ui, const PlatformWindow &win,
                     session_.adjust_fuel(false, true);
                 }
                 if (button(ui, {1642, 384, 210, 44}, full_svc ? "Fill Both Tanks" : "Fill (hangar only)",
-                           full_svc && total_fuel < 52.9)) {
+                           full_svc && (session_.profile().care_.left_fuel_gal < ui.aircraft_.left_tank_capacity_gal - 0.05 ||
+                                        session_.profile().care_.right_fuel_gal < ui.aircraft_.right_tank_capacity_gal - 0.05))) {
                     session_.service(AircraftService::FillBoth);
                 }
                 if (button(ui, {1188, 446, 664, 44},
@@ -1430,7 +1504,8 @@ void GameFrontend::draw_walk(AircraftAndHud &ui, const PlatformWindow &win,
                 break;
             }
             case WalkStation::Door: {
-                std::snprintf(line, sizeof(line), "24V Battery: %.0f%%   |   Windshield: %.0f%% clean, %.0f%% intact",
+                std::snprintf(line, sizeof(line), "%dV Battery: %.0f%%   |   Windshield: %.0f%% clean, %.0f%% intact",
+                              static_cast<int>(std::round(ui.aircraft_.bus_voltage * 6.0 / 7.0)),
                               session_.profile().care_.battery_soc * 100.0,
                               (1.0 - session_.profile().care_.windshield_dirt) * 100.0,
                               (1.0 - session_.profile().care_.windshield_crack) * 100.0);
@@ -1570,7 +1645,7 @@ void GameFrontend::draw_navigation(AircraftAndHud &ui, const PlatformWindow &win
     else if (sys.is_engine_running() && sys.get_oil_press_psi() < 32.0)
         caution = "LOW OIL PRESSURE - Check oil quantity on walkaround.";
     else if (sys.get_master_battery() && sys.get_battery_soc() < 0.18)
-        caution = "LOW 24V BATTERY - Start engine for alternator or charge on walkaround.";
+        caution = "LOW AIRCRAFT BATTERY - Start engine for alternator or charge on walkaround.";
     else if (session_.profile().care_.airframe_damage >= 0.5)
         caution = "AIRFRAME DAMAGED - Engine power reduced. Inspect & repair at an airport.";
 

@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#163a59"/>
+      <stop offset="1" stop-color="#0a1725"/>
+    </linearGradient>
+    <linearGradient id="wing" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fff4d8"/>
+      <stop offset="1" stop-color="#b9d3d8"/>
+    </linearGradient>
+  </defs>
+  <rect x="12" y="12" width="232" height="232" rx="52" fill="url(#sky)"/>
+  <circle cx="128" cy="128" r="82" fill="none" stroke="#59c1bb" stroke-width="5" opacity=".9"/>
+  <path d="M128 38 139 112 208 139 208 151 137 143 132 209 151 222 151 230 128 220 105 230 105 222 124 209 119 143 48 151 48 139 117 112Z" fill="url(#wing)"/>
+  <path d="m128 38 11 74 69 27-38-7-47-19-47 19-38 7 69-27Z" fill="#fff8e8" opacity=".3"/>
+  <circle cx="128" cy="128" r="7" fill="#f2b96e"/>
+</svg>

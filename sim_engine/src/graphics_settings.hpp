@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include "app_paths.hpp"
 
 namespace nsim {
 
@@ -29,15 +30,7 @@ struct GraphicsSettings {
 };
 
 inline std::filesystem::path graphics_settings_path() {
-#ifdef _WIN32
-    if (const char *appdata = std::getenv("APPDATA"))
-        return std::filesystem::path(appdata) / "OpenSkyVFR" / "graphics.ini";
-#endif
-    if (const char *xdg = std::getenv("XDG_CONFIG_HOME"))
-        return std::filesystem::path(xdg) / "opensky-vfr" / "graphics.ini";
-    if (const char *home = std::getenv("HOME"))
-        return std::filesystem::path(home) / ".config" / "opensky-vfr" / "graphics.ini";
-    return std::filesystem::current_path() / "opensky-graphics.ini";
+    return opensky_config_dir() / "graphics.ini";
 }
 
 inline GraphicsSettings load_graphics_settings() {

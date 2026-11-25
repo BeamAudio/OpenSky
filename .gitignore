@@ -31,6 +31,7 @@ __pycache__/
 # Local analysis and QA output
 /graphify-out/
 /gameplay_captures/
+/dist/
 /.agents/
 /.commandcode/
 

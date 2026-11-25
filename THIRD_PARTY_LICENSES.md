@@ -1,12 +1,14 @@
 # Licenses & Attribution
 
 The project's own source code is released under the **MIT License** (see `LICENSE`).
-Third-party code, data and assets keep their own licenses, summarized below. All
-of them are compatible with commercial use and open-source redistribution.
+Third-party code, data and assets keep their own licenses, summarized below.
+Commercial redistribution depends on each component's license, attribution duties,
+and any separate API service terms. Do not treat the project MIT license as a
+license for bundled scenery, models, or live data services.
 
 ## Own Code
 - `sim_engine/`, `engine/src/`, `builder/`, `protocol/`, `tools/`: MIT (see `LICENSE`).
-- `game/aircraft/c172s/*.xml`: OpenSky-authored aircraft configuration, CC0 1.0.
+- `game/aircraft/c172s/*`: OpenSky-authored aircraft manifest/configuration, CC0 1.0.
   No FlightGear GPL flight models, configs or textures are used.
 
 ## Libraries
@@ -14,7 +16,7 @@ of them are compatible with commercial use and open-source redistribution.
 |---|---|---|
 | JSBSim | LGPL-2.1-or-later | Upstream source pinned in `engine/thirdparty/jsbsim/UPSTREAM.md`, built as a separate `libJSBSim.so.1` by `sim_engine/Makefile`. `nspain_sim` links dynamically with `$ORIGIN` rpath; no static LGPL linking. License text: `engine/thirdparty/jsbsim/COPYING.LGPL-2.1`. |
 | cgltf, stb_image, stb_image_write, stb_easy_font, miniz_tinfl, KHR/glcorearb | MIT / Public Domain | Headers under `sim_engine/third_party/`. |
-| Open-Meteo | CC-BY 4.0 (data) | Live weather feed; attribution shown in-game. |
+| Open-Meteo | CC-BY 4.0 (data) | Live weather input; attribution is shown in-game. Data licensing and API service terms are separate. The current free API service is non-commercial; a commercial release that calls it needs an eligible commercial plan or must disable that feed. See [Open-Meteo terms](https://open-meteo.com/en/terms) and [data license](https://open-meteo.com/en/licence). |
 
 ## Geospatial Data
 | Source | License | Obligations |
@@ -37,10 +39,19 @@ The interface bitmap atlas was rendered from Inter Medium by the Inter Project A
 - **Cessna 172 Exterior (`game/assets/models/aircraft/c172s_exterior.glb`)**
   - Original Work: "Cessna 172" by [e737](https://sketchfab.com/e0057537) on [Sketchfab](https://sketchfab.com/3d-models/cessna-172-64cddaee5aff470682659a8c08525046)
   - Intermediate Optimization: `c172.glb` from [veyron007/AUREL](https://github.com/veyron007/AUREL/blob/main/public/models/README.md)
-  - License: [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)
+  - Original model license recorded here: [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
   - Modifications: re-oriented to `-Z` forward / `+X` right / `+Y` up, textures
     converted to standard Metallic-Roughness PNG/JPEG, propeller/spinner split
     into animated `PropHub`/`PropBlades` nodes, navigation/strobe/beacon lights added.
+  - **Commercial release review required:** the exact rights and license chain for
+    the intermediate AUREL model file and all embedded textures are not evidenced
+    in this repository. Confirm that the chain permits this redistribution and
+    preserve all required credits, or replace the model with a fully verified asset.
+- **C172S Cockpit (`game/assets/models/aircraft/c172s_cockpit.glb`)**
+  - The distributed GLB and its source Blender file are present, but their author,
+    source, and redistribution license are not recorded here. Identify and document
+    the complete rights chain, or replace the cockpit with a verified asset before
+    publishing a binary that contains it.
 
 ## Online Imagery Policy
 Runtime and offline baking stream **IGN Spain PNOA only** (CC-BY 4.0), at

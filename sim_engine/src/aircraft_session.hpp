@@ -1,6 +1,7 @@
 #pragma once
 
 #include "fleet_profile.hpp"
+#include "aircraft_package.hpp"
 
 namespace nsim {
 
@@ -19,6 +20,7 @@ enum class AircraftService {
 class AircraftSession {
 public:
     void init(const PackReader &pack, std::filesystem::path profile_file);
+    void init(const PackReader &pack, std::filesystem::path profile_file, const AircraftPackage &aircraft);
     std::string begin_walkaround(const AirportInfo &airport, const LocalAirSample *weather);
     void board(AircraftAndHud &aircraft, double ambient_temp_c);
     bool can_park(const AircraftAndHud &aircraft) const;
@@ -44,6 +46,9 @@ private:
     mutable std::string profile_error_;
     bool preserve_invalid_profile_ = false;
     FleetProfile profile_{};
+    double left_fuel_capacity_gal_ = 26.5;
+    double right_fuel_capacity_gal_ = 26.5;
+    double oil_capacity_quarts_ = 8.0;
     bool flight_active_ = false;
     size_t active_leg_ = 0;
     double remote_fuel_added_ = 0.0; // Caps remote-strip jerrycan refills per visit

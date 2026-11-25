@@ -27,7 +27,7 @@ public:
 
     ~GameFrontend();
     bool init(const PackReader &pack, const std::string &shader_root, const std::string &asset_root,
-              std::filesystem::path profile_file);
+              std::filesystem::path profile_file, const AircraftPackage &aircraft);
     void draw_menu(AircraftAndHud &aircraft, SkyAndClouds &sky, const PlatformWindow &win,
                    bool preparing_airfield, int &time_of_day,
                    RegionalAtmosphere *reg_atmo = nullptr, double sim_time_sec = 0.0);
@@ -69,7 +69,7 @@ public:
 private:
     const AirportInfo *home_airport() const;
     bool is_full_service_airport(const std::string &id) const;
-    enum class Page { World, Logbook, Settings, Controls };
+    enum class Page { World, Logbook, Settings, Controls, Credits };
     enum class WalkStation { Nose = 0, LeftWing, RightWing, Gear, Tail, Door };
     using RoutePoint = FleetRoutePoint;
     void draw_world(AircraftAndHud &aircraft, const PlatformWindow &win,
@@ -77,6 +77,7 @@ private:
     void draw_logbook(AircraftAndHud &aircraft);
     void draw_settings(AircraftAndHud &aircraft, int &time_of_day, RegionalAtmosphere *reg_atmo);
     void draw_controls(AircraftAndHud &aircraft);
+    void draw_credits(AircraftAndHud &aircraft);
     void load_profile();
     void focus_airport(const AirportInfo &airport, float zoom);
     void add_point(RoutePoint point);

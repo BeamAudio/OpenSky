@@ -169,6 +169,7 @@ public:
 
     bool load_pack(const std::string &nspack_path);
     bool load_packs_dir(const std::string &packs_dir, const std::string &only_region_id = "", const std::string &prefer_region_id = "");
+    bool load_packs_dirs(const std::vector<std::string> &packs_dirs, const std::string &only_region_id = "", const std::string &prefer_region_id = "");
     bool load_scenery(const std::string &nsscn_path, bool append = false);
     bool load_city_shadows(const std::string &nsshd_path, uint32_t region_idx = 0);
     int city_shadow_tile_count() const;

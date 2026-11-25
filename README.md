@@ -1,8 +1,14 @@
 # OpenSky VFR Simulator
 
-OpenSky is an iGPU-first VFR simulator project built around a native **C++20 / OpenGL 4.6** renderer. The first curated flight region is the Pyrenees in Aragón, with a Cessna 172S and a bundled **OpenSky World Editor**. The current runnable target is Linux with X11/GLX; Windows packaging and measured 1080p High support remain release milestones.
+OpenSky is an iGPU-first VFR simulator project built around a native **C++20 / OpenGL 4.6** renderer. The first curated flight region is the Pyrenees in Aragón, with a Cessna 172S and an **OpenSky World Editor** in the source checkout. The current runnable target is Linux with X11/GLX; Windows packaging and measured 1080p High support remain release milestones.
 
 The product target is 1920×1080 output at 60 FPS on integrated graphics, with the renderer allowed a bounded internal reconstruction scale. The documented Renoir baseline is below that target in several High scenarios. See the dated [engine audit](docs/2026-11-23_opensky-engine-audit.md) and [flight/weather audit](docs/2026-11-23_flight-weather-audit.md) for measurements and known gaps.
+
+## Install and launch the game
+
+The player release target for Debian/Ubuntu is an installable `opensky-vfr_<version>_amd64.deb`. Install it with the graphical Software app or `sudo apt install ./opensky-vfr_<version>_amd64.deb`, then launch **OpenSky VFR** from the Games menu. It includes the game, the Aragón region, and its desktop icon; players do not compile the source or start the game from a script. The package recipe is in `tools/package_deb.py`; a downloadable `.deb` is not published yet because the asset and data rights listed in [release readiness](docs/RELEASE_READINESS.md) still need to be cleared. Windows 11 is not supported yet.
+
+Add-on regions can be installed in `~/.local/share/opensky-vfr/packs/`. Saves and aircraft packages stay in the user's config folder; downloaded imagery stays in the user's cache folder.
 
 ---
 
@@ -10,14 +16,15 @@ The product target is 1920×1080 output at 60 FPS on integrated graphics, with t
 - `protocol/` — Shared `.nspack` binary pack specification ([pack_format.h](protocol/pack_format.h) / [pack_format.py](protocol/pack_format.py)).
 - `builder/` — Offline regional pack baker ([build_region.py](builder/build_region.py)) ingesting **IGN Spain PNOA**, **IGN MDT05/MDT25**, **OurAirports**, and **OpenStreetMap**. The World Editor also accepts user-licensed XYZ imagery and Terrarium elevation tiles outside Spain, or builds explicit elevation-only regions.
 - `sim_engine/` — C++20/OpenGL renderer with CDLOD terrain, instanced and baked city meshes, vegetation shading, reduced-resolution volumetric clouds, baked solar and night lighting, and reverse-Z terrain depth.
-- `engine/` — WGS84 geometry, C172S systems, OpenTrack UDP and the adapter to upstream JSBSim. The project-authored C172S aircraft data is kept separate from the LGPL library.
-- `game/` — Runtime textures, GLB models, factory C172S configuration and native libraries.
-- [Engine audit](docs/2026-11-23_opensky-engine-audit.md) and [flight/weather audit](docs/2026-11-23_flight-weather-audit.md) — Dated performance, flight-model, and weather findings.
-- [Earlier delivery plan](docs/OPENSKY_VFR_DELIVERY_PLAN.md) — Historical milestones and engine design notes.
+- `engine/` — WGS84 geometry, light-piston aircraft systems, OpenTrack UDP and the adapter to upstream JSBSim. Aircraft packages keep project aircraft data separate from the LGPL library.
+- `game/` — Runtime textures, GLB models, the factory aircraft package, and native libraries.
+- [Engine audit](docs/2026-11-23_opensky-engine-audit.md) and [flight/weather audit](docs/2026-11-23_flight-weather-audit.md) — Dated performance and implementation evidence.
 
 ---
 
-## Quick Start (Linux)
+## Build from source (developers)
+
+These steps are for contributors building the source checkout. Players use the installable app package described above when a release is published.
 
 ### 1. Bake a regional pack (Zaragoza LEZG – Huesca LEHC – Pyrenees corridor)
 ```bash
@@ -98,6 +105,12 @@ Start it with `./run_builder.sh`. Choose a Northern Spain preset or draw custom 
 
 For OSM roads and baked settlements outside the bundled Spain extracts, provide a local `.pbf` extract. Spanish region builds bake IGN LiDAR canopy across the full selected region at Z15 by default and derive coarser levels for distance. OSM taxiways and apron polygons are drawn with the airport runway surfaces in every region. In flight, canopy heights share the fixed terrain page cache with the orthophoto and ground elevation.
 
+### Aircraft packages and source mods
+
+List installed aircraft with `./run_sim.sh --list-aircraft`. Install a package folder in `game/aircraft/<id>/` or `~/.config/opensky-vfr/aircraft/<id>/`, then select it with `./run_sim.sh --aircraft <id>`. An interactive selection is saved in the fleet profile. Format 1 packages include an `aircraft.ini`, JSBSim aircraft/engine data, and exterior/cockpit GLB models. The current systems profile supports one piston engine and two tanks; Lua aircraft scripts and multi-engine/jet systems are future work.
+
+See [docs/MODDING.md](docs/MODDING.md) for the package format, model node mappings, region content workflow, and current limits. See [CONTRIBUTING.md](CONTRIBUTING.md) for code contribution rules and [docs/RELEASE_READINESS.md](docs/RELEASE_READINESS.md) for commercial release blockers.
+
 ### Controls
 | Input | Action |
 |---|---|
@@ -131,16 +144,14 @@ For OSM roads and baked settlements outside the bundled Spain extracts, provide 
 
 ---
 
-## Delivery status
+## Current status
 
-The output remains 1920×1080. The default graphics setting shades 60% of native pixels (about 1488×837) and reconstructs terrain and sky to output resolution. In cockpit view, the cockpit can bypass that reduced-resolution grid and draw at native output resolution with its own depth buffer and matching AgX/Spain LUT transform. The Graphics Settings menu allows a 40–100% pixel budget, spatial FXAA or two TAA modes, a 75–150% terrain mesh LOD radius, and a cockpit native-resolution toggle. Settings persist in the user's OpenSky config directory. Performance figures in the [engine audit](docs/2026-11-23_opensky-engine-audit.md) were captured before these reconstruction changes and need a fresh comparison before they can describe the new default.
-
-See [the full delivery plan](docs/OPENSKY_VFR_DELIVERY_PLAN.md) for remaining milestones and release gates.
+The supported runtime is Linux/X11/GLX. The target is 1080p at 60 FPS on AMD Renoir, but the dated [Renoir benchmark](docs/benchmarks/2026-11-23-renoir-linux.md) does not meet the average-frame or p95 gates. Aircraft packages currently support one piston engine and two tanks; scripted and multi-engine systems are not implemented. See [release readiness](docs/RELEASE_READINESS.md) for the remaining product and redistribution blockers.
 
 ## Attribution (Required)
 - **Orthophoto:** PNOA cedido por © Instituto Geográfico Nacional de España (CC-BY 4.0).
 - **Elevation & Hydrography:** MDT05 / MDT25 & INSPIRE Hidrografía © Instituto Geográfico Nacional de España (CC-BY 4.0); border fallback AWS Terrain Tiles.
-- **Airports & Scenery:** OurAirports (Public Domain), OpenStreetMap contributors (ODbL), ENAIRE AIP.
+- **Airports & Scenery:** OurAirports (Public Domain), OpenStreetMap contributors (ODbL); ENAIRE AIP reuse terms are under review.
 - **PBR Ground & Material Textures:** Poly Haven (CC0 1.0 Public Domain).
 
 ## License

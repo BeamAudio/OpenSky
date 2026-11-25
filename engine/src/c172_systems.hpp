@@ -49,10 +49,21 @@ struct C172EnvStep {
     double precip_mm = 0.0;
 };
 
-class C172Systems {
+struct PistonSystemsConfig {
+    double left_tank_capacity_gal = 26.5;
+    double right_tank_capacity_gal = 26.5;
+    double oil_capacity_quarts = 8.0;
+    double max_flaps_deg = 30.0;
+    double bus_voltage = 28.0;
+};
+
+class PistonAircraftSystems {
 public:
-    C172Systems();
-    ~C172Systems() = default;
+    PistonAircraftSystems();
+    ~PistonAircraftSystems() = default;
+
+    void configure(const PistonSystemsConfig &config);
+    const PistonSystemsConfig &configuration() const { return config_; }
 
     void reset_to_running_default();
     void reset_cold_and_dark();
@@ -121,7 +132,7 @@ public:
     void set_flaps_target_deg(double deg);
     double get_flaps_target_deg() const { return flaps_target_deg_; }
     double get_flaps_actual_deg() const { return flaps_actual_deg_; }
-    double get_flaps01() const { return flaps_actual_deg_ / 30.0; }
+    double get_flaps01() const { return config_.max_flaps_deg > 0.0 ? flaps_actual_deg_ / config_.max_flaps_deg : 0.0; }
 
     // Fuel system
     void set_fuel_selector(int pos);
@@ -234,8 +245,8 @@ private:
     double load_amps_ = 10.5;
     bool low_volts_annunciator_ = false;
 
-    // Fuel system (26.5 US gal usable per wing tank)
-    static constexpr double MAX_TANK_GAL = 26.5;
+    PistonSystemsConfig config_{};
+    // Package-defined two-tank fuel, oil and flap limits; defaults match the factory C172S.
     double fuel_left_gal_ = 21.0;
     double fuel_right_gal_ = 21.0;
     int fuel_selector_ = FUEL_SEL_BOTH;
@@ -287,5 +298,8 @@ private:
     int xpdr_squawk_ = 7000;
     double xpdr_ident_timer_s_ = 0.0;
 };
+
+// Compatibility name retained for the built-in C172 implementation and old callers.
+using C172Systems = PistonAircraftSystems;
 
 } // namespace nspain

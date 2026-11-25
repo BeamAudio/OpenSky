@@ -1,4 +1,5 @@
 #include "pack_reader.hpp"
+#include "app_paths.hpp"
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "../third_party/stb_image.h"
@@ -41,6 +42,16 @@ inline uint32_t hash2i(int x, int y, uint32_t seed) {
     uint32_t h = static_cast<uint32_t>(x) * 374761393u ^ static_cast<uint32_t>(y) * 668265263u ^ seed;
     h = (h ^ (h >> 13)) * 1274126177u;
     return h ^ (h >> 16);
+}
+
+std::string shell_quote(const std::string &value) {
+    std::string quoted = "'";
+    for (char c : value) {
+        if (c == '\'') quoted += "'\\''";
+        else quoted += c;
+    }
+    quoted += '\'';
+    return quoted;
 }
 
 inline float vnoise2(float x, float y, uint32_t seed) {
@@ -170,7 +181,7 @@ void PackReader::set_online_provider(OnlineOrthoProvider p) {
     online_provider_.store(p, std::memory_order_release);
     if (p != OnlineOrthoProvider::OFF) {
         std::error_code ec;
-        std::filesystem::create_directories("cache/online_tiles", ec);
+        std::filesystem::create_directories(opensky_cache_dir() / "online_tiles", ec);
         std::lock_guard<std::mutex> lk(online_mtx_);
         if (online_workers_.empty()) {
             online_stop_.store(false, std::memory_order_release);
@@ -206,11 +217,9 @@ bool PackReader::download_online_tile_to_disk(
 
     std::string tmp_path = cache_path + ".tmp." + std::to_string(
         std::hash<std::thread::id>{}(std::this_thread::get_id()) & 0xFFFFu);
-    char cmd[1024];
-    std::snprintf(cmd, sizeof(cmd),
-        "curl -sS -f -L --connect-timeout 2 --max-time 4 -A \"Mozilla/5.0\" -o \"%s\" \"%s\" 2>/dev/null",
-        tmp_path.c_str(), url.c_str());
-    int rc = std::system(cmd);
+    const std::string cmd = "curl -sS -f -L --connect-timeout 2 --max-time 4 -A \"Mozilla/5.0\" -o " +
+        shell_quote(tmp_path) + " " + shell_quote(url) + " 2>/dev/null";
+    int rc = std::system(cmd.c_str());
     struct stat st{};
     if (rc == 0 && ::stat(tmp_path.c_str(), &st) == 0 && st.st_size > 512) {
         ::rename(tmp_path.c_str(), cache_path.c_str());
@@ -267,10 +276,10 @@ void PackReader::online_dl_worker() const {
         int y       = static_cast<int>(okey & 0xFFFFFFu);
         if (prov_id != static_cast<int>(OnlineOrthoProvider::PNOA)) continue;
         auto prov = OnlineOrthoProvider::PNOA;
-        char cpath[256];
-        std::snprintf(cpath, sizeof(cpath), "cache/online_tiles/pnoa_z%d_%d_%d.jpg", z, x, y);
+        const std::string cpath = (opensky_cache_dir() / "online_tiles" /
+            ("pnoa_z" + std::to_string(z) + "_" + std::to_string(x) + "_" + std::to_string(y) + ".jpg")).string();
         struct stat st{};
-        bool ok = (::stat(cpath, &st) == 0 && st.st_size > 512);
+        bool ok = (::stat(cpath.c_str(), &st) == 0 && st.st_size > 512);
         if (!ok) {
             ok = download_online_tile_to_disk(prov, z, x, y, cpath);
         }
@@ -302,10 +311,10 @@ std::shared_ptr<DecodedRgbTile> PackReader::get_online_rgb_tile(
         return hit;
     }
 
-    char cpath[256];
-    std::snprintf(cpath, sizeof(cpath), "cache/online_tiles/pnoa_z%d_%d_%d.jpg", z, x, y);
+    const std::string cpath = (opensky_cache_dir() / "online_tiles" /
+        ("pnoa_z" + std::to_string(z) + "_" + std::to_string(x) + "_" + std::to_string(y) + ".jpg")).string();
     struct stat st{};
-    if (::stat(cpath, &st) != 0 || st.st_size <= 512) {
+    if (::stat(cpath.c_str(), &st) != 0 || st.st_size <= 512) {
         if (!queue_download) return nullptr;
         bool should_notify = false;
         {
@@ -341,7 +350,7 @@ std::shared_ptr<DecodedRgbTile> PackReader::get_online_rgb_tile(
         return nullptr;
     }
 
-    int fd = ::open(cpath, O_RDONLY);
+    int fd = ::open(cpath.c_str(), O_RDONLY);
     if (fd < 0) return nullptr;
     struct stat fst{};
     if (::fstat(fd, &fst) != 0 || fst.st_size <= 512) { ::close(fd); return nullptr; }
@@ -370,7 +379,7 @@ void PackReader::prefetch_online_box(double center_lat, double center_lon, doubl
     OnlineOrthoProvider prov = online_provider_.load(std::memory_order_relaxed);
     if (prov == OnlineOrthoProvider::OFF) return;
     std::error_code ec;
-    std::filesystem::create_directories("cache/online_tiles", ec);
+    std::filesystem::create_directories(opensky_cache_dir() / "online_tiles", ec);
     double m_lat = 111132.0, m_lon = 82600.0;
     nspain::meters_per_degree(center_lat, m_lat, m_lon);
     double dlat = half_span_m / m_lat;
@@ -389,10 +398,10 @@ void PackReader::prefetch_online_box(double center_lat, double center_lon, doubl
     int n = static_cast<int>(coords.size());
     int nw = std::min(n, 6);
     auto warm = [&](int tx, int ty) {
-        char cpath[256];
-        std::snprintf(cpath, sizeof(cpath), "cache/online_tiles/pnoa_z%d_%d_%d.jpg", zoom, tx, ty);
+        const std::string cpath = (opensky_cache_dir() / "online_tiles" /
+            ("pnoa_z" + std::to_string(zoom) + "_" + std::to_string(tx) + "_" + std::to_string(ty) + ".jpg")).string();
         struct stat st{};
-        if (::stat(cpath, &st) != 0 || st.st_size <= 512) download_online_tile_to_disk(prov, zoom, tx, ty, cpath);
+        if (::stat(cpath.c_str(), &st) != 0 || st.st_size <= 512) download_online_tile_to_disk(prov, zoom, tx, ty, cpath);
         get_online_rgb_tile(prov, zoom, tx, ty);
     };
     if (nw <= 1) {
@@ -605,7 +614,7 @@ void PackReader::finalize_packs(double anchor_lat, double anchor_lon) {
         header_.lon_max = std::max(header_.lon_max, r.hdr.lon_max);
         header_.lat_max = std::max(header_.lat_max, r.hdr.lat_max);
     }
-    // For equal layer and XYZ keys the first installed pack in sorted path order wins.
+    // For equal layer and XYZ keys the first loaded pack wins (user packs precede shipped packs).
     // All tile readers resolve through find_entry(), including cached sampling.
     std::sort(index_.begin(), index_.end(), [](const IndexedTile &a, const IndexedTile &b) {
         if (a.key != b.key) return a.key < b.key;
@@ -645,26 +654,37 @@ bool PackReader::load_pack(const std::string &nspack_path) {
 }
 
 bool PackReader::load_packs_dir(const std::string &packs_dir, const std::string &only_region_id, const std::string &prefer_region_id) {
+    return load_packs_dirs({packs_dir}, only_region_id, prefer_region_id);
+}
+
+bool PackReader::load_packs_dirs(const std::vector<std::string> &packs_dirs, const std::string &only_region_id, const std::string &prefer_region_id) {
     clear_regions();
     std::error_code ec;
-    if (!std::filesystem::is_directory(packs_dir, ec)) return false;
     std::vector<std::filesystem::path> files;
-    for (const auto &ent : std::filesystem::directory_iterator(packs_dir, ec)) {
-        if (ent.is_regular_file() && ent.path().extension() == ".nspack") {
-            if (!only_region_id.empty()) {
-                std::string stem = ent.path().stem().string();
-                if (stem != only_region_id && stem.find(only_region_id) == std::string::npos) continue;
+    std::unordered_set<std::string> seen_pack_stems;
+    for (const auto &packs_dir : packs_dirs) {
+        ec.clear();
+        if (!std::filesystem::is_directory(packs_dir, ec)) continue;
+        std::vector<std::filesystem::path> dir_files;
+        for (const auto &ent : std::filesystem::directory_iterator(packs_dir, ec)) {
+            if (ent.is_regular_file() && ent.path().extension() == ".nspack") {
+                if (!only_region_id.empty()) {
+                    std::string stem = ent.path().stem().string();
+                    if (stem != only_region_id && stem.find(only_region_id) == std::string::npos) continue;
+                }
+                if (seen_pack_stems.insert(ent.path().stem().string()).second)
+                    dir_files.push_back(ent.path());
             }
-            files.push_back(ent.path());
         }
+        std::sort(dir_files.begin(), dir_files.end());
+        files.insert(files.end(), dir_files.begin(), dir_files.end());
     }
-    std::sort(files.begin(), files.end());
     for (const auto &p : files) {
         append_pack_internal(p.string());
     }
     if (regions_.empty()) {
-        std::fprintf(stderr, "[PACK] No installed .nspack found in %s%s\n",
-                     packs_dir.c_str(), only_region_id.empty() ? "" : (" for region " + only_region_id).c_str());
+        std::fprintf(stderr, "[PACK] No installed .nspack found in the configured packs directories%s\n",
+                     only_region_id.empty() ? "" : (" for region " + only_region_id).c_str());
         return false;
     }
     const LoadedRegion *start = nullptr;

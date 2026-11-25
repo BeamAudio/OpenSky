@@ -41,10 +41,26 @@ double bearing(double a_lat, double a_lon, double b_lat, double b_lon) {
 } // namespace
 
 void AircraftSession::init(const PackReader &pack, std::filesystem::path profile_file) {
+    AircraftPackage factory;
+    factory.id = "c172s";
+    factory.name = "Cessna 172S";
+    init(pack, std::move(profile_file), factory);
+}
+
+void AircraftSession::init(const PackReader &pack, std::filesystem::path profile_file, const AircraftPackage &aircraft) {
     pack_ = &pack;
     profile_file_ = std::move(profile_file);
     preserve_invalid_profile_ = !profile_file_.empty() &&
         read_fleet_profile(profile_file_, profile_) == ProfileLoad::Invalid;
+    profile_.aircraft_id_ = aircraft.id;
+    left_fuel_capacity_gal_ = aircraft.left_tank_capacity_gal;
+    right_fuel_capacity_gal_ = aircraft.right_tank_capacity_gal;
+    oil_capacity_quarts_ = aircraft.oil_capacity_quarts;
+    if (!preserve_invalid_profile_) {
+        profile_.care_.left_fuel_gal = std::clamp(profile_.care_.left_fuel_gal, 0.0, left_fuel_capacity_gal_);
+        profile_.care_.right_fuel_gal = std::clamp(profile_.care_.right_fuel_gal, 0.0, right_fuel_capacity_gal_);
+        profile_.care_.oil_quarts = std::clamp(profile_.care_.oil_quarts, 0.0, oil_capacity_quarts_);
+    }
     if (profile_.parked_id_.empty()) {
         const auto *home = pack.find_airport("ES-0205");
         if (!home) home = pack.find_airport("LECS");
@@ -68,7 +84,8 @@ bool AircraftSession::full_service(const std::string &id) {
 
 bool AircraftSession::can_add_fuel(bool left_tank) const {
     const auto &care = profile_.care_;
-    return !flight_active_ && (left_tank ? care.left_fuel_gal : care.right_fuel_gal) < 26.45 &&
+    return !flight_active_ && (left_tank ? care.left_fuel_gal < left_fuel_capacity_gal_ - 0.05
+                                         : care.right_fuel_gal < right_fuel_capacity_gal_ - 0.05) &&
            (full_service(profile_.parked_id_) || remote_fuel_added_ < 10.0);
 }
 
@@ -81,7 +98,8 @@ void AircraftSession::adjust_fuel(bool left_tank, bool add) {
     } else {
         if (!can_add_fuel(left_tank)) return;
         const bool hangar = full_service(profile_.parked_id_);
-        const double amount = std::min({5.0, 26.5 - tank, hangar ? 5.0 : 10.0 - remote_fuel_added_});
+        const double capacity = left_tank ? left_fuel_capacity_gal_ : right_fuel_capacity_gal_;
+        const double amount = std::min({5.0, capacity - tank, hangar ? 5.0 : 10.0 - remote_fuel_added_});
         tank += amount;
         if (!hangar) remote_fuel_added_ += amount;
     }
@@ -93,10 +111,10 @@ void AircraftSession::service(AircraftService action) {
     const bool hangar = full_service(profile_.parked_id_);
     auto &c = profile_.care_;
     switch (action) {
-        case AircraftService::TopOil: c.oil_quarts = std::min(8.0, c.oil_quarts + 1.0); break;
+        case AircraftService::TopOil: c.oil_quarts = std::min(oil_capacity_quarts_, c.oil_quarts + 1.0); break;
         case AircraftService::ChangeOil:
             if (!hangar) return;
-            c.oil_quarts = 7.6;
+            c.oil_quarts = std::min(7.6, oil_capacity_quarts_);
             c.oil_hours = 0;
             break;
         case AircraftService::CleanPlugs: c.spark_fouling = 0; break;
@@ -111,8 +129,8 @@ void AircraftSession::service(AircraftService action) {
         case AircraftService::FillLeft:
         case AircraftService::FillBoth:
             if (!hangar) return;
-            c.left_fuel_gal = 26.5;
-            if (action == AircraftService::FillBoth) c.right_fuel_gal = 26.5;
+            c.left_fuel_gal = left_fuel_capacity_gal_;
+            if (action == AircraftService::FillBoth) c.right_fuel_gal = right_fuel_capacity_gal_;
             break;
         case AircraftService::DrainSumps: c.sump_water = 0; break;
         case AircraftService::TogglePitot: c.pitot_cover_on = !c.pitot_cover_on; break;

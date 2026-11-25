@@ -22,8 +22,17 @@ AircraftAndHud::~AircraftAndHud() {
     shutdown();
 }
 
-bool AircraftAndHud::init(const PackReader *pack, const std::string &asset_root, const std::string &aircraft_dir, const std::string &shader_root) {
+std::string AircraftAndHud::visual_node_name(const GlbMeshData &mesh, const char *fallback) const {
+    const bool cockpit = &mesh == &ckpt_mesh_;
+    const std::string key = std::string("node.") + (cockpit ? "cockpit_" : "exterior_") + fallback;
+    if (const auto it = aircraft_.nodes.find(key.substr(5)); it != aircraft_.nodes.end()) return it->second;
+    return fallback;
+}
+
+bool AircraftAndHud::init(const PackReader *pack, const std::string &asset_root, const AircraftPackage &aircraft,
+                          const std::string &shader_root) {
     pack_ = pack;
+    aircraft_ = aircraft;
     ac_prog_  = compile_program_files(shader_root + "/aircraft.vert", shader_root + "/aircraft.frag");
     hud_prog_ = compile_program_files(shader_root + "/hud.vert", shader_root + "/hud.frag");
     precip_prog_ = compile_program_files(shader_root + "/precip.vert", shader_root + "/precip.frag");
@@ -100,31 +109,50 @@ bool AircraftAndHud::init(const PackReader *pack, const std::string &asset_root,
             return 0;
         }
     };
-    windshield_rain_front_tex_ = load_rain_lut(asset_root + "/pbr/c172_windscreen_rain_front.png");
-    windshield_rain_side_tex_ = load_rain_lut(asset_root + "/pbr/c172_windscreen_rain_side.png");
+    std::filesystem::path rain_front, rain_side;
+    std::string asset_error;
+    if (!resolve_aircraft_asset(aircraft_, aircraft_.rain_front, asset_root, rain_front, asset_error) ||
+        !resolve_aircraft_asset(aircraft_, aircraft_.rain_side, asset_root, rain_side, asset_error)) {
+        std::fprintf(stderr, "[AIRCRAFT] Invalid optional package texture: %s\n", asset_error.c_str());
+        return false;
+    }
+    if (!rain_front.empty()) windshield_rain_front_tex_ = load_rain_lut(rain_front.string());
+    if (!rain_side.empty()) windshield_rain_side_tex_ = load_rain_lut(rain_side.string());
     if (windshield_rain_front_tex_ && windshield_rain_side_tex_)
         std::printf("[AIRCRAFT] 512x512x4 physically simulated rain LUTs loaded (front + side glass).\n");
 
-    if (!init_physics(pack, aircraft_dir)) return false;
+    if (!init_physics(pack, aircraft.flight_model_dir.string())) return false;
     opentrack_.start_listening(4242);
 
-    WorldObjects::load_colored_glb(asset_root + "/models/aircraft/c172s_exterior.glb", ext_mesh_);
-    if (!WorldObjects::load_colored_glb(asset_root + "/models/aircraft/c172s_cockpit.glb", ckpt_mesh_)) {
-        std::fprintf(stderr, "[AIRCRAFT] Unable to load the factory C172S cockpit.\n");
+    std::filesystem::path exterior_path, cockpit_path;
+    if (!resolve_aircraft_asset(aircraft_, aircraft_.exterior_model, asset_root, exterior_path, asset_error) ||
+        !WorldObjects::load_colored_glb(exterior_path.string(), ext_mesh_)) {
+        std::fprintf(stderr, "[AIRCRAFT] Unable to load aircraft exterior (%s): %s\n",
+                     aircraft_.id.c_str(), asset_error.c_str());
         return false;
     }
-    if (auto wi = ckpt_mesh_.node_index.find("Windshield"); wi != ckpt_mesh_.node_index.end()) {
+    if (!aircraft_.cockpit_model.empty() &&
+        (!resolve_aircraft_asset(aircraft_, aircraft_.cockpit_model, asset_root, cockpit_path, asset_error) ||
+         !WorldObjects::load_colored_glb(cockpit_path.string(), ckpt_mesh_))) {
+        std::fprintf(stderr, "[AIRCRAFT] Unable to load aircraft cockpit (%s): %s\n",
+                     aircraft_.id.c_str(), asset_error.c_str());
+        return false;
+    }
+    const std::string windshield_node = visual_node_name(ckpt_mesh_, "Windshield");
+    if (auto wi = ckpt_mesh_.node_index.find(windshield_node); wi != ckpt_mesh_.node_index.end()) {
         size_t count = 0;
         float material_alpha = 1.0f;
         for (const auto &sm : ckpt_mesh_.submeshes) if (sm.node_idx == wi->second) {
             ++count;
             material_alpha = sm.base_color.w;
         }
-        std::printf("[AIRCRAFT] Curved C172 windshield node %d: %zu draw part(s), GLTF alpha %.3f, rain %s.\n",
+        std::printf("[AIRCRAFT] Cockpit windshield node %d: %zu draw part(s), GLTF alpha %.3f, rain %s.\n",
                     wi->second, count, material_alpha,
                     windshield_rain_front_tex_ && windshield_rain_side_tex_ ? "ready" : "unavailable");
     } else {
-        std::fprintf(stderr, "[AIRCRAFT] Curved C172 windshield node is missing from GLB.\n");
+        if (!aircraft_.cockpit_model.empty())
+            std::fprintf(stderr, "[AIRCRAFT] Optional windshield node '%s' is missing; cockpit rain effects are disabled.\n",
+                         windshield_node.c_str());
     }
 
     // Load crisp HiDPI TrueType monospace font atlas (1024x576, 16x6 cells, white glyph + dark outline drop-shadow!)
@@ -189,10 +217,19 @@ bool AircraftAndHud::init_physics(const PackReader *pack, const std::string &air
         return ground;
     });
     if (!fdm_.load(aircraft_dir)) {
-        std::fprintf(stderr, "[JSBSIM] Factory C172S failed to load from %s\n", aircraft_dir.c_str());
+        std::fprintf(stderr, "[JSBSIM] Aircraft package '%s' failed to load from %s\n",
+                     aircraft_.id.c_str(), aircraft_dir.c_str());
         return false;
     }
-    std::printf("[JSBSIM] Upstream JSBSim %s | OpenSky C172S config\n", nspain::FlightModel::version().c_str());
+    std::printf("[JSBSIM] Upstream JSBSim %s | aircraft package %s (%s)\n",
+                nspain::FlightModel::version().c_str(), aircraft_.id.c_str(), aircraft_.name.c_str());
+    nspain::PistonSystemsConfig systems_config{};
+    systems_config.left_tank_capacity_gal = aircraft_.left_tank_capacity_gal;
+    systems_config.right_tank_capacity_gal = aircraft_.right_tank_capacity_gal;
+    systems_config.oil_capacity_quarts = aircraft_.oil_capacity_quarts;
+    systems_config.max_flaps_deg = aircraft_.max_flaps_deg;
+    systems_config.bus_voltage = aircraft_.bus_voltage;
+    systems_.configure(systems_config);
     systems_.reset_to_running_default();
     reset_flight(st_.lat_deg, st_.lon_deg, st_.alt_msl_m, st_.heading_deg, st_.speed_mps * 1.94384, false);
     return true;
@@ -287,7 +324,7 @@ void AircraftAndHud::reset_flight(double lat, double lon, double alt_m, double h
     controls.throttle = st_.throttle;
     controls.mixture = st_.mixture;
     controls.brake_left = controls.brake_right = st_.parking_brake ? 1.0 : 0.0;
-    controls.flaps = systems_.get_flaps_actual_deg() / 30.0;
+    controls.flaps = systems_.get_flaps01();
     fdm_.set_controls(controls);
     nspain::FlightEngineInputs engine{};
     engine.left_fuel_gal = systems_.get_left_tank_gal();
@@ -300,7 +337,8 @@ void AircraftAndHud::reset_flight(double lat, double lon, double alt_m, double h
     engine.running = systems_.is_engine_running();
     fdm_.set_engine(engine);
     if (!fdm_.initialize(st_.lat_deg, st_.lon_deg, st_.alt_msl_m, st_.heading_deg, ias_kt, on_ground)) {
-        std::fprintf(stderr, "[JSBSIM] Could not initialize C172S at %.5f, %.5f / %.0f m\n", lat, lon, st_.alt_msl_m);
+        std::fprintf(stderr, "[JSBSIM] Could not initialize package '%s' at %.5f, %.5f / %.0f m\n",
+                     aircraft_.id.c_str(), lat, lon, st_.alt_msl_m);
         return;
     }
     const auto &fs = fdm_.state();
@@ -538,7 +576,7 @@ void AircraftAndHud::step_inputs_and_physics(const PlatformWindow &win, double d
             else systems_.set_pitot_heat_switch(!systems_.get_pitot_heat_switch());
         }
     }
-    if (win.key_pressed(KEY_F)) systems_.set_flaps_target_deg(std::min(30.0, systems_.get_flaps_target_deg() + 10.0));
+    if (win.key_pressed(KEY_F)) systems_.set_flaps_target_deg(std::min(aircraft_.max_flaps_deg, systems_.get_flaps_target_deg() + 10.0));
     if (win.key_pressed(KEY_V)) systems_.set_flaps_target_deg(std::max(0.0, systems_.get_flaps_target_deg() - 10.0));
     // Cursor-Anchored Trackpad/Mouse Yoke (zero XWarpPointer -> zero XWayland runaway!):
     // Anchors seamlessly around current cursor with compact trackpad travel, magnetic center detent,
@@ -740,7 +778,7 @@ void AircraftAndHud::advance_aircraft(double dt, const AtmosphereState &atmo, co
     ci.elevator_trim = st_.trim;
     ci.throttle = st_.throttle;
     ci.mixture = st_.mixture;
-    ci.flaps = systems_.get_flaps_actual_deg() / 30.0;
+    ci.flaps = systems_.get_flaps01();
     ci.brake_left = brake_left;
     ci.brake_right = brake_right;
     fdm_.set_controls(ci);
@@ -1143,8 +1181,8 @@ void AircraftAndHud::draw_glb(
                 (sm.material_name == "C172S baked cabin" ||
                  sm.material_name == "C172S baked PBR instrument panel") ? 1.0f : 0.0f);
             const int glass_mode = is_interior
-                ? (mesh.nodes[ni].name == "Windshield" ? 2 :
-                   mesh.nodes[ni].name == "Cabin glazing" ? 1 : 0)
+                ? (mesh.nodes[ni].name == visual_node_name(mesh, "Windshield") ? 2 :
+                   mesh.nodes[ni].name == visual_node_name(mesh, "Cabin glazing") ? 1 : 0)
                 : 0;
             glUniform1i(u_ac_cabin_glass_, glass_mode);
             const float glass_rain_mm = (last_air_.precipitation_mm_hr >= 0.45) ? static_cast<float>(last_air_.precipitation_mm_hr) : 0.0f;
@@ -1173,8 +1211,9 @@ void AircraftAndHud::draw_glb(
 }
 
 void AircraftAndHud::apply_damage_rig(std::vector<Mat4> &anim, float flaps_rad, float ail, float elv, float trm, float rud) const {
-    auto set_node = [](const GlbMeshData &m, std::vector<Mat4> &dst, const char *name, const Mat4 &xf) {
-        auto it = m.node_index.find(name);
+    auto set_node = [this](const GlbMeshData &m, std::vector<Mat4> &dst, const char *name, const Mat4 &xf) {
+        const std::string mapped = visual_node_name(m, name);
+        auto it = m.node_index.find(mapped);
         if (it != m.node_index.end() && static_cast<size_t>(it->second) < dst.size()) dst[static_cast<size_t>(it->second)] = xf;
     };
     const float pn = static_cast<float>(std::clamp(prop_nicks_, 0.0, 1.0));
@@ -1243,12 +1282,14 @@ void AircraftAndHud::render_aircraft_3d(const Mat4 &vp, const Vec3 &cam_off, con
     float trm = static_cast<float>(st_.trim);
     const float idle_vib = (rpm > 120.0f && rpm < 950.0f) ? ((950.0f - rpm) / 830.0f) : (cranking ? 0.95f : 0.0f);
 
-    auto set_node = [](const GlbMeshData &m, std::vector<Mat4> &anim, const char *name, const Mat4 &xf) {
-        auto it = m.node_index.find(name);
+    auto set_node = [this](const GlbMeshData &m, std::vector<Mat4> &anim, const char *name, const Mat4 &xf) {
+        const std::string mapped = visual_node_name(m, name);
+        auto it = m.node_index.find(mapped);
         if (it != m.node_index.end()) anim[static_cast<size_t>(it->second)] = xf;
     };
-    auto set_f = [](const GlbMeshData &m, std::vector<float> &arr, const char *name, float v) {
-        auto it = m.node_index.find(name);
+    auto set_f = [this](const GlbMeshData &m, std::vector<float> &arr, const char *name, float v) {
+        const std::string mapped = visual_node_name(m, name);
+        auto it = m.node_index.find(mapped);
         if (it != m.node_index.end()) arr[static_cast<size_t>(it->second)] = v;
     };
 
@@ -1256,7 +1297,7 @@ void AircraftAndHud::render_aircraft_3d(const Mat4 &vp, const Vec3 &cam_off, con
         // Pilot seated eye framing: crisp unobstructed 3D 6-pack + GNS430 + cowling + spinning prop veil!
         // The cockpit model is framed around the pilot's eye; place both it
         // and the camera at the eye height above JSBSim's centre of gravity.
-        Mat4 ckpt_root = ac_rot * Mat4::translate({0.0f, COCKPIT_EYE_HEIGHT_M + 0.034f, -0.120f});
+        Mat4 ckpt_root = ac_rot * Mat4::translate({0.0f, static_cast<float>(aircraft_.cockpit_eye_height_m) + 0.034f, -0.120f});
         size_t nn = ckpt_mesh_.nodes.size();
         std::vector<Mat4> anim(nn, Mat4::identity());
         std::vector<float> alpha(nn, 1.0f);
@@ -1447,7 +1488,7 @@ void AircraftAndHud::render_parked_aircraft(const Mat4 &vp, Vec3 offset, float h
     std::vector<Mat4> anim(ext_mesh_.nodes.size(), Mat4::identity());
     apply_damage_rig(anim, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
     std::vector<float> alpha(ext_mesh_.nodes.size(), 1.0f);
-    const auto blur = ext_mesh_.node_index.find("PropBlurDisc");
+    const auto blur = ext_mesh_.node_index.find(visual_node_name(ext_mesh_, "PropBlurDisc"));
     if (blur != ext_mesh_.node_index.end()) alpha[blur->second] = 0.0f;
     draw_glb(ext_mesh_, vp, model, model, anim, alpha, {}, atmo, reflection, false, 0.0f, lut != 0);
 }

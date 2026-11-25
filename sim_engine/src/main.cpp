@@ -1,4 +1,6 @@
 #include "aircraft_hud.hpp"
+#include "aircraft_package.hpp"
+#include "app_paths.hpp"
 #include "airfield_vegetation.hpp"
 #include "async_streamer.hpp"
 #include "audio_engine.hpp"
@@ -7,6 +9,7 @@
 #include "game_frontend.hpp"
 #include "flight_profiler.hpp"
 #include "flight_replay.hpp"
+#include "fleet_profile.hpp"
 #include "living_traffic.hpp"
 #include "pack_reader.hpp"
 #include "platform_window.hpp"
@@ -302,7 +305,10 @@ int main(int argc, char **argv) {
     bool season_qa = false;
     std::string req_region;
     std::string req_airport;
+    std::string req_aircraft;
+    bool list_aircraft = false;
     std::string packs_dir = "packs";
+    bool packs_dir_explicit = false;
     std::string autotest_dir;
     std::string topdown_dir;
     std::string airport_qa_dir;
@@ -350,9 +356,11 @@ int main(int argc, char **argv) {
         else if (a == "--only-region") only_region = true;
         else if (a == "--region" && i + 1 < argc) req_region = argv[++i];
         else if (a == "--airport" && i + 1 < argc) req_airport = argv[++i];
+        else if (a == "--aircraft" && i + 1 < argc) req_aircraft = argv[++i];
+        else if (a == "--list-aircraft") list_aircraft = true;
         else if (a == "--season" && i + 1 < argc) season_arg = argv[++i];
         else if (a == "--weather" && i + 1 < argc) weather_arg = argv[++i];
-        else if (a == "--packs-dir" && i + 1 < argc) packs_dir = argv[++i];
+        else if (a == "--packs-dir" && i + 1 < argc) { packs_dir = argv[++i]; packs_dir_explicit = true; }
         else if (a == "--autotest" && i + 1 < argc) autotest_dir = argv[++i];
         else if (a == "--topdown"  && i + 1 < argc) topdown_dir  = argv[++i];
         else if (a == "--world-qa" && i + 1 < argc) world_qa_png = argv[++i];
@@ -386,6 +394,15 @@ int main(int argc, char **argv) {
         return 2;
     }
     const std::string root = ".";
+    std::vector<std::string> packs_dirs;
+    if (packs_dir_explicit) {
+        packs_dirs.push_back(packs_dir);
+    } else {
+        // User-installed regions are loaded first, so they can override a shipped region with the same id.
+        packs_dirs.push_back((opensky_data_dir() / "packs").string());
+        packs_dirs.push_back(packs_dir);
+    }
+    const bool interactive_run = autotest_dir.empty() && topdown_dir.empty() && !quick_profile && airport_qa_dir.empty() && region_test_dir.empty() && world_qa_png.empty() && replay_flight_path.empty();
     // The profiler owns GL queries, so it must be destroyed before the window.
     PlatformWindow win;
     FlightProfiler profiler;
@@ -395,13 +412,42 @@ int main(int argc, char **argv) {
         return 1;
     }
     PackReader pack;
-    if (!pack.load_packs_dir(packs_dir, only_region ? req_region : "", req_region)) return 1;
+    if (!pack.load_packs_dirs(packs_dirs, only_region ? req_region : "", req_region)) return 1;
     profiler.startup_stage("pack_load_and_corridor_bake");
     if (!req_region.empty() && !pack.find_region_by_id(req_region)) {
-        std::fprintf(stderr, "[OPENSKY] Region '%s' is not installed in %s. Open the World Editor to build or install it.\n", req_region.c_str(), packs_dir.c_str());
+        std::fprintf(stderr, "[OPENSKY] Region '%s' is not installed. Open the World Editor to build or install it.\n", req_region.c_str());
         return 1;
     }
     GraphicsSettings graphics_settings = load_graphics_settings();
+    const auto profile_file = interactive_run
+        ? graphics_settings_path().parent_path() / "fleet.ini" : std::filesystem::path{};
+    const auto aircraft_roots = std::vector<std::filesystem::path>{
+        std::filesystem::path(root) / "game/aircraft",
+        graphics_settings_path().parent_path() / "aircraft"
+    };
+    auto aircraft_catalog = discover_aircraft_packages(aircraft_roots);
+    for (const auto &warning : aircraft_catalog.warnings)
+        std::fprintf(stderr, "[AIRCRAFT] Skipping package: %s\n", warning.c_str());
+    if (list_aircraft) {
+        for (const auto &item : aircraft_catalog.packages)
+            std::printf("%s\t%s\t%s\n", item.id.c_str(), item.name.c_str(), item.systems_profile.c_str());
+        return aircraft_catalog.packages.empty() ? 1 : 0;
+    }
+    std::string selected_aircraft_id = req_aircraft;
+    if (selected_aircraft_id.empty() && !profile_file.empty()) {
+        FleetProfile saved_profile;
+        if (read_fleet_profile(profile_file, saved_profile) == ProfileLoad::Loaded)
+            selected_aircraft_id = saved_profile.aircraft_id_;
+    }
+    if (selected_aircraft_id.empty()) selected_aircraft_id = "c172s";
+    const auto selected_aircraft = std::find_if(aircraft_catalog.packages.begin(), aircraft_catalog.packages.end(),
+        [&](const AircraftPackage &item) { return item.id == selected_aircraft_id; });
+    if (selected_aircraft == aircraft_catalog.packages.end()) {
+        std::fprintf(stderr, "[AIRCRAFT] Package '%s' is not installed. Use --list-aircraft or install it under game/aircraft or %s/aircraft.\n",
+                     selected_aircraft_id.c_str(), graphics_settings_path().parent_path().c_str());
+        return 1;
+    }
+    const AircraftPackage aircraft_package = *selected_aircraft;
     if (ortho_explicit) graphics_settings.terrain_streaming = init_online == OnlineOrthoProvider::PNOA;
     else if (!graphics_settings.terrain_streaming) init_online = OnlineOrthoProvider::OFF;
     pack.set_online_provider(init_online);
@@ -447,7 +493,6 @@ int main(int argc, char **argv) {
     if (!win.create("OpenSky VFR Simulator", output_w, output_h)) {
         return 1;
     }
-    const bool interactive_run = autotest_dir.empty() && topdown_dir.empty() && !quick_profile && airport_qa_dir.empty() && region_test_dir.empty() && world_qa_png.empty() && replay_flight_path.empty();
     // Cap FPS to monitor refresh rate (<= 60 Hz for iGPU thermal stability <80C) and enable VSync interactively.
     const double fps_cap = std::clamp(win.refresh_hz(), 30.0, 60.0);
     const double frame_period = 1.0 / fps_cap;
@@ -531,16 +576,15 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "[VEG] Warning: volumetric airfield vegetation failed to initialize.\n");
     }
     profiler.startup_stage("world_resources");
-    if (!ac_hud.init(&pack, root + "/game/assets", root + "/game/aircraft/c172s", root + "/sim_engine/shaders")) return 1;
+    if (!ac_hud.init(&pack, root + "/game/assets", aircraft_package, root + "/sim_engine/shaders")) return 1;
     ac_hud.set_graphics_settings(graphics_settings);
     profiler.startup_stage("aircraft_resources");
     const bool interactive = interactive_run;
     audio.init(interactive && !no_audio);
     // An empty path gives scripted runs an in-memory profile with no read/write access.
-    const auto profile_file = interactive
-        ? graphics_settings_path().parent_path() / "fleet.ini" : std::filesystem::path{};
     if ((interactive || !airport_qa_dir.empty() || !world_qa_png.empty()) &&
-        !frontend.init(pack, root + "/sim_engine/shaders", root + "/game/assets", profile_file)) return 1;
+        !frontend.init(pack, root + "/sim_engine/shaders", root + "/game/assets", profile_file,
+                       aircraft_package)) return 1;
     auto show_loading = [&](const char *title, const char *stage, float progress01) {
         if (!interactive) return;
         frontend.draw_loading_screen(ac_hud, win.width(), win.height(), title, stage, progress01);

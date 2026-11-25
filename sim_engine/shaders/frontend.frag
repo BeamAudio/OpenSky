@@ -25,6 +25,8 @@ void main() {
         bool installed = false;
         int relief_layer = -1;
         vec2 relief_uv = vec2(0);
+        vec2 relief_scale = vec2(1);
+        vec2 geo_dx = dFdx(degrees), geo_dy = dFdy(degrees);
         for (int i = 0; i < u_region_count; ++i) {
             vec4 b = bounds[2 * i];
             if (any(lessThan(degrees, b.xy)) || any(greaterThan(degrees, b.zw))) continue;
@@ -32,13 +34,16 @@ void main() {
             int layer = int(bounds[2 * i + 1].x);
             if (relief_layer < 0 && layer >= 0) {
                 relief_layer = layer;
-                relief_uv = (degrees - b.xy) / (b.zw - b.xy);
+                relief_scale = 1.0 / (b.zw - b.xy);
+                relief_uv = (degrees - b.xy) * relief_scale;
             }
         }
         if (installed) {
             color = mix(vec3(.072, .29, .34), vec3(.20, .49, .38), land);
             if (relief_layer >= 0) {
-                vec4 relief = texture(u_relief, vec3(relief_uv.x, 1.0 - relief_uv.y, relief_layer));
+                vec2 texture_scale = relief_scale * vec2(1.0, -1.0);
+                vec4 relief = textureGrad(u_relief, vec3(relief_uv.x, 1.0 - relief_uv.y, relief_layer),
+                                          geo_dx * texture_scale, geo_dy * texture_scale);
                 color = mix(color, relief.rgb, relief.a * land);
             }
         }

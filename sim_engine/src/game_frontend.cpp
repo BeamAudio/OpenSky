@@ -91,13 +91,11 @@ struct GlobeProjection {
 } // namespace
 
 GameFrontend::~GameFrontend() {
-    if (region_map_future_.valid()) region_map_future_.wait();
     if (vao_) glDeleteVertexArrays(1, &vao_);
     if (bounds_) glDeleteBuffers(1, &bounds_);
     if (land_) glDeleteTextures(1, &land_);
     if (font_) glDeleteTextures(1, &font_);
     if (relief_) glDeleteTextures(1, &relief_);
-    if (region_map_) glDeleteTextures(1, &region_map_);
     if (backdrop_) glDeleteProgram(backdrop_);
 }
 
@@ -107,11 +105,9 @@ bool GameFrontend::init(const PackReader &pack, const std::string &shader_root, 
     pack_ = &pack;
     backdrop_ = compile_program_files(shader_root + "/fullscreen.vert", shader_root + "/frontend.frag");
     if (!backdrop_) return false;
-    relief_bounds_uniform_ = glGetUniformLocation(backdrop_, "u_relief_bounds");
     globe_uniform_ = glGetUniformLocation(backdrop_, "u_globe");
     region_count_uniform_ = glGetUniformLocation(backdrop_, "u_region_count");
     aspect_uniform_ = glGetUniformLocation(backdrop_, "u_aspect");
-    region_map_ready_uniform_ = glGetUniformLocation(backdrop_, "u_region_map_ready");
     int tw, th, channels;
     unsigned char *pixels = stbi_load((asset_root + "/ui/globe_land.png").c_str(), &tw, &th, &channels, 1);
     if (!pixels) {
@@ -137,32 +133,43 @@ bool GameFrontend::init(const PackReader &pack, const std::string &shader_root, 
     glTextureParameteri(font_, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTextureParameteri(font_, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 
-    // The regional planning map reuses the DEM already baked by the pack reader.
-    glCreateTextures(GL_TEXTURE_2D, 1, &relief_);
-    glTextureStorage2D(relief_, 1, GL_R32F, pack.corridor_dem_w(), pack.corridor_dem_h());
-    glTextureSubImage2D(relief_, 0, 0, 0, pack.corridor_dem_w(), pack.corridor_dem_h(),
-                        GL_RED, GL_FLOAT, pack.corridor_dem().data());
-    glTextureParameteri(relief_, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTextureParameteri(relief_, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTextureParameteri(relief_, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTextureParameteri(relief_, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glCreateTextures(GL_TEXTURE_2D, 1, &region_map_);
-    glTextureStorage2D(region_map_, 1, GL_RG32F, map_area.w, map_area.h);
-    glTextureParameteri(region_map_, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTextureParameteri(region_map_, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTextureParameteri(region_map_, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTextureParameteri(region_map_, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    relief_bounds_ = {float(pack.anchor_lon() + pack.corridor_min_e() / pack.anchor_m_lon()),
-                      float(pack.anchor_lat() + pack.corridor_min_n() / pack.anchor_m_lat()),
-                      float(pack.corridor_span_e() / pack.anchor_m_lon()),
-                      float(pack.corridor_span_n() / pack.anchor_m_lat())};
-
+    constexpr int relief_width = 1536, relief_height = 1024, mip_levels = 11;
     std::vector<Vec4> bounds;
+    int layer_count = 0;
     for (const auto &region : pack.regions()) {
         const auto &b = region.hdr;
+        auto path = std::filesystem::path(region.pack_path).replace_extension(".relief.png");
         bounds.emplace_back(b.lon_min, b.lat_min, b.lon_max, b.lat_max);
+        std::error_code ec;
+        const int layer = std::filesystem::is_regular_file(path, ec) ? layer_count++ : -1;
+        bounds.emplace_back(static_cast<float>(layer), 0, 0, 0);
     }
-    region_count_ = static_cast<int>(bounds.size());
+    region_count_ = static_cast<int>(pack.regions().size());
+    if (layer_count > 0) {
+        glCreateTextures(GL_TEXTURE_2D_ARRAY, 1, &relief_);
+        glTextureStorage3D(relief_, mip_levels, GL_RGBA8, relief_width, relief_height, layer_count);
+        glTextureParameteri(relief_, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+        glTextureParameteri(relief_, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTextureParameteri(relief_, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTextureParameteri(relief_, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        for (const auto &region : pack.regions()) {
+            Vec4 &layer_entry = bounds[2 * region.idx + 1];
+            const int layer = static_cast<int>(layer_entry.x);
+            if (layer < 0) continue;
+            auto path = std::filesystem::path(region.pack_path).replace_extension(".relief.png");
+            const auto name = path.string();
+            if (!stbi_info(name.c_str(), &tw, &th, &channels) ||
+                tw != relief_width || th != relief_height ||
+                !(pixels = stbi_load(name.c_str(), &tw, &th, &channels, 4))) {
+                layer_entry.x = -1;
+                std::fprintf(stderr, "[WORLD] Invalid relief image %s\n", name.c_str());
+                continue;
+            }
+            glTextureSubImage3D(relief_, 0, 0, 0, layer, tw, th, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+            stbi_image_free(pixels);
+        }
+        glGenerateTextureMipmap(relief_);
+    }
     if (bounds.empty()) bounds.emplace_back();
     glCreateBuffers(1, &bounds_);
     glNamedBufferStorage(bounds_, bounds.size() * sizeof(Vec4), bounds.data(), 0);
@@ -336,7 +343,6 @@ void GameFrontend::focus_airport(const AirportInfo &airport, float zoom) {
     globe_lat_ = airport.lat;
     globe_lon_ = airport.lon;
     globe_zoom_ = zoom;
-    region_map_preview_dirty_ = true;
 }
 
 void GameFrontend::add_point(RoutePoint point) {
@@ -727,85 +733,15 @@ void GameFrontend::draw_globe() {
     glDisable(GL_CULL_FACE);
     glDisable(GL_BLEND);
     glUseProgram(backdrop_);
-    glUniform4f(relief_bounds_uniform_, relief_bounds_.x, relief_bounds_.y, relief_bounds_.z, relief_bounds_.w);
     glUniform1i(region_count_uniform_, region_count_);
     glUniform1f(aspect_uniform_, float(a.w) / a.h);
     glUniform3f(globe_uniform_, float(globe_lat_ * DEG2RAD_D), float(globe_lon_ * DEG2RAD_D), globe_radius * globe_zoom_);
-    const bool preview_matches = !region_map_preview_.elevation_rg.empty() &&
-        std::abs(region_map_preview_.center_lat - globe_lat_) < 1e-7 &&
-        std::abs(region_map_preview_.center_lon - globe_lon_) < 1e-7 &&
-        std::abs(region_map_preview_.zoom - globe_zoom_) < 1e-5f;
-    glUniform1i(region_map_ready_uniform_, preview_matches ? 1 : 0);
     glBindTextureUnit(0, land_);
     glBindTextureUnit(1, relief_);
-    glBindTextureUnit(2, region_map_);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, bounds_);
     glBindVertexArray(vao_);
     glDrawArrays(GL_TRIANGLES, 0, 3);
     glBindVertexArray(0);
-}
-
-void GameFrontend::update_region_map_preview() {
-    const bool has_regions = !pack_->regions().empty();
-    if (region_map_future_.valid() &&
-        region_map_future_.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
-        try {
-            RegionMapPreview fresh = region_map_future_.get();
-            const bool same_target = has_regions &&
-                std::abs(fresh.center_lat - globe_lat_) < 1e-7 &&
-                std::abs(fresh.center_lon - globe_lon_) < 1e-7 &&
-                std::abs(fresh.zoom - globe_zoom_) < 1e-5f;
-            if (same_target && fresh.elevation_rg.size() == static_cast<size_t>(map_area.w * map_area.h * 2)) {
-                glTextureSubImage2D(region_map_, 0, 0, 0, map_area.w, map_area.h,
-                                    GL_RG, GL_FLOAT, fresh.elevation_rg.data());
-                region_map_preview_ = std::move(fresh);
-                region_map_preview_dirty_ = false;
-            } else {
-                region_map_preview_dirty_ = true;
-            }
-        } catch (const std::exception &e) {
-            std::fprintf(stderr, "[WORLD] Regional map preview failed: %s\n", e.what());
-            region_map_preview_dirty_ = false;
-        }
-    }
-    if (!has_regions || region_map_future_.valid() || !region_map_preview_dirty_) return;
-
-    const PackReader *pack = pack_;
-    const double center_lat = globe_lat_, center_lon = globe_lon_;
-    const float zoom = globe_zoom_;
-    region_map_preview_dirty_ = false;
-    region_map_future_ = std::async(std::launch::async,
-        [pack, center_lat, center_lon, zoom]() {
-            RegionMapPreview result;
-            result.center_lat = center_lat;
-            result.center_lon = center_lon;
-            result.zoom = zoom;
-            result.elevation_rg.assign(static_cast<size_t>(map_area.w * map_area.h * 2), 0.0f);
-            const double center_lat_r = center_lat * DEG2RAD_D;
-            const double center_lon_r = center_lon * DEG2RAD_D;
-            const double aspect = static_cast<double>(map_area.w) / map_area.h;
-            const double radius = globe_radius * zoom;
-            const double sl = std::sin(center_lat_r), cl = std::cos(center_lat_r);
-            for (int y = 0; y < map_area.h; ++y) {
-                const double py = ((y + 0.5) / map_area.h - 0.5) / radius;
-                for (int x = 0; x < map_area.w; ++x) {
-                    const double px = ((x + 0.5) / map_area.w - 0.5) * aspect / radius;
-                    const double r2 = px * px + py * py;
-                    if (r2 > 1.0) continue;
-                    const double z = std::sqrt(std::max(0.0, 1.0 - r2));
-                    const double lat = std::asin(std::clamp(py * cl + z * sl, -1.0, 1.0)) * RAD2DEG_D;
-                    const double lon = std::remainder(center_lon_r + std::atan2(px, z * cl - py * sl),
-                                                      2.0 * PI_D) * RAD2DEG_D;
-                    // Use high-resolution elevation data across every installed
-                    // region so the menu keeps one shaded-relief map style.
-                    if (!pack->find_region_at(lat, lon)) continue;
-                    const size_t offset = (static_cast<size_t>(y) * map_area.w + x) * 2;
-                    result.elevation_rg[offset] = static_cast<float>(pack->sample_elevation(lat, lon));
-                    result.elevation_rg[offset + 1] = 1.0f;
-                }
-            }
-            return result;
-        });
 }
 
 void GameFrontend::draw_menu(AircraftAndHud &aircraft, SkyAndClouds &sky, const PlatformWindow &win,
@@ -862,7 +798,6 @@ void GameFrontend::draw_world(AircraftAndHud &ui, const PlatformWindow &win,
     const auto *parked = parked_airport();
     if (button(ui, {64, 986, 149, 47}, "Globe view")) {
         globe_zoom_ = 1.0f;
-        region_map_preview_dirty_ = true;
     }
     if (button(ui, {225, 986, 194, 47}, "Find aircraft", parked)) {
         focus_airport(*parked, 90.0f);
@@ -870,18 +805,15 @@ void GameFrontend::draw_world(AircraftAndHud &ui, const PlatformWindow &win,
     }
     if (button(ui, {431, 986, 62, 47}, "-")) {
         globe_zoom_ = std::max(1.0f, globe_zoom_ / 1.8f);
-        region_map_preview_dirty_ = true;
     }
     if (button(ui, {505, 986, 62, 47}, "+")) {
         globe_zoom_ = std::min(180.0f, globe_zoom_ * 1.8f);
-        region_map_preview_dirty_ = true;
     }
     if (button(ui, {579, 986, 235, 47}, add_waypoint_ ? "Cancel map point" : "Add map point", !flight_active_, add_waypoint_))
         add_waypoint_ = !add_waypoint_;
     label(ui, 837, 1000, 16, add_waypoint_ ? "Click inside installed terrain" : "Drag to move the globe", true);
     if (win.key_pressed(KEY_ESC)) add_waypoint_ = false;
 
-    const bool was_map_dragging = map_dragging_;
     if (!win.mouse_left_down()) map_dragging_ = false;
     if (map_dragging_ && !win.mouse_left_clicked()) {
         const double scale = .19 / globe_zoom_;
@@ -889,10 +821,8 @@ void GameFrontend::draw_world(AircraftAndHud &ui, const PlatformWindow &win,
         const double lon_scale = scale / std::max(.21, std::cos(globe_lat_ * DEG2RAD_D));
         globe_lon_ = std::remainder(globe_lon_ - win.mouse_dx() * lon_scale, 360.0);
     }
-    if (was_map_dragging && !win.mouse_left_down()) region_map_preview_dirty_ = true;
 
     GlobeProjection projection(globe_lat_, globe_lon_, globe_zoom_);
-    update_region_map_preview();
     draw_globe();
     ui.hud_border(map_area.x, map_area.y, map_area.w, map_area.h, 1, .29f, .42f, .50f, .8f);
 
@@ -955,7 +885,6 @@ void GameFrontend::draw_world(AircraftAndHud &ui, const PlatformWindow &win,
             }
         } else if (hit) {
             selected_id_ = hit->id;
-            region_map_preview_dirty_ = true;
             if (globe_zoom_ < 8) focus_airport(*hit, 75.0f);
         } else map_dragging_ = true;
         click_ = false;

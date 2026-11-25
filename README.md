@@ -79,6 +79,10 @@ condition, engine hours, and route are saved locally.
 
 ### World Editor
 
+New packs include a shaded elevation image for the World menu. Bake images for
+already installed packs with `python3 builder/bake_map_relief.py packs/*.nspack`.
+The images are loaded at startup and travel with their packs.
+
 Start it with `./run_builder.sh`. Choose a Northern Spain preset or draw custom bounds. For global regions, choose `local-xyz` and an imagery directory in `<root>/<z>/<x>/<y>.jpg|png|webp` layout, or choose `none` for terrain-only presentation. Elevation can use Terrarium XYZ PNG tiles in the same directory layout. Imported layers require an attribution string; the pack manifest records it. Custom region IDs derive from all four bounds so separate areas do not collide.
 
 For OSM roads and baked settlements outside the bundled Spain extracts, provide a local `.pbf` extract. Spanish region builds bake IGN LiDAR canopy across the full selected region at Z15 by default and derive coarser levels for distance. OSM taxiways and apron polygons are drawn with the airport runway surfaces in every region. In flight, canopy heights share the fixed terrain page cache with the orthophoto and ground elevation.

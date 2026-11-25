@@ -1290,6 +1290,10 @@ def build_region(args: argparse.Namespace) -> int:
             if wx_out.exists():
                 baked_files["nswx"] = wx_out.name
 
+    from bake_map_relief import bake as bake_map_relief
+    relief_path = bake_map_relief(out_path)
+    baked_files["relief"] = relief_path.name
+
     _update_registry_entry(region_id, {
         "region_id": region_id,
         "name": name,
@@ -1352,6 +1356,9 @@ def _discover_installed_regions() -> dict[str, dict[str, Any]]:
                 info.setdefault("name", rid)
             stem_base = "es_aragon" if rid == "es_aragon_pyrenees" else rid
             files = {"nspack": p.name}
+            relief = p.with_suffix(".relief.png")
+            if relief.is_file():
+                files["relief"] = relief.name
             for ext, key in (
                 ("_scenery.nsscn", "nsscn"), ("_cities.nscity", "nscity"),
                 ("_city_sh.nsshd", "nsshd"), ("_weather.nswx", "nswx"),

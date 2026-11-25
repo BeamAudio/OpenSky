@@ -26,6 +26,7 @@ cache/
 __pycache__/
 *.pyc
 *.blend1
+/game/assets/models/aircraft/c172-bake-*/
 
 # Local analysis and QA output
 /graphify-out/

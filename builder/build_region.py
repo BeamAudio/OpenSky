@@ -46,7 +46,6 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from builder.airports import haversine_m, merge_airports  # noqa: E402
-from builder.airport_vision import recognize_airport_buildings  # noqa: E402
 from protocol.pack_format import (  # noqa: E402
     ENC_JPEG,
     ENC_PNG,
@@ -1121,17 +1120,6 @@ def build_region(args: argparse.Namespace) -> int:
         coverage = len(img_tiles) / len(img_jobs)
         log(f"  imagery coverage: {coverage:.1%} ({len(img_tiles)}/{len(img_jobs)} requested tiles)")
 
-    airport_vision = {"airports_with_imagery": 0, "detected": 0, "skipped_low_confidence": 0}
-    if img_tiles and airports:
-        log("[4b/5] Recognizing airport structures from licensed orthophotos...")
-        airport_vision = recognize_airport_buildings(airports, img_tiles)
-        log(
-            "  airport imagery coverage={airports_with_imagery}/{total} | "
-            "new roof footprints={detected} | low-confidence skipped={skipped_low_confidence}".format(
-                total=len(airports), **airport_vision
-            )
-        )
-
     log("[5/5] Encoding tiles, generating surface/forest masks, and writing .nspack...")
     records: list[TileRecord] = []
     for (z, x, y), arr in elev_tiles.items():
@@ -1172,8 +1160,7 @@ def build_region(args: argparse.Namespace) -> int:
             if plan["elevation_source"] == "terrarium"
             else "User-imported Terrarium XYZ elevation; source attribution must be reviewed before redistribution")
     )
-    # Aerodrome boundary rings are an internal recognition mask. Do not copy
-    # large OSM boundary geometries into the runtime manifest.
+    # Keep the OSM boundary rings used during ingestion out of the runtime manifest.
     manifest_airports = [
         {key: value for key, value in airport.items() if key != "boundary_polygons"}
         for airport in airports
@@ -1190,12 +1177,6 @@ def build_region(args: argparse.Namespace) -> int:
         "surface_zooms": sorted(mask_zooms),
         "high_res_insets": inset_bboxes,
         "airports": manifest_airports,
-        "airport_building_recognition": {
-            "method": "orthophoto_rectangular_roof_geometry_v1",
-            "imagery_source": plan["imagery_source"],
-            "counts": airport_vision,
-            "license_note": "Detections derive from the region imagery source and retain that source's attribution.",
-        },
         "attribution": {
             "imagery": imagery_attribution,
             "elevation": elevation_attribution,

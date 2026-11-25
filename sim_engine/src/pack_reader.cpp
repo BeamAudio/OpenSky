@@ -126,21 +126,29 @@ bool extract_json_num(const std::string &obj, const char *key, double &out) {
     return true;
 }
 
-inline double online_tile_dist_m(uint64_t okey, double cam_lat, double cam_lon) {
-    const int z = static_cast<int>((okey >> 48) & 0xFFu);
-    const int x = static_cast<int>((okey >> 24) & 0xFFFFFFu);
-    const int y = static_cast<int>(okey & 0xFFFFFFu);
-    const double nt = static_cast<double>(1u << z);
-    const double tlon = ((x + 0.5) / nt) * 360.0 - 180.0;
-    const double my = PI_D * (1.0 - 2.0 * ((y + 0.5) / nt));
-    const double tlat = std::atan(std::sinh(my)) * (180.0 / PI_D);
-    return nspain::haversine_m(cam_lat, cam_lon, tlat, tlon);
-}
+// Queue ranking only needs regional distances. Compute the local Mercator
+// scale once so scanning the bounded queue under its mutex stays cheap.
+struct OnlineTileFocus {
+    double x, y, span_m;
+
+    OnlineTileFocus(double lat, double lon)
+        : x((lon + 180.0) / 360.0),
+          y((1.0 - std::asinh(std::tan(lat * DEG2RAD_D)) / PI_D) * 0.5),
+          span_m(40075016.69 * std::cos(lat * DEG2RAD_D)) {}
+
+    double distance_m(uint64_t key) const {
+        const int zoom = static_cast<int>((key >> 48) & 0xFFu);
+        const double n = static_cast<double>(1u << zoom);
+        const double dx = (((key >> 24) & 0xFFFFFFu) + 0.5) / n - x;
+        const double dy = ((key & 0xFFFFFFu) + 0.5) / n - y;
+        return std::sqrt(dx * dx + dy * dy) * span_m;
+    }
+};
 
 inline double online_tile_priority_score(uint64_t okey, double dist_m) {
     const int z = static_cast<int>((okey >> 48) & 0xFFu);
-    // Prioritize Z13..Z15 carrier tiles within 24 km ahead of Z17..Z20 hyper-detail so fast/accelerated
-    // flight always displays real PNOA photography rather than lapsing into coarse baked fallback.
+    // Finish nearby detail while retaining priority for midrange carrier imagery.
+    if (z >= 19 && dist_m <= 500.0) return std::max(30.0, dist_m * 0.20);
     const double mult = (z <= 15 && dist_m < 24000.0) ? 0.20 : (1.0 + std::max(0, z - 16) * 0.12);
     return std::max(120.0, dist_m) * mult;
 }
@@ -203,6 +211,21 @@ void PackReader::set_online_camera(double lat_deg, double lon_deg) {
     online_cam_lon_bits_.store(double_bits(lon_deg), std::memory_order_relaxed);
 }
 
+int PackReader::online_page_zoom(double lat, double lon, double half_span_m, int ortho_res) const {
+    if (online_provider() != OnlineOrthoProvider::PNOA) return 0;
+    const double cam_lat = bits_double(online_cam_lat_bits_.load(std::memory_order_relaxed));
+    const double cam_lon = bits_double(online_cam_lon_bits_.load(std::memory_order_relaxed));
+    const double distance = nspain::haversine_m(cam_lat, cam_lon, lat, lon);
+    const double texel_m = 2.0 * half_span_m / ortho_res;
+    // A 320 m leaf fits a Z20 source grid. Include the nearest leaf even
+    // when the camera is exactly on the junction of four leaf pages.
+    if (texel_m <= 0.625 && distance <= 230.0) return 20;
+    int zoom = online_zoom_for_distance_m(distance);
+    const double metres_per_pixel = 156543.03 * std::max(0.2, std::cos(lat * DEG2RAD_D));
+    while (zoom > 13 && metres_per_pixel / static_cast<double>(1u << zoom) < texel_m * 0.35) --zoom;
+    return zoom;
+}
+
 bool PackReader::download_online_tile_to_disk(
     OnlineOrthoProvider prov, int z, int x, int y, const std::string &cache_path
 ) const {
@@ -221,8 +244,10 @@ bool PackReader::download_online_tile_to_disk(
         shell_quote(tmp_path) + " " + shell_quote(url) + " 2>/dev/null";
     int rc = std::system(cmd.c_str());
     struct stat st{};
-    if (rc == 0 && ::stat(tmp_path.c_str(), &st) == 0 && st.st_size > 512) {
-        ::rename(tmp_path.c_str(), cache_path.c_str());
+    int w = 0, h = 0, channels = 0;
+    if (rc == 0 && ::stat(tmp_path.c_str(), &st) == 0 && st.st_size > 512 &&
+        stbi_info(tmp_path.c_str(), &w, &h, &channels) && w == 256 && h == 256 &&
+        ::rename(tmp_path.c_str(), cache_path.c_str()) == 0) {
         online_fetched_count_.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
@@ -245,19 +270,16 @@ void PackReader::online_dl_worker() const {
             const bool have_cam = (std::abs(cam_lat) > 0.1 || std::abs(cam_lon) > 0.1);
             size_t best_idx = online_dl_queue_.size() - 1;
             if (have_cam) {
+                const OnlineTileFocus focus(cam_lat, cam_lon);
+                std::erase_if(online_dl_queue_, [&](uint64_t key) {
+                    if (focus.distance_m(key) <= 55000.0) return false;
+                    online_dl_seen_.erase(key);
+                    return true;
+                });
                 double best_score = 1e18;
-                for (size_t qi = online_dl_queue_.size(); qi > 0;) {
-                    --qi;
+                for (size_t qi = 0; qi < online_dl_queue_.size(); ++qi) {
                     const uint64_t kq = online_dl_queue_[qi];
-                    const double d = online_tile_dist_m(kq, cam_lat, cam_lon);
-                    // Evict stale downloads >55 km away so old regions never stall current tiles.
-                    if (d > 55000.0) {
-                        online_dl_seen_.erase(kq);
-                        online_dl_queue_[qi] = online_dl_queue_.back();
-                        online_dl_queue_.pop_back();
-                        continue;
-                    }
-                    const double sc = online_tile_priority_score(kq, d);
+                    const double sc = online_tile_priority_score(kq, focus.distance_m(kq));
                     if (sc < best_score) {
                         best_score = sc;
                         best_idx = qi;
@@ -265,7 +287,6 @@ void PackReader::online_dl_worker() const {
                 }
             }
             if (online_dl_queue_.empty()) continue;
-            best_idx = std::min(best_idx, online_dl_queue_.size() - 1);
             okey = online_dl_queue_[best_idx];
             online_dl_queue_[best_idx] = online_dl_queue_.back();
             online_dl_queue_.pop_back();
@@ -288,7 +309,7 @@ void PackReader::online_dl_worker() const {
             online_dl_seen_.erase(okey);
             if (ok) {
                 online_failed_until_.erase(okey);
-                online_arrived_.store(true, std::memory_order_release);
+                online_revision_.fetch_add(1, std::memory_order_release);
             } else {
                 const double now_s = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
                 if (online_failed_until_.size() > 8192) online_failed_until_.clear();
@@ -300,9 +321,8 @@ void PackReader::online_dl_worker() const {
 
 std::shared_ptr<DecodedRgbTile> PackReader::get_online_rgb_tile(
     OnlineOrthoProvider prov, int z, int x, int y,
-    bool queue_download, bool *out_queued_or_pending
+    bool queue_download
 ) const {
-    if (out_queued_or_pending) *out_queued_or_pending = false;
     if (prov != OnlineOrthoProvider::PNOA) return nullptr;
     uint8_t layer_id = static_cast<uint8_t>(10 + static_cast<int>(prov));
     uint64_t okey = nspain::make_tile_key(layer_id, static_cast<uint8_t>(z), static_cast<uint32_t>(x), static_cast<uint32_t>(y));
@@ -327,15 +347,18 @@ std::shared_ptr<DecodedRgbTile> PackReader::get_online_rgb_tile(
                 if (online_dl_queue_.size() >= 256) {
                     const double cam_lat = bits_double(online_cam_lat_bits_.load(std::memory_order_relaxed));
                     const double cam_lon = bits_double(online_cam_lon_bits_.load(std::memory_order_relaxed));
+                    const OnlineTileFocus focus(cam_lat, cam_lon);
                     size_t worst_idx = 0;
-                    double worst_dist = -1.0;
+                    double worst_score = -1.0;
                     for (size_t qi = 0; qi < online_dl_queue_.size(); ++qi) {
-                        double d = online_tile_dist_m(online_dl_queue_[qi], cam_lat, cam_lon);
-                        if (d > worst_dist) {
-                            worst_dist = d;
+                        const uint64_t queued = online_dl_queue_[qi];
+                        const double score = online_tile_priority_score(queued, focus.distance_m(queued));
+                        if (score > worst_score) {
+                            worst_score = score;
                             worst_idx = qi;
                         }
                     }
+                    if (online_tile_priority_score(okey, focus.distance_m(okey)) >= worst_score) return nullptr;
                     online_dl_seen_.erase(online_dl_queue_[worst_idx]);
                     online_dl_queue_[worst_idx] = online_dl_queue_.back();
                     online_dl_queue_.pop_back();
@@ -344,7 +367,6 @@ std::shared_ptr<DecodedRgbTile> PackReader::get_online_rgb_tile(
                 online_dl_queue_.push_back(okey);
                 should_notify = true;
             }
-            if (out_queued_or_pending) *out_queued_or_pending = true;
         }
         if (should_notify) online_cv_.notify_one();
         return nullptr;
@@ -2088,9 +2110,9 @@ void PackReader::fill_page_data(
     std::vector<uint8_t> &out_ortho_rgba,
     std::vector<uint8_t> &out_norm_ao_rgba,
     std::vector<uint8_t> &out_surf_rgba,
-    bool *out_incomplete_online
+    PageImagery *out_imagery
 ) const {
-    if (out_incomplete_online) *out_incomplete_online = false;
+    if (out_imagery) *out_imagery = PageImagery{online_revision()};
     const double center_lat = frame.anchor_lat + center_north_m / frame.metres_lat;
     const double center_lon = frame.anchor_lon + center_east_m / frame.metres_lon;
     const double span_m = half_span_m * 2.0;
@@ -2159,15 +2181,8 @@ void PackReader::fill_page_data(
             : OnlineOrthoProvider::OFF;
         int tier_z = 0;
         if (oprov == OnlineOrthoProvider::PNOA) {
-            double cam_lat = bits_double(online_cam_lat_bits_.load(std::memory_order_relaxed));
-            double cam_lon = bits_double(online_cam_lon_bits_.load(std::memory_order_relaxed));
-            double dist_m = nspain::haversine_m(cam_lat, cam_lon, center_lat, center_lon);
-            tier_z = online_zoom_for_distance_m(dist_m);
-            // Never request tiles far finer than the page's own texel size (prevents 144-tile Z20 bursts overflowing the download queue).
-            double cos_lat = std::max(0.2, std::cos(center_lat * DEG2RAD_D));
-            while (tier_z > 13 && (156543.03 * cos_lat) / static_cast<double>(1u << tier_z) < texel_m * 0.45) {
-                --tier_z;
-            }
+            tier_z = online_page_zoom(center_lat, center_lon, half_span_m, res);
+            if (out_imagery) out_imagery->target_zoom = tier_z;
             // Include already-cached online zooms (tier_z down to 13) so a higher tier step never drops back to baked Z12.
             for (int z = tier_z; z >= 13 && n_az < 16; z--) active_z[n_az++] = z;
         }
@@ -2230,11 +2245,11 @@ void PackReader::fill_page_data(
                     std::shared_ptr<DecodedRgbTile> tile;
                     if (oprov == OnlineOrthoProvider::PNOA && tier_z > 0 && z <= tier_z && z >= 13) {
                         const int carrier_z = (tier_z >= 16) ? 15 : ((tier_z == 15) ? 14 : tier_z);
-                        const bool queue_dl = (z >= std::max(14, tier_z - 1)) || (z == carrier_z);
-                        bool pending_dl = false;
-                        tile = get_online_rgb_tile(oprov, z, tx, ty, queue_dl, &pending_dl);
-                        if (!tile && (z == tier_z || z == carrier_z) && pending_dl && out_incomplete_online) {
-                            *out_incomplete_online = true;
+                        const bool queue_dl = z == tier_z || z == carrier_z;
+                        tile = get_online_rgb_tile(oprov, z, tx, ty, queue_dl);
+                        if (out_imagery && z == tier_z) {
+                            if (tile) ++out_imagery->target_tiles_ready;
+                            else ++out_imagery->target_tiles_missing;
                         }
                     }
                     if (!tile) tile = get_rgb_tile(layer, z, tx, ty);

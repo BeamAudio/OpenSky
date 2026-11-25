@@ -14,7 +14,7 @@ The game is built around unhurried exploration rather than missions or ownership
 
 ## Screenshots
 
-Captured from the running game at 1920×1080 with Ultra quality and 500% terrain LOD.
+Captured in OpenSky at 1920×1080 with Ultra quality and a 450% terrain LOD radius. Aerial imagery © Instituto Geográfico Nacional de España (PNOA).
 
 | Castejón de Sos — cockpit | Castejón de Sos — chase view |
 |---|---|
@@ -24,13 +24,25 @@ Captured from the running game at 1920×1080 with Ultra quality and 500% terrain
 |---|---|
 | ![Cockpit view along Barcelona's coast](docs/images/promo_cockpit_barcelona_beaches.png) | ![Chase view above Barcelona and its harbor](docs/images/promo_chase_barcelona_beaches.png) |
 
-| Platja de Pals | Catalan Pyrenees — cockpit |
+| Costa Brava, Begur — cockpit | Costa Brava, Begur — chase view |
 |---|---|
-| ![Chase view over the Costa Brava shoreline at Platja de Pals](docs/images/promo_chase_pals_beach.png) | ![Cockpit view toward the Catalan Pyrenees](docs/images/promo_cockpit_catalan_pyrenees.png) |
+| ![View of the Costa Brava from the Cessna cockpit](docs/images/promo_cockpit_costa_brava.png) | ![Cessna banking above the cliffs and coves near Begur](docs/images/promo_chase_costa_brava.png) |
 
-| Catalan Pyrenees — chase view | Mediano reservoir |
+| Catalan Pyrenees — cockpit | Catalan Pyrenees — chase view |
 |---|---|
-| ![Chase view across the Catalan Pyrenees](docs/images/promo_chase_catalan_pyrenees.png) | ![Cessna above Mediano reservoir in Aragón](docs/images/promo_chase_mediano.png) |
+| ![Cockpit view toward the Catalan Pyrenees](docs/images/promo_cockpit_catalan_pyrenees.png) | ![Chase view across the Catalan Pyrenees](docs/images/promo_chase_catalan_pyrenees.png) |
+
+| Mediano reservoir — cockpit | Mediano reservoir — chase view |
+|---|---|
+| ![Cockpit view over Mediano reservoir in Aragón](docs/images/promo_cockpit_mediano.png) | ![Cessna above Mediano reservoir in Aragón](docs/images/promo_chase_mediano.png) |
+
+### Weather in flight
+
+These scenes use preset inputs to the regional weather model. The simulation drives the volumetric cloud layers and the rain that reaches the cockpit glass.
+
+| Clouds and valley mist in the Pyrenees | Rain near Castejón de Sos |
+|---|---|
+| ![Cessna above patches of cloud and mist in the Pyrenees](docs/images/promo_weather_clouds.png) | ![Rain on the Cessna windshield near Castejón de Sos](docs/images/promo_weather_rain.png) |
 
 ## Getting started
 

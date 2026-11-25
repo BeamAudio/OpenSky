@@ -38,6 +38,13 @@ inline int online_zoom_for_distance_m(double dist_m) {
     return 0;
 }
 
+struct PageImagery {
+    uint64_t source_revision = 0;
+    int target_zoom = 0;
+    int target_tiles_ready = 0;
+    int target_tiles_missing = 0;
+};
+
 struct AirportRunway {
     double lat_a = 42.0, lon_a = -0.3, elev_a_m = 400.0;
     double lat_b = 42.005, lon_b = -0.3, elev_b_m = 400.0;
@@ -226,7 +233,7 @@ public:
         std::vector<uint8_t> &out_ortho_rgba,
         std::vector<uint8_t> &out_norm_ao_rgba,
         std::vector<uint8_t> &out_surf_rgba,
-        bool *out_incomplete_online = nullptr
+        PageImagery *out_imagery = nullptr
     ) const;
 
     // Pre-bake whole-corridor 50km planetary DEM 10-time-of-day horizon shadows + 8-dir Valley Sky AO (uint32 packed!)
@@ -266,7 +273,8 @@ public:
     const char *online_provider_name() const;
     int online_tiles_fetched() const { return online_fetched_count_.load(std::memory_order_relaxed); }
     int online_tiles_used() const { return online_used_count_.load(std::memory_order_relaxed); }
-    bool consume_online_arrived() const { return online_arrived_.exchange(false, std::memory_order_acq_rel); }
+    uint64_t online_revision() const { return online_revision_.load(std::memory_order_acquire); }
+    int online_page_zoom(double lat, double lon, double half_span_m, int ortho_res) const;
     void set_online_camera(double lat_deg, double lon_deg);
     void prefetch_online_box(double center_lat, double center_lon, double half_span_m, int zoom = 17) const;
 
@@ -288,8 +296,7 @@ private:
     std::shared_ptr<DecodedElevTile> get_elev_tile(int z, int x, int y) const;
     std::shared_ptr<DecodedRgbTile> get_rgb_tile(uint8_t layer, int z, int x, int y) const;
     std::shared_ptr<DecodedRgbTile> get_online_rgb_tile(OnlineOrthoProvider prov, int z, int x, int y,
-                                                        bool queue_download = true,
-                                                        bool *out_queued_or_pending = nullptr) const;
+                                                        bool queue_download = true) const;
     bool download_online_tile_to_disk(OnlineOrthoProvider prov, int z, int x, int y, const std::string &cache_path) const;
     void online_dl_worker() const;
     const LoadedRegion *find_sh_region_at_ll(double lat_deg, double lon_deg) const;
@@ -365,7 +372,7 @@ private:
     mutable std::atomic<OnlineOrthoProvider> online_provider_{OnlineOrthoProvider::OFF};
     mutable std::atomic<int> online_fetched_count_{0};
     mutable std::atomic<int> online_used_count_{0};
-    mutable std::atomic<bool> online_arrived_{false};
+    mutable std::atomic<uint64_t> online_revision_{0};
     mutable std::atomic<bool> online_stop_{false};
     mutable std::mutex online_mtx_;
     mutable std::condition_variable online_cv_;

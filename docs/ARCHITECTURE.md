@@ -69,9 +69,9 @@ The game-facing piston systems are in `engine/src/c172_systems.cpp`. They model 
 
 `PackReader` reads the shared pack protocol, indexes airports, places, roads, runways, imagery and elevation, and creates immutable `WorldFrame` snapshots for terrain jobs. The terrain worker pool consumes a frame snapshot instead of mutable region state. The main thread validates transition generations before publishing completed work, so stale results cannot replace the active world after a region change.
 
-`AsyncTerrainStreamer` prioritizes pages by aircraft distance and view demand. Workers read, decode and prepare content; the render thread uploads only a bounded amount per frame. The GPU residency cache is a fixed page pool. Nearby L7–L9 imagery is prioritized, while coarse levels cover the horizon. Close-page invalidation is centralized around region changes and online-imagery updates.
+`AsyncTerrainStreamer` prioritizes pages by aircraft distance and view demand. Workers prepare terrain pages for a bounded number of uploads each frame. L7–L9 pages carry nearby detail, and coarser pages cover the horizon. `PackReader` streams IGN PNOA separately from terrain work. The nearest L9 pages can use Z20 source tiles, with installed imagery available while downloads finish. Each page records the download revision it sampled, so a download that completes during a page build can still trigger an in-place refresh. The render loop throttles those refreshes and prioritizes recently visible pages.
 
-`CDLODTerrain` draws height and surface data using the active quality tier. World-menu topography uses baked `.relief.png` sidecars with a shared palette, uploaded once with mipmaps. Relief sidecars are distinct from flight-scene PNOA imagery.
+`CdlodTerrain` draws height and surface data using the active quality tier. When the draw budget runs low, the traversal keeps coarser patches to cover the remaining terrain. The engine recenters the world asynchronously before the aircraft reaches the edge of its terrain grid. World-menu topography uses baked `.relief.png` sidecars with a shared palette, uploaded once with mipmaps. Relief sidecars are distinct from flight-scene PNOA imagery.
 
 ### Weather data flow
 

@@ -116,21 +116,20 @@ void AsyncTerrainStreamer::release_cache_slot(int idx) {
     slot = CacheSlot{};
 }
 
-bool AsyncTerrainStreamer::init(const PackReader *pack, int worker_count, OrthoFormat format) {
+bool AsyncTerrainStreamer::init(const PackReader *pack, int worker_count, OrthoFormat format, int page_capacity) {
     if (!pack) return false;
     pack_ = pack;
     world_frame_ = pack_->world_frame();
     format_ = format;
     layout_ = make_page_layout(format);
 
+    page_capacity_ = std::clamp(page_capacity, MAX_PAGES, 1024);
+    slots_.assign(page_capacity_, CacheSlot{});
     free_slots_.clear();
-    free_slots_.reserve(MAX_PAGES);
+    free_slots_.reserve(page_capacity_);
     key_to_slot_.clear();
     pending_key_to_slot_.clear();
-    for (int i = 0; i < MAX_PAGES; ++i) {
-        slots_[i] = CacheSlot{};
-        free_slots_.push_back(i);
-    }
+    for (int i = 0; i < page_capacity_; ++i) free_slots_.push_back(i);
     {
         std::lock_guard<std::mutex> lk(req_mtx_);
         pending_reqs_.clear();
@@ -144,7 +143,7 @@ bool AsyncTerrainStreamer::init(const PackReader *pack, int worker_count, OrthoF
 
     // Allocate the resident terrain arrays.
     glCreateTextures(GL_TEXTURE_2D_ARRAY, 1, &height_arr_);
-    glTextureStorage3D(height_arr_, 1, GL_R32F, HEIGHT_N, HEIGHT_N, MAX_PAGES);
+    glTextureStorage3D(height_arr_, 1, GL_R32F, HEIGHT_N, HEIGHT_N, page_capacity_);
     glTextureParameteri(height_arr_, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTextureParameteri(height_arr_, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTextureParameteri(height_arr_, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -154,7 +153,7 @@ bool AsyncTerrainStreamer::init(const PackReader *pack, int worker_count, OrthoF
     // BC7 keeps PNOA RGB fidelity while cutting the streamed ortho page upload
     // and resident texture footprint to one byte per texel.
     const GLenum internal_format = is_compressed(format_) ? GL_COMPRESSED_SRGB_ALPHA_BPTC_UNORM : GL_SRGB8_ALPHA8;
-    glTextureStorage3D(ortho_arr_, ORTHO_MIPS, internal_format, ORTHO_RES, ORTHO_RES, MAX_PAGES);
+    glTextureStorage3D(ortho_arr_, ORTHO_MIPS, internal_format, ORTHO_RES, ORTHO_RES, page_capacity_);
     glTextureParameteri(ortho_arr_, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
     glTextureParameteri(ortho_arr_, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTextureParameteri(ortho_arr_, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -162,14 +161,14 @@ bool AsyncTerrainStreamer::init(const PackReader *pack, int worker_count, OrthoF
     glTextureParameterf(ortho_arr_, GL_TEXTURE_MAX_ANISOTROPY, 8.0f);
 
     glCreateTextures(GL_TEXTURE_2D_ARRAY, 1, &norm_arr_);
-    glTextureStorage3D(norm_arr_, 1, GL_RGBA8, AUX_RES, AUX_RES, MAX_PAGES);
+    glTextureStorage3D(norm_arr_, 1, GL_RGBA8, AUX_RES, AUX_RES, page_capacity_);
     glTextureParameteri(norm_arr_, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTextureParameteri(norm_arr_, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTextureParameteri(norm_arr_, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTextureParameteri(norm_arr_, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
     glCreateTextures(GL_TEXTURE_2D_ARRAY, 1, &surf_arr_);
-    glTextureStorage3D(surf_arr_, 1, GL_RGBA8, AUX_RES, AUX_RES, MAX_PAGES);
+    glTextureStorage3D(surf_arr_, 1, GL_RGBA8, AUX_RES, AUX_RES, page_capacity_);
     glTextureParameteri(surf_arr_, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTextureParameteri(surf_arr_, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTextureParameteri(surf_arr_, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -256,10 +255,8 @@ void AsyncTerrainStreamer::fill_staging_slot(StagingSlot &slot, uint64_t key, co
 
     thread_local std::vector<float> tmp_h;
     thread_local std::vector<uint8_t> tmp_ortho, tmp_norm, tmp_surf;
-    bool incomplete_online = false;
     pack_->fill_page_data(frame, ce, cn, hs, HEIGHT_N, ORTHO_RES, AUX_RES, sdir,
-                          tmp_h, tmp_ortho, tmp_norm, tmp_surf, &incomplete_online);
-    slot.incomplete_online = incomplete_online;
+                          tmp_h, tmp_ortho, tmp_norm, tmp_surf, &slot.imagery);
 
     // PBO storage is mapped write-only and may be write-combined. Build and
     // encode in cached system RAM, then make one sequential copy to staging.
@@ -469,41 +466,70 @@ void AsyncTerrainStreamer::invalidate_shadows() {
     req_cv_.notify_all();
 }
 
-void AsyncTerrainStreamer::invalidate_close_pages(bool evict_inactive) {
+void AsyncTerrainStreamer::invalidate_close_pages() {
     {
         std::lock_guard<std::mutex> lk(req_mtx_);
-        if (evict_inactive) {
-            pending_reqs_.clear();
-            pending_req_heap_ = RequestHeap{};
-            pending_req_frame_.clear();
-        }
+        pending_reqs_.clear();
+        pending_req_heap_ = RequestHeap{};
+        pending_req_frame_.clear();
         for (auto it = key_to_slot_.begin(); it != key_to_slot_.end(); ) {
             QuadKey qk = QuadKey::unpack(it->first);
-            const int min_lod = evict_inactive ? 5 : 4;
-            if (qk.lod < min_lod) { ++it; continue; }
+            if (qk.lod < 5) { ++it; continue; }
             int slot_idx = it->second;
             const bool active = (cur_frame_ <= 8) || ((cur_frame_ - slots_[slot_idx].last_used_frame) <= 8);
-            if (evict_inactive && !active) {
+            if (!active) {
                 release_cache_slot(slot_idx);
                 it = key_to_slot_.erase(it);
                 continue;
             }
-            if (!active) {
-                ++it;
-                continue;
-            }
-            // During live periodic PNOA arrival checks (!evict_inactive), only re-queue pages that fell back
-            // to coarser data while waiting on PNOA tiles so already-sharp PNOA pages NEVER flicker!
-            if (!evict_inactive && !slots_[slot_idx].pending_online_refine) {
-                ++it;
-                continue;
-            }
             if (inflight_active_.find(it->first) == inflight_active_.end()) {
-                float prio = evict_inactive ? (1200.0f + qk.lod * 25.0f) : (780.0f + qk.lod * 20.0f);
-                queue_request(pending_reqs_, pending_req_heap_, it->first, prio);
+                queue_request(pending_reqs_, pending_req_heap_, it->first, 1200.0f + qk.lod * 25.0f);
                 pending_req_frame_[it->first] = cur_frame_;
             }
             ++it;
+        }
+    }
+    req_cv_.notify_all();
+}
+
+void AsyncTerrainStreamer::refine_online_pages(double now_sec) {
+    if (now_sec < next_imagery_refine_sec_ || pack_->online_provider() == OnlineOrthoProvider::OFF) return;
+    next_imagery_refine_sec_ = now_sec + 0.20;
+    const uint64_t revision = pack_->online_revision();
+    std::vector<RequestOrder> candidates;
+    const auto &frame = *world_frame_;
+    for (const auto &[key, index] : key_to_slot_) {
+        const CacheSlot &slot = slots_[index];
+        if (cur_frame_ - slot.last_used_frame > 8) continue;
+        const QuadKey qk = QuadKey::unpack(key);
+        if (qk.lod < 4) continue;
+        double east, north, half_span;
+        quad_bounds_en(qk, east, north, half_span);
+        const int zoom = pack_->online_page_zoom(frame.anchor_lat + north / frame.metres_lat,
+                                                 frame.anchor_lon + east / frame.metres_lon,
+                                                 half_span, ORTHO_RES);
+        const double age_sec = now_sec - slot.last_imagery_upload_sec;
+        // Compare with the revision sampled before this page was built. An
+        // arrival during a build still triggers a refresh after upload.
+        const bool retry = slot.imagery.target_tiles_missing > 0 && age_sec >= 1.0 &&
+            (slot.imagery.source_revision != revision || age_sec >= 30.0);
+        if (zoom > slot.imagery.target_zoom || (zoom == slot.imagery.target_zoom && retry)) {
+            const float priority = zoom == 20 ? 10500.0f : 1700.0f;
+            candidates.push_back({priority + slot.last_importance, key});
+        }
+    }
+    if (candidates.empty()) return;
+    std::sort(candidates.begin(), candidates.end(), [](const RequestOrder &a, const RequestOrder &b) {
+        return RequestOrderLess{}(b, a);
+    });
+    {
+        std::lock_guard<std::mutex> lk(req_mtx_);
+        int queued = 0;
+        for (const auto &request : candidates) {
+            if (inflight_active_.contains(request.key)) continue;
+            queue_request(pending_reqs_, pending_req_heap_, request.key, request.priority);
+            pending_req_frame_[request.key] = cur_frame_;
+            if (++queued == 6) break;
         }
     }
     req_cv_.notify_all();
@@ -542,10 +568,10 @@ void AsyncTerrainStreamer::invalidate_all_and_prewarm(const Vec3 &sun_dir) {
             s.last_used_frame = 0;
             s.last_importance = 0.0f;
             s.pinned = false;
-            s.pending_online_refine = false;
+            s.imagery = {};
         }
         free_slots_.clear();
-        for (int i = 0; i < MAX_PAGES; ++i) free_slots_.push_back(i);
+        for (int i = 0; i < page_capacity_; ++i) free_slots_.push_back(i);
     }
     prewarm_coarse(sun_dir);
 }
@@ -562,7 +588,7 @@ void AsyncTerrainStreamer::begin_async_transition(
     if (old_pending != 0) {
         for (const auto &kv : pending_key_to_slot_) {
             int s = kv.second;
-            if (s >= 0 && s < MAX_PAGES && slots_[s].generation == old_pending) {
+            if (s >= 0 && s < page_capacity_ && slots_[s].generation == old_pending) {
                 release_cache_slot(s);
             }
         }
@@ -646,7 +672,7 @@ void AsyncTerrainStreamer::commit_async_transition() {
     pending_required_keys_.clear();
     key_to_slot_.swap(pending_key_to_slot_);
     pending_key_to_slot_.clear();
-    for (int i = 0; i < MAX_PAGES; ++i) {
+    for (int i = 0; i < page_capacity_; ++i) {
         if (slots_[i].generation != next_gen) {
             release_cache_slot(i);
         } else {
@@ -662,7 +688,7 @@ void AsyncTerrainStreamer::cancel_async_transition() {
     if (old_pending != 0) {
         for (const auto &kv : pending_key_to_slot_) {
             int s = kv.second;
-            if (s >= 0 && s < MAX_PAGES && slots_[s].generation == old_pending) {
+            if (s >= 0 && s < page_capacity_ && slots_[s].generation == old_pending) {
                 release_cache_slot(s);
             }
         }
@@ -681,8 +707,8 @@ void AsyncTerrainStreamer::begin_frame(uint64_t frame_idx) {
 
     // 1. Proactively free stale off-frustum high-LOD leaves once cache passes 75% capacity
     // so new visible terrain allocates immediately without stalling behind passed tiles.
-    constexpr size_t kHighWater = (MAX_PAGES * 3) / 4;
-    if (key_to_slot_.size() > kHighWater && frame_idx > 16) {
+    const size_t high_water = (page_capacity_ * 3) / 4;
+    if (key_to_slot_.size() > high_water && frame_idx > 16) {
         const uint64_t act_gen = active_gen_.load(std::memory_order_acquire);
         auto has_child = [&](uint64_t pk) {
             QuadKey p = QuadKey::unpack(pk);
@@ -695,10 +721,10 @@ void AsyncTerrainStreamer::begin_frame(uint64_t frame_idx) {
             }
             return false;
         };
-        for (int pass = 0; pass < 2 && key_to_slot_.size() > kHighWater; ++pass) {
+        for (int pass = 0; pass < 2 && key_to_slot_.size() > high_water; ++pass) {
             const int min_lod = (pass == 0) ? 6 : 3;
             const uint64_t min_age = (pass == 0) ? 10ULL : 90ULL;
-            for (int i = 0; i < MAX_PAGES && key_to_slot_.size() > kHighWater; ++i) {
+            for (int i = 0; i < page_capacity_ && key_to_slot_.size() > high_water; ++i) {
                 CacheSlot &s = slots_[i];
                 if (s.key == UINT64_MAX || s.pinned || s.generation != act_gen) continue;
                 const uint64_t age = (frame_idx >= s.last_used_frame) ? (frame_idx - s.last_used_frame) : 0ULL;
@@ -779,7 +805,6 @@ int AsyncTerrainStreamer::allocate_cache_slice(
 ) {
     auto it = target_map.find(key);
     if (it != target_map.end()) {
-        slots_[it->second].last_used_frame = cur_frame_;
         return it->second;
     }
 
@@ -806,7 +831,7 @@ int AsyncTerrainStreamer::allocate_cache_slice(
         victim = free_slots_.back();
         free_slots_.pop_back();
     } else {
-        for (int i = 0; i < MAX_PAGES; i++) {
+        for (int i = 0; i < page_capacity_; i++) {
             if (slots_[i].key == UINT64_MAX) {
                 victim = i;
                 break;
@@ -859,7 +884,7 @@ int AsyncTerrainStreamer::allocate_cache_slice(
     slots_[victim].fade_dur_sec = 0.18f + static_cast<float>(fh) * (0.12f / 65535.0f);
     slots_[victim].last_importance = 0.0f;
     slots_[victim].pinned = (qk.lod <= 2);
-    slots_[victim].pending_online_refine = false;
+    slots_[victim].imagery = {};
     target_map[key] = victim;
     return victim;
 }
@@ -924,7 +949,8 @@ void AsyncTerrainStreamer::pump_gpu_uploads(float now_sec, int max_uploads, doub
         glTextureSubImage3D(surf_arr_, 0, 0, 0, slice, AUX_RES, AUX_RES, 1, GL_RGBA, GL_UNSIGNED_BYTE, reinterpret_cast<const void *>(layout_.surface));
         glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
 
-        slots_[slice].pending_online_refine = staging_[i].incomplete_online;
+        slots_[slice].imagery = staging_[i].imagery;
+        slots_[slice].last_imagery_upload_sec = t0;
         staging_[i].fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
         staging_[i].state.store(StageState::UPLOADING, std::memory_order_release);
 
@@ -944,10 +970,16 @@ void AsyncTerrainStreamer::pump_gpu_uploads(float now_sec, int max_uploads, doub
 StreamStats AsyncTerrainStreamer::stats() const {
     StreamStats s{};
     s.resident_pages = static_cast<int>(key_to_slot_.size());
-    s.max_pages = MAX_PAGES;
+    s.max_pages = page_capacity_;
     for (const auto &kv : key_to_slot_) {
         const uint8_t lod = QuadKey::unpack(kv.first).lod;
         if (lod < s.resident_by_lod.size()) s.resident_by_lod[lod]++;
+        const auto &slot = slots_[kv.second];
+        if (slot.imagery.target_zoom == 20 && cur_frame_ - slot.last_used_frame <= 8) {
+            if (slot.imagery.target_tiles_ready > 0 && slot.imagery.target_tiles_missing == 0) ++s.z20_pages;
+            s.z20_tiles_ready += slot.imagery.target_tiles_ready;
+            s.z20_tiles_missing += slot.imagery.target_tiles_missing;
+        }
     }
     {
         std::lock_guard<std::mutex> lk(req_mtx_);

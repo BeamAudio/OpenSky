@@ -33,8 +33,9 @@ struct TerrainGrassZone {
 // - True 16-layer GL_TEXTURE_2D_ARRAY Northern Spain satellite cascade + Tri-Planar Cliffs + Cliff-Pines + PMRF!
 class CdlodTerrain {
 public:
+    static constexpr int MAX_LOD_DISTANCE_PERCENT = 450;
     static constexpr int PATCH_N = 65; // 65x65 vertices = 64x64 quads per CDLOD leaf (4x sharper ridges & cliffs!)
-    static constexpr int MAX_VISIBLE_NODES = 512;
+    static constexpr int MAX_VISIBLE_NODES = 1024;
 
     CdlodTerrain() = default;
     ~CdlodTerrain();
@@ -92,7 +93,8 @@ private:
         double pred_e, double pred_n,
         int max_desired_lod,
         float now_sec,
-        bool is_prefetch_only
+        bool is_prefetch_only,
+        int draw_limit
     );
 
     bool load_sat_array_16(const std::string &atlas_path);

@@ -54,6 +54,9 @@ struct StreamStats {
     double worker_encode_total_ms = 0.0;
     size_t gpu_page_bytes = 0;
     std::array<int, 12> resident_by_lod{};
+    int z20_pages = 0;
+    int z20_tiles_ready = 0;
+    int z20_tiles_missing = 0;
 };
 
 enum class OrthoFormat { BC7, BC7Fast, RGBA8 };
@@ -74,7 +77,8 @@ public:
     AsyncTerrainStreamer() = default;
     ~AsyncTerrainStreamer();
 
-    bool init(const PackReader *pack, int worker_count = 0, OrthoFormat format = OrthoFormat::BC7Fast);
+    bool init(const PackReader *pack, int worker_count = 0, OrthoFormat format = OrthoFormat::BC7Fast,
+              int page_capacity = MAX_PAGES);
     void shutdown();
 
     // Synchronously pre-warm coarse root pages (lod 0..2 = 21 pages) so frame 1 covers the full 163km horizon!
@@ -83,8 +87,9 @@ public:
     void flush_pending_sync(int max_pages_to_drain = 160, double timeout_sec = 2.5);
     // Re-queue currently active resident pages in-place when user jumps time of day (zero blank flash!)
     void invalidate_shadows();
-    // Re-queue active pages that missed higher-tier PNOA imagery in-place (never downgrades completed PNOA).
-    void invalidate_close_pages(bool evict_inactive = false);
+    // Rebuild active pages and evict stale ones after changing imagery providers.
+    void invalidate_close_pages();
+    void refine_online_pages(double now_sec);
     // Drop queued pages left behind after a QA teleport; resident pages remain available.
     void clear_pending_requests();
     void set_thermal_sleep_ms(int ms) { thermal_sleep_ms_.store(std::clamp(ms, 0, 140), std::memory_order_relaxed); }
@@ -129,7 +134,8 @@ private:
         float fade_dur_sec = 0.65f; // Per-page randomized arrival duration (0.18..0.30s) for non-grid organic dissolve!
         float last_importance = 0.0f;
         bool pinned = false;        // Coarse root pages (lod <= 2) never evicted
-        bool pending_online_refine = false;
+        PageImagery imagery;
+        double last_imagery_upload_sec = 0.0;
     };
 
     enum class StageState : uint8_t { FREE = 0, FILLING = 1, READY = 2, UPLOADING = 3 };
@@ -141,7 +147,7 @@ private:
         uint64_t key = UINT64_MAX;
         uint64_t generation = 0;
         float worker_ms = 0.0f;
-        bool incomplete_online = false;
+        PageImagery imagery;
         std::atomic<StageState> state{StageState::FREE};
     };
 
@@ -158,6 +164,7 @@ private:
     using RequestHeap = std::priority_queue<RequestOrder, std::vector<RequestOrder>, RequestOrderLess>;
 
     static constexpr int NUM_STAGING = 24;
+    double next_imagery_refine_sec_ = 0.0;
     static constexpr size_t SZ_HEIGHT = static_cast<size_t>(HEIGHT_N) * HEIGHT_N * sizeof(float);
     static constexpr size_t SZ_AUX = static_cast<size_t>(AUX_RES) * AUX_RES * 4;
 
@@ -190,7 +197,8 @@ private:
     GLuint norm_arr_ = 0;
     GLuint surf_arr_ = 0;
 
-    CacheSlot slots_[MAX_PAGES]{};
+    std::vector<CacheSlot> slots_;
+    int page_capacity_ = 0;
     std::vector<int> free_slots_;
     std::unordered_map<uint64_t, int> key_to_slot_;
     std::unordered_map<uint64_t, int> pending_key_to_slot_;

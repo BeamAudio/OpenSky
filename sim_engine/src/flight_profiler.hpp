@@ -30,7 +30,7 @@ public:
     ~FlightProfiler();
     bool open(const std::filesystem::path &directory);
     void startup_stage(const char *stage);
-    void metadata(int width, int height, const char *format, const char *provider, int terrain_workers, size_t page_bytes);
+    void metadata(int width, int height, const char *format, const char *provider, int terrain_workers, size_t terrain_storage_bytes);
     void init_gpu();
     void finish();
     void set_overlay(bool visible) { overlay_ = visible; }

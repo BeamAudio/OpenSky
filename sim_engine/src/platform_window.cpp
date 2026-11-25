@@ -222,7 +222,7 @@ PlatformWindow::~PlatformWindow() {
     destroy();
 }
 
-bool PlatformWindow::create(const char *title, int aspect_w, int aspect_h, DisplayMode mode) {
+bool PlatformWindow::create(const char *title, int aspect_w, int aspect_h, DisplayMode mode, bool visible) {
     impl_ = new Impl();
     impl_->gl_lib = dlopen("libGL.so.1", RTLD_LAZY | RTLD_LOCAL);
     if (!impl_->gl_lib) {
@@ -334,8 +334,8 @@ bool PlatformWindow::create(const char *title, int aspect_w, int aspect_h, Displ
     XSetWMNormalHints(impl_->dpy, impl_->win, &hints);
     impl_->wm_delete = XInternAtom(impl_->dpy, "WM_DELETE_WINDOW", False);
     XSetWMProtocols(impl_->dpy, impl_->win, &impl_->wm_delete, 1);
-    XMapWindow(impl_->dpy, impl_->win);
-    if (mode == DisplayMode::Fullscreen) {
+    if (visible) XMapWindow(impl_->dpy, impl_->win);
+    if (visible && mode == DisplayMode::Fullscreen) {
         const Atom state_atom = XInternAtom(impl_->dpy, "_NET_WM_STATE", False);
         const Atom fullscreen_atom = XInternAtom(impl_->dpy, "_NET_WM_STATE_FULLSCREEN", False);
         XEvent request{};

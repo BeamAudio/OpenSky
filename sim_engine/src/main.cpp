@@ -382,6 +382,10 @@ int main(int argc, char **argv) {
             }
         }
     }
+    if (promo_only && autotest_dir.empty()) {
+        std::fprintf(stderr, "[PROMO-QA] --promo-only requires --autotest <output-directory>\n");
+        return 2;
+    }
     if (quick_profile && (!autotest_dir.empty() || !topdown_dir.empty() || selftest_only)) {
         std::fprintf(stderr, "[PROFILE] --quick-profile is a standalone capture mode\n");
         return 2;
@@ -427,7 +431,7 @@ int main(int argc, char **argv) {
         graphics_settings.quality_preset = 3;
         graphics_settings.pixel_percent = 100;
         graphics_settings.aa_mode = 2;
-        graphics_settings.terrain_lod_percent = 500;
+        graphics_settings.terrain_lod_percent = CdlodTerrain::MAX_LOD_DISTANCE_PERCENT;
         graphics_settings.weather_detail = 3;
         graphics_settings.aircraft_detail = 1;
     }
@@ -460,6 +464,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     const AircraftPackage aircraft_package = *selected_aircraft;
+    if (promo_only && !ortho_explicit) graphics_settings.terrain_streaming = true;
     if (ortho_explicit) graphics_settings.terrain_streaming = init_online == OnlineOrthoProvider::PNOA;
     else if (!graphics_settings.terrain_streaming) init_online = OnlineOrthoProvider::OFF;
     pack.set_online_provider(init_online);
@@ -503,7 +508,7 @@ int main(int argc, char **argv) {
     const int output_w = !topdown_dir.empty() ? 1024 : GAME_OUTPUT_W;
     const int output_h = !topdown_dir.empty() ? 1024 : GAME_OUTPUT_H;
     if (!win.create("OpenSky VFR Simulator", output_w, output_h,
-                    static_cast<DisplayMode>(graphics_settings.display_mode))) {
+                    static_cast<DisplayMode>(graphics_settings.display_mode), !promo_only)) {
         return 1;
     }
     // Cap FPS to monitor refresh rate (<= 60 Hz for iGPU thermal stability <80C) and enable VSync interactively.
@@ -540,12 +545,16 @@ int main(int argc, char **argv) {
     AircraftAndHud ac_hud;
     GameFrontend frontend;
 
-    if (!streamer.init(&pack, 0, ortho_format)) return 1;
+    const unsigned cpu_threads = std::thread::hardware_concurrency();
+    const int terrain_workers = promo_only ? std::clamp(static_cast<int>(cpu_threads / 2), 3, 8)
+                                           : (cpu_threads >= 8 ? 4 : 3);
+    const int page_capacity = promo_only ? 1024 : AsyncTerrainStreamer::MAX_PAGES;
+    if (!streamer.init(&pack, terrain_workers, ortho_format, page_capacity)) return 1;
     profiler.startup_stage("terrain_streamer_allocate");
     const char *format_name = ortho_format == OrthoFormat::BC7 ? "bc7"
                            : ortho_format == OrthoFormat::BC7Fast ? "bc7-fast" : "rgba8";
     profiler.metadata(output_w, output_h, format_name,
-                      pack.online_provider_name(), streamer.worker_count(), streamer.stats().gpu_page_bytes);
+                      pack.online_provider_name(), streamer.worker_count(), streamer.stats().gpu_page_bytes * page_capacity);
     std::printf("[MULTICORE] AsyncTerrainStreamer: %d parallel workers | PackReader 10-TOD DEM: parallelized\n", streamer.worker_count());
     if (!terrain.init(root + "/game/assets", root + "/sim_engine/shaders")) return 1;
     profiler.startup_stage("terrain_resources");
@@ -675,8 +684,9 @@ int main(int argc, char **argv) {
     auto transition_world = [&](double lat, double lon, const char *loading_title = nullptr) {
         cancel_async_crossing();
         if (loading_title) show_loading(loading_title, "Preparing world coordinates...", 0.20f);
-        const bool changed = pack.reanchor_to(lat, lon);
-        if (changed) {
+        const auto next_frame = pack.prepare_world_frame(lat, lon, !promo_only);
+        if (next_frame) {
+            pack.commit_world_frame(next_frame);
             vegetation.invalidate();
             if (loading_title) show_loading(loading_title, "Streaming coarse terrain & IGN PNOA...", 0.50f);
             streamer.invalidate_all_and_prewarm(sky_clouds.atmo().sun_dir);
@@ -687,7 +697,7 @@ int main(int argc, char **argv) {
         }
         reg_atmo.sync_region(lat, lon);
         reg_atmo.update_field(sky_clouds.atmo().sun_dir, sim_time, false, wx_advance);
-        return changed;
+        return next_frame != nullptr;
     };
 
     auto step_flight_world_transition = [&](double lat, double lon, double vel_e = 0.0, double vel_n = 0.0) -> bool {
@@ -730,13 +740,16 @@ int main(int argc, char **argv) {
         const auto *anchor_region = pack.find_region_at(pack.anchor_lat(), pack.anchor_lon());
         const bool out_of_anchor_box = anchor_region && !bbox_contains_region(*anchor_region, lat, lon);
         const bool region_crossed = flight_region && flight_region != anchor_region && out_of_anchor_box;
-        if (anchor_drift_m > 60000.0 || region_crossed) {
+        // Recenter before the aircraft approaches the edge of the 164 km
+        // terrain square and loses the distant scenery in its forward view.
+        const bool recenter = anchor_drift_m > 40000.0;
+        if (recenter || region_crossed) {
             async_cross.active = true;
             async_cross.stage2_streaming = false;
             async_cross.start_wall_t = PlatformWindow::now_sec();
-            async_cross.cpu_future = std::async(std::launch::async, [&pack, &objects, lat, lon]() {
+            async_cross.cpu_future = std::async(std::launch::async, [&pack, &objects, lat, lon, recenter]() {
                 AsyncPrepareResult res;
-                res.frame = pack.prepare_world_frame(lat, lon, true);
+                res.frame = pack.prepare_world_frame(lat, lon, !recenter);
                 if (res.frame) res.world_objs = objects.prepare_reanchor_cpu(*res.frame);
                 return res;
             });
@@ -860,17 +873,15 @@ int main(int argc, char **argv) {
         const double cam_alt = walking ? walker.alt : st.alt_msl_m;
         const double cam_ground = walking ? walker.alt - 1.68 : st.ground_m;
         const double cam_agl = std::max(0.0, cam_alt - cam_ground);
-        pack.set_online_camera(lat, lon);
+        if (!promo_only) pack.set_online_camera(lat, lon);
 
         sky_clouds.resize_if_needed(output_w, output_h, quality,
                                     eff_pixel_pct, render_settings.aa_mode, render_settings.weather_detail);
         profiler.cpu_end(FlightProfiler::Prepare, prepare_start);
         const LocalAirSample &air_now = ac_hud.last_air();
         const Vec2 local_wind_en{static_cast<float>(air_now.wind_east_mps), static_cast<float>(air_now.wind_north_mps)};
-        if ((frame_idx % 90 == 0) && pack.consume_online_arrived()) {
-            streamer.invalidate_close_pages();
-        }
         streamer.begin_frame(frame_idx);
+        streamer.refine_online_pages(wall_now);
         // Frame-time-budgeted upload cap; drains PBO staging bursts quickly without long frame stalls.
         const int max_up = streamer.has_async_transition() ? 10 : ((quality <= 1) ? 5 : 6);
         const double up_budget_ms = streamer.has_async_transition() ? 3.0 : ((quality == 0) ? 1.4 : (quality == 1 ? 1.8 : 2.2));
@@ -1122,11 +1133,16 @@ int main(int argc, char **argv) {
             if (!PlatformWindow::save_framebuffer_png(save_png, output_w, output_h))
                 std::fprintf(stderr, "[CAPTURE] Could not save %s\n", save_png.c_str());
         }
-        const double present_start = profiler.cpu_start();
-        const PixelRect viewport = win.presentation_rect(output_w, output_h);
-        sky_clouds.present(viewport.x, viewport.y, viewport.w, viewport.h, win.width(), win.height());
-        win.swap_buffers();
-        profiler.cpu_end(FlightProfiler::Present, present_start);
+        if (promo_only) {
+            // Keep capture frames on the GPU without presenting a desktop window.
+            glFlush();
+        } else {
+            const double present_start = profiler.cpu_start();
+            const PixelRect viewport = win.presentation_rect(output_w, output_h);
+            sky_clouds.present(viewport.x, viewport.y, viewport.w, viewport.h, win.width(), win.height());
+            win.swap_buffers();
+            profiler.cpu_end(FlightProfiler::Present, present_start);
+        }
         if (profiler.enabled()) {
             profiler.end_frame(stream, reg_atmo.work_stats(), pack, terrain.last_stats().max_active_lod,
                                sky_clouds.scene_w(), sky_clouds.scene_h());
@@ -1754,12 +1770,23 @@ int main(int argc, char **argv) {
                         double time_advance = 0.0, float look_yaw = 0.0f, float look_pitch = 0.0f,
                         double roll = 0.0, double ail = 0.0, bool draw_hud = true) {
             FlightSimState &s = ac_hud.state();
-            profiler.set_scene(fname);
+            profiler.set_scene(promo_only ? fname + " warmup" : fname);
             s.paused = true;
             s.slew_fast = false;
             s.view_mode = vmode;
+            if (promo_only && vmode == 1) s.chase_dist_m = 24.0f;
             double gnd = pack.sample_elevation(lat, lon);
-            if (promo_only) transition_world(lat, lon);
+            if (promo_only) {
+                transition_world(lat, lon);
+                // At photo altitude, prioritize the foreground visible below
+                // the nose rather than the ground directly below the aircraft.
+                double metres_lat, metres_lon;
+                nspain::meters_per_degree(lat, metres_lat, metres_lon);
+                const double azimuth = (hdg - look_yaw) * DEG2RAD_D;
+                const double forward_m = std::max(220.0, agl * 2.0);
+                pack.set_online_camera(lat + std::cos(azimuth) * forward_m / metres_lat,
+                                       lon + std::sin(azimuth) * forward_m / metres_lon);
+            }
             ac_hud.reset_flight(lat, lon, gnd + agl, hdg, 100.0, false);
             // Ordinary QA shots share one region anchor. Promo shots move
             // across large areas, so transition_world reanchors and cancels
@@ -1782,22 +1809,45 @@ int main(int argc, char **argv) {
             sky_clouds.reset_temporal_history();
             // Drain all 9 CDLOD split passes (L2 -> L9), TOD shadow refreshes & local tree cells cleanly for steady-state visual inspection!
             const int warm_frames = cockpit_qa ? 5 : (promo_only ? 20 : 14);
-            for (int w = 0; w < warm_frames; w++) {
+            const double warm_started = PlatformWindow::now_sec();
+            const bool wants_z20 = pack.online_provider() == OnlineOrthoProvider::PNOA && agl <= 1150.0;
+            const double promo_wait_sec = wants_z20 ? 35.0 : 7.0;
+            bool imagery_ready = false;
+            for (int w = 0; !win.should_close() && (promo_only || w < warm_frames); w++) {
                 win.poll_events();
                 step_flight(1.0 / 60.0);
                 capture_frame(1.0 / 60.0, draw_hud, 128);
                 if (cockpit_qa) streamer.flush_pending_sync(4, 0.12);
-                else if (promo_only) streamer.flush_pending_sync(8, 0.05);
+                else if (promo_only) streamer.flush_pending_sync(16, 0.035);
                 else streamer.flush_pending_sync(24, 0.25);
+                if (promo_only) {
+                    const StreamStats ready = streamer.stats();
+                    const int target_tiles = ready.z20_tiles_ready + ready.z20_tiles_missing;
+                    imagery_ready = !wants_z20 ||
+                        (target_tiles > 0 && ready.z20_tiles_ready * 100 >= target_tiles * 98);
+                    const double elapsed = PlatformWindow::now_sec() - warm_started;
+                    if (elapsed >= promo_wait_sec ||
+                        (w + 1 >= warm_frames && elapsed >= 5.0 && imagery_ready &&
+                         terrain.last_stats().max_active_lod >= (wants_z20 ? 9 : 7))) break;
+                }
             }
+            if (win.should_close()) return;
+            if (promo_only) profiler.set_scene(fname);
             std::string p = autotest_dir + "/" + fname;
-            for (int f = 0; f < 10; f++) {
+            const int settle_frames = promo_only ? 30 : 10;
+            for (int f = 0; f < settle_frames; f++) {
                 win.poll_events();
                 step_flight(1.0 / 60.0);
-                capture_frame(1.0 / 60.0, draw_hud, 128, (f == 9) ? p : "");
+                capture_frame(1.0 / 60.0, draw_hud, 128, (f == settle_frames - 1) ? p : "");
             }
             StreamStats ss = streamer.stats();
             CdlodDrawStats cd = terrain.last_stats();
+            if (promo_only) {
+                std::printf("[PROMO-QA] %s | PNOA Z20: %d complete pages, %d/%d source tiles ready | %s\n",
+                            fname.c_str(), ss.z20_pages, ss.z20_tiles_ready,
+                            ss.z20_tiles_ready + ss.z20_tiles_missing,
+                            imagery_ready ? "warm-up ready" : "warm-up reached time limit");
+            }
             std::printf("[AUTOTEST] %s | gnd=%.1fm | CDLOD=%d(L%d) nodes7-9=%d/%d/%d | cache=%d/%d pages7-9=%d/%d/%d jobs=%d worker=%.0fms | canopy=material-pass | cars=%d\n",
                         fname.c_str(), gnd, cd.visible_nodes, cd.max_active_lod,
                         cd.visible_by_lod[7], cd.visible_by_lod[8], cd.visible_by_lod[9], ss.resident_pages, ss.max_pages,
@@ -1851,15 +1901,28 @@ int main(int argc, char **argv) {
         }
 
         if (promo_only) {
-            if (req_region == "es_catalonia_coast") {
+            if (cloud_qa) {
+                reg_atmo.set_manual_weather_override(true);
+                reg_atmo.set_regime(WindRegime::PYRENEAN_THERMAL);
+                wx_advance = 0.62f;
+                snap("promo_weather_clouds.png", 42.36000, 0.23500, 2620.0, 32.0, -5.0, 1,
+                     50.0, -28.0f, -14.0f, 5.0, 0.0, false);
+                reg_atmo.set_regime(WindRegime::CONVECTIVE_STORM);
+                wx_advance = 0.94f;
+                snap("promo_weather_rain.png", 42.53131, 0.47676, 140.0, 160.0, -4.0, 0,
+                     75.0, 0.0f, -4.0f, 0.0, 0.0, false);
+                std::printf("[PROMO-QA] Cockpit rain sample: %.2f mm/h\n", ac_hud.last_air().precipitation_mm_hr);
+            } else if (req_region == "es_catalonia_coast") {
                 snap("promo_cockpit_barcelona_beaches.png", 41.3640, 2.1990, 900.0, 305.0, -2.0, 0,
                      0.0, 0.0f, -3.0f, 0.0, 0.0, false);
                 snap("promo_chase_barcelona_beaches.png", 41.3640, 2.1990, 900.0, 305.0, -2.0, 1,
                      0.0, 0.0f, -7.0f, 0.0, 0.0, false);
-                snap("promo_cockpit_pals_beach.png", 41.9929, 3.2011, 500.0, 180.0, -2.0, 0,
-                     0.0, 0.0f, -3.0f, 0.0, 0.0, false);
-                snap("promo_chase_pals_beach.png", 41.9929, 3.2011, 500.0, 180.0, -2.0, 1,
-                     0.0, 0.0f, -7.0f, 0.0, 0.0, false);
+                // Higher pass across Sa Tuna, Begur: the broad view makes the
+                // cove and surrounding headland legible while shoreline tiles settle.
+                snap("promo_cockpit_costa_brava.png", 41.9410, 3.2470, 480.0, 331.0, -2.0, 0,
+                     0.0, 12.0f, -6.0f, 0.0, 0.0, false);
+                snap("promo_chase_costa_brava.png", 41.9545, 3.2420, 600.0, 305.0, -2.0, 1,
+                     0.0, 24.0f, -15.0f, -5.0, 0.0, false);
             } else if (req_region == "es_catalonia_pyrenees") {
                 snap("promo_cockpit_catalan_pyrenees.png", 42.3387, 1.4092, 950.0, 350.0, -2.0, 0,
                      0.0, 0.0f, -3.0f, 0.0, 0.0, false);
@@ -1876,7 +1939,8 @@ int main(int argc, char **argv) {
                      0.0, 0.0f, -7.0f, 0.0, 0.0, false);
             }
             profiler.finish();
-            std::printf("[PROMO-QA] Scenic cockpit and chase captures complete for %s -> %s\n",
+            if (win.should_close()) return 1;
+            std::printf("[PROMO-QA] Captures complete for %s -> %s\n",
                         req_region.empty() ? "Aragon" : req_region.c_str(), autotest_dir.c_str());
             return 0;
         }
@@ -1948,10 +2012,10 @@ int main(int argc, char **argv) {
         pack.set_online_provider(OnlineOrthoProvider::PNOA);
         pack.prefetch_online_box(42.52380, 0.48120, 200.0, 20);
         pack.prefetch_online_box(42.52380, 0.48120, 500.0, 19);
-        streamer.invalidate_close_pages(true);
+        streamer.invalidate_close_pages();
         snap("shot_online_pnoa_z20.png", 42.52380, 0.48120, 22.0, 158.0, -9.0, 2);
         pack.set_online_provider(init_online);
-        streamer.invalidate_close_pages(true);
+        streamer.invalidate_close_pages();
         }
 
         // 2. Live Flight & HIGH-SPEED 350 KT Async Streaming p95 Benchmarks!
@@ -2362,7 +2426,7 @@ int main(int argc, char **argv) {
             const auto provider = ac_hud.graphics_settings().terrain_streaming ? OnlineOrthoProvider::PNOA : OnlineOrthoProvider::OFF;
             if (pack.online_provider() != provider) {
                 pack.set_online_provider(provider);
-                streamer.invalidate_close_pages(true);
+                streamer.invalidate_close_pages();
             }
             const double menu_period = std::max(1.0 / 45.0, 1.0 / thermal_fps_cap);
             const double spare = menu_period - (PlatformWindow::now_sec() - now);
@@ -2426,7 +2490,7 @@ int main(int argc, char **argv) {
             ac_hud.set_graphics_settings(settings);
             save_graphics_settings(settings);
             pack.set_online_provider(settings.terrain_streaming ? OnlineOrthoProvider::PNOA : OnlineOrthoProvider::OFF);
-            streamer.invalidate_close_pages(true);
+            streamer.invalidate_close_pages();
         }
         if (win.key_pressed(KEY_M)) {
             if (!reg_atmo.manual_weather_override()) {

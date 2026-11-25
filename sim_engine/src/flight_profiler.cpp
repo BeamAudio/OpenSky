@@ -120,14 +120,14 @@ void FlightProfiler::startup_stage(const char *stage) {
 }
 
 void FlightProfiler::metadata(int width, int height, const char *format, const char *provider,
-                             int terrain_workers, size_t page_bytes) {
+                             int terrain_workers, size_t terrain_storage_bytes) {
     if (!metadata_.is_open()) return;
     metadata_ << "renderer=" << glGetString(GL_RENDERER) << '\n'
               << "opengl=" << glGetString(GL_VERSION) << '\n'
               << "output=" << width << 'x' << height << '\n'
               << "ortho=" << format << '\n' << "ortho_provider=" << provider << '\n'
               << "terrain_workers=" << terrain_workers << '\n'
-              << "terrain_gpu_logical_storage_bytes=" << page_bytes * AsyncTerrainStreamer::MAX_PAGES << '\n'
+              << "terrain_gpu_logical_storage_bytes=" << terrain_storage_bytes << '\n'
               << "drm_device=" << drm_device_.string() << '\n';
     metadata_.flush();
 }

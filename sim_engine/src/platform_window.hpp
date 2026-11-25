@@ -29,7 +29,7 @@ public:
     ~PlatformWindow();
 
     bool create(const char *title, int aspect_w, int aspect_h,
-                DisplayMode mode = DisplayMode::Windowed);
+                DisplayMode mode = DisplayMode::Windowed, bool visible = true);
     void destroy();
     void poll_events();
     void set_relative_mouse(bool enabled);

@@ -385,7 +385,8 @@ void CdlodTerrain::select_node(
     double pred_e, double pred_n,
     int max_desired_lod,
     float now_sec,
-    bool is_prefetch_only
+    bool is_prefetch_only,
+    int draw_limit
 ) {
     double ce = 0.0, cn = 0.0, hs = 0.0;
     AsyncTerrainStreamer::quad_bounds_en(k, ce, cn, hs);
@@ -396,12 +397,15 @@ void CdlodTerrain::select_node(
     float max_x = static_cast<float>(ce + hs - cam_e);
     float min_z = static_cast<float>(-(cn + hs - cam_n));
     float max_z = static_cast<float>(-(cn - hs - cam_n));
-    // Account for Earth curvature drop at distance so far peaks stay inside frustum AABB
+    // Bound the curvature at the farthest corner as well as the closest
+    // point so the frustum cannot discard a patch that bends into view.
     double d_e = std::max(0.0, std::abs(ce - cam_e) - hs);
     double d_n = std::max(0.0, std::abs(cn - cam_n) - hs);
     double horiz_d = std::hypot(d_e, d_n);
-    float curv_drop = static_cast<float>((horiz_d * horiz_d) / (2.0 * 6378137.0));
-    float min_y = static_cast<float>(-150.0 - cam_alt) - curv_drop - 80.0f;
+    const double far_e = std::abs(ce - cam_e) + hs;
+    const double far_n = std::abs(cn - cam_n) + hs;
+    const float far_drop = static_cast<float>((far_e * far_e + far_n * far_n) / (2.0 * 6378137.0));
+    const float min_y = static_cast<float>(-230.0 - cam_alt) - far_drop;
     float max_y = static_cast<float>(3600.0 - cam_alt) + 80.0f;
 
     bool in_frustum = frustum.intersects_aabb({min_x, min_y, min_z}, {max_x, max_y, max_z});
@@ -451,8 +455,11 @@ void CdlodTerrain::select_node(
     // Distance metric for splitting (uses actual camera AGL, not MSL, so high Pyrenees valleys get sharp L8/L9!)
     double dist_cam = std::hypot(horiz_d, std::max(0.0, cam_agl) * 0.45);
     const int max_prefetch_lod = visible_here ? max_desired_lod : std::min(max_desired_lod, 5);
-    bool want_split_render = visible_here && (k.lod < max_desired_lod) && (dist_cam < lod_ranges_[k.lod + 1]);
-    bool want_split_prefetch = (k.lod < max_prefetch_lod) && (pred_d < lod_ranges_[k.lod + 1] * 1.10);
+    const bool room_for_children = draw_limit - static_cast<int>(visible_.size()) >= 4;
+    bool want_split_render = visible_here && room_for_children &&
+        (k.lod < max_desired_lod) && (dist_cam < lod_ranges_[k.lod + 1]);
+    bool want_split_prefetch = (is_prefetch_only || room_for_children) &&
+        (k.lod < max_prefetch_lod) && (pred_d < lod_ranges_[k.lod + 1] * 1.10);
 
     if (want_split_render || want_split_prefetch) {
         // Check if all 4 children are resident before splitting visually (atomic quad split = ZERO T-junction gaps!)
@@ -494,7 +501,13 @@ void CdlodTerrain::select_node(
         }
 
         if (want_split_render && all_children_ready) {
-            for (int ci = 0; ci < 4; ci++) {
+            // Reserve a draw slot for each remaining sibling. If the limit
+            // is tight, the sibling keeps its coarser patch and still draws.
+            const int nearest = (cam_e >= ce ? 1 : 0) | (cam_n >= cn ? 2 : 0);
+            const int nearer_axis = std::abs(cam_e - ce) < std::abs(cam_n - cn) ? 1 : 2;
+            const int order[] = {nearest, nearest ^ nearer_axis, nearest ^ (nearer_axis ^ 3), nearest ^ 3};
+            for (int rank = 0; rank < 4; rank++) {
+                const int ci = order[rank];
                 uint16_t cx = static_cast<uint16_t>(k.qx * 2 + (ci & 1));
                 uint16_t cy = static_cast<uint16_t>(k.qy * 2 + (ci >> 1));
                 QuadKey ck{static_cast<uint8_t>(k.lod + 1), cx, cy};
@@ -502,7 +515,7 @@ void CdlodTerrain::select_node(
                     streamer, ck, my_slice,
                     (ci & 1) ? 0.5f : 0.0f, (ci >> 1) ? 0.5f : 0.0f,
                     frustum, cam_e, cam_n, cam_alt, cam_agl, pred_e, pred_n,
-                    max_desired_lod, now_sec, false
+                    max_desired_lod, now_sec, false, draw_limit - (3 - rank)
                 );
             }
             return;
@@ -516,14 +529,14 @@ void CdlodTerrain::select_node(
                     streamer, ck, my_slice,
                     (ci & 1) ? 0.5f : 0.0f, (ci >> 1) ? 0.5f : 0.0f,
                     frustum, cam_e, cam_n, cam_alt, cam_agl, pred_e, pred_n,
-                    max_desired_lod, now_sec, true
+                    max_desired_lod, now_sec, true, draw_limit
                 );
             }
             return;
         }
     }
 
-    if (is_prefetch_only || !in_frustum || static_cast<int>(visible_.size()) >= MAX_VISIBLE_NODES) return;
+    if (is_prefetch_only || !in_frustum) return;
 
     NodeInstanceGpu inst{};
     inst.min_e_rel = static_cast<float>(ce - hs - cam_e);
@@ -574,16 +587,17 @@ void CdlodTerrain::update_and_render(
 
     // Balanced LOD distance scale keeps sharp L8/L9 near camera while hitting 60 FPS on Renoir iGPUs
     float q_mult = (quality == 0) ? 2.25f : (quality == 1 ? 2.65f : (quality == 2 ? 2.90f : 3.45f));
-    q_mult *= std::clamp(lod_distance_percent, 75, 500) / 100.0f;
+    q_mult *= std::clamp(lod_distance_percent, 75, MAX_LOD_DISTANCE_PERCENT) / 100.0f;
     for (int l = 1; l <= AsyncTerrainStreamer::MAX_LOD; l++) {
         double quad_size = AsyncTerrainStreamer::WORLD_SPAN_M / static_cast<double>(1u << l);
         lod_ranges_[l] = static_cast<float>(quad_size * q_mult);
     }
 
+    const int draw_limit = lod_distance_percent > 200 ? MAX_VISIBLE_NODES : 512;
     select_node(
         streamer, QuadKey{0, 0, 0}, -1, 0.0f, 0.0f,
         frustum, cam_east_m, cam_north_m, cam_alt_m, cam_agl_m, pred_e, pred_n,
-        max_lod, time_sec, false
+        max_lod, time_sec, false, draw_limit
     );
     stats_.visible_nodes = static_cast<int>(visible_.size());
     if (visible_.empty()) return;

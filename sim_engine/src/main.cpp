@@ -10,6 +10,7 @@
 #include "pack_reader.hpp"
 #include "platform_window.hpp"
 #include "regional_atmosphere.hpp"
+#include "simulation_clock.hpp"
 #include "volumetric_clouds.hpp"
 #include "world_objects.hpp"
 
@@ -300,6 +301,7 @@ int main(int argc, char **argv) {
     std::string autotest_dir;
     std::string topdown_dir;
     std::string airport_qa_dir;
+    std::string world_qa_png;
     std::string profile_dir;
     std::string region_test_dir;
     std::string season_arg = "auto";
@@ -342,6 +344,7 @@ int main(int argc, char **argv) {
         else if (a == "--packs-dir" && i + 1 < argc) packs_dir = argv[++i];
         else if (a == "--autotest" && i + 1 < argc) autotest_dir = argv[++i];
         else if (a == "--topdown"  && i + 1 < argc) topdown_dir  = argv[++i];
+        else if (a == "--world-qa" && i + 1 < argc) world_qa_png = argv[++i];
         else if (a == "--airport-qa" && i + 1 < argc) airport_qa_dir = argv[++i];
         else if (a == "--region-flight-test" && i + 1 < argc) region_test_dir = argv[++i];
         else if (a == "--online-ortho" && i + 1 < argc) {
@@ -420,7 +423,7 @@ int main(int argc, char **argv) {
     if (!win.create("OpenSky VFR Simulator", output_w, output_h)) {
         return 1;
     }
-    const bool interactive_run = autotest_dir.empty() && topdown_dir.empty() && !quick_profile && airport_qa_dir.empty() && region_test_dir.empty();
+    const bool interactive_run = autotest_dir.empty() && topdown_dir.empty() && !quick_profile && airport_qa_dir.empty() && region_test_dir.empty() && world_qa_png.empty();
     // Cap FPS to monitor refresh rate (<= 60 Hz for iGPU thermal stability <80C) and enable VSync interactively.
     const double fps_cap = std::clamp(win.refresh_hz(), 30.0, 60.0);
     const double frame_period = 1.0 / fps_cap;
@@ -466,6 +469,7 @@ int main(int argc, char **argv) {
     if (!sky_clouds.init(root + "/sim_engine/shaders", output_w, output_h, quality,
                          graphics_settings.pixel_percent, graphics_settings.aa_mode)) return 1;
     profiler.startup_stage("sky_cloud_resources");
+    if (!interactive_run) reg_atmo.set_solver_seed(0x1725);
     if (!reg_atmo.init(&pack, true, "", interactive_run)) return 1;
     if (weather_arg != "auto") {
         reg_atmo.set_manual_weather_override(true);
@@ -511,7 +515,7 @@ int main(int argc, char **argv) {
     // An empty path gives scripted runs an in-memory profile with no read/write access.
     const auto profile_file = interactive
         ? graphics_settings_path().parent_path() / "fleet.ini" : std::filesystem::path{};
-    if ((interactive || !airport_qa_dir.empty()) &&
+    if ((interactive || !airport_qa_dir.empty() || !world_qa_png.empty()) &&
         !frontend.init(pack, root + "/sim_engine/shaders", root + "/game/assets", profile_file)) return 1;
     auto show_loading = [&](const char *title, const char *stage, float progress01) {
         if (!interactive) return;
@@ -537,6 +541,12 @@ int main(int argc, char **argv) {
         std::printf("[OPENSKY] Region '%s' has no runway; starting at its center.\n", req_region.c_str());
     }
     profiler.startup_stage("initialize_flight");
+    if (!world_qa_png.empty()) {
+        if (!start_ap) return 1;
+        frontend.focus_map(*start_ap);
+        const bool captured = frontend.capture_world(ac_hud, sky_clouds, win, tod_slot, &reg_atmo, world_qa_png);
+        return captured ? 0 : 1;
+    }
     const auto &spawn = ac_hud.state();
     const WeatherSnapshot *baked0 = reg_atmo.has_weather() ? &reg_atmo.weather() : nullptr;
     sky_clouds.update_solar_and_weather(spawn.lat_deg, spawn.lon_deg, spawn.ground_m,
@@ -547,6 +557,7 @@ int main(int argc, char **argv) {
     Vec3 last_stream_sun = sky_clouds.atmo().sun_dir;
     profiler.startup_stage("terrain_coarse_prewarm");
 
+    double sim_time = 0.0;
     uint64_t frame_idx = 1;
     auto transition_world = [&](double lat, double lon, const char *loading_title = nullptr) {
         if (loading_title) show_loading(loading_title, "Preparing world coordinates...", 0.20f);
@@ -561,11 +572,11 @@ int main(int argc, char **argv) {
             sky_clouds.reset_temporal_history();
         }
         reg_atmo.sync_region(lat, lon);
+        reg_atmo.update_field(sky_clouds.atmo().sun_dir, sim_time, false, wx_advance);
         return changed;
     };
 
     double last_t = PlatformWindow::now_sec();
-    double sim_time = 0.0;
     const double cycle_clock_origin = last_t;
     double menu_clock_refresh = -1.0;
     std::vector<double> frame_hist(60, 16.6);
@@ -595,6 +606,28 @@ int main(int argc, char **argv) {
     bool first_presented = false;
     int thermal_pixel_cap = 72;
     double last_thermal_check_t = -10.0;
+    const auto update_environment = [&] {
+        const double weather_start = profiler.cpu_start();
+        const bool walking = frontend.walking();
+        const auto &walker = frontend.walker();
+        const auto &aircraft = ac_hud.state();
+        const double lat = walking ? walker.lat : aircraft.lat_deg;
+        const double lon = walking ? walker.lon : aircraft.lon_deg;
+        const double cam_ground = walking ? walker.alt - 1.68 : aircraft.ground_m;
+        if ((frame_idx % 180) == 0) reg_atmo.sync_region(lat, lon);
+        reg_atmo.update_field(sky_clouds.atmo().sun_dir, sim_time, false, wx_advance);
+        const WeatherSnapshot *bakedw = reg_atmo.has_weather() ? &reg_atmo.weather() : nullptr;
+        sky_clouds.update_solar_and_weather(lat, lon, cam_ground, tod_slot, sim_time,
+                                            regime_fog_mult(), wx_advance, bakedw, season_override,
+                                            std::max(0.0, PlatformWindow::now_sec() - cycle_clock_origin));
+        streamer.set_sun_direction(sky_clouds.atmo().sun_dir);
+        if (dot(sky_clouds.atmo().sun_dir, last_stream_sun) < 0.996f) {
+            last_stream_sun = sky_clouds.atmo().sun_dir;
+            streamer.invalidate_shadows();
+        }
+        profiler.cpu_end(FlightProfiler::Weather, weather_start);
+    };
+
     auto render_one_frame = [&](bool draw_hud, int max_new_tree_cells = 1, const std::string &save_png = "", float fov_deg = 50.0f) {
         frame_idx++;
         profiler.start_frame(frame_idx, quality);
@@ -636,23 +669,8 @@ int main(int argc, char **argv) {
         sky_clouds.resize_if_needed(output_w, output_h, quality,
                                     eff_pixel_pct, render_settings.aa_mode, render_settings.weather_detail);
         profiler.cpu_end(FlightProfiler::Prepare, prepare_start);
-        const double weather_start = profiler.cpu_start();
-        const WeatherSnapshot *bakedw = reg_atmo.has_weather() ? &reg_atmo.weather() : nullptr;
-        sky_clouds.update_solar_and_weather(lat, lon, cam_ground, tod_slot, sim_time,
-                                            regime_fog_mult(), wx_advance, bakedw, season_override,
-                                            std::max(0.0, PlatformWindow::now_sec() - cycle_clock_origin));
-        reg_atmo.update_field(sky_clouds.atmo().sun_dir, sim_time, false, wx_advance);
         const LocalAirSample &air_now = ac_hud.last_air();
         const Vec2 local_wind_en{static_cast<float>(air_now.wind_east_mps), static_cast<float>(air_now.wind_north_mps)};
-        streamer.set_sun_direction(sky_clouds.atmo().sun_dir);
-        if (dot(sky_clouds.atmo().sun_dir, last_stream_sun) < 0.996f) {
-            last_stream_sun = sky_clouds.atmo().sun_dir;
-            streamer.invalidate_shadows();
-        }
-        if ((frame_idx % 180) == 0) {
-            reg_atmo.sync_region(lat, lon);
-        }
-        profiler.cpu_end(FlightProfiler::Weather, weather_start);
         if ((frame_idx % 90 == 0) && pack.consume_online_arrived()) {
             streamer.invalidate_close_pages();
         }
@@ -920,6 +938,7 @@ int main(int argc, char **argv) {
     const auto capture_frame = [&](double elapsed, bool draw_hud, int tree_budget = 1,
                                    const std::string &png = "", float fov = 50.0f) {
         sim_time += elapsed;
+        update_environment();
         render_one_frame(draw_hud, tree_budget, png, fov);
     };
 
@@ -1050,12 +1069,15 @@ int main(int argc, char **argv) {
                 if (step % 2 == 0) {
                     double f0 = PlatformWindow::now_sec();
                     win.poll_events();
+                    update_environment();
+                    update_environment();
                     render_one_frame(true, 4);
                     double sp = (1.0 / 60.0) - (PlatformWindow::now_sec() - f0);
                     if (sp > 0.001) std::this_thread::sleep_for(std::chrono::duration<double>(sp));
                 }
                 if (lifted && !captured_climb && ns.agl_m > 65.0) {
                     captured_climb = true;
+                    update_environment();
                     render_one_frame(true, 1, region_test_dir + "/02_castejon_departure_climb.png");
                     break;
                 }
@@ -1140,6 +1162,7 @@ int main(int argc, char **argv) {
                 const auto &ns = ac_hud.jsb_state();
                 if (!captured_final && !touched && d_thr < 380.0) {
                     captured_final = true;
+                    update_environment();
                     render_one_frame(true, 1, region_test_dir + "/06_leci_short_final.png");
                 }
                 if (!touched && ns.on_ground) {
@@ -1148,11 +1171,14 @@ int main(int argc, char **argv) {
                     td_ias = ns.ias_kt;
                     td_g = ns.g_load;
                     td_lat = ns.lat_deg; td_lon = ns.lon_deg;
+                    update_environment();
                     render_one_frame(true, 1, region_test_dir + "/07_leci_touchdown.png");
                 }
                 if (step % 2 == 0) {
                     double f0 = PlatformWindow::now_sec();
                     win.poll_events();
+                    update_environment();
+                    update_environment();
                     render_one_frame(true, 4);
                     double sp = (1.0 / 60.0) - (PlatformWindow::now_sec() - f0);
                     if (sp > 0.001) std::this_thread::sleep_for(std::chrono::duration<double>(sp));
@@ -1692,6 +1718,7 @@ int main(int argc, char **argv) {
         audio.update_state(as);
     };
 
+    SimulationClock clock;
     while (!win.should_close()) {
         double now = PlatformWindow::now_sec();
         const double frame_sec = now - last_t;
@@ -1737,7 +1764,7 @@ int main(int argc, char **argv) {
                         enter_region(*airport);
                         frontend.park(ac_hud, *airport);
                         prepare_airfield(*airport);
-                        }
+                    }
                 }
                 break;
             case GameFrontend::Request::Editor:
@@ -1762,6 +1789,7 @@ int main(int argc, char **argv) {
             if (ready) airfield_pages.clear();
         }
         if (ac_hud.state().menu_open && (!frontend.walking() || !airfield_pages.empty())) {
+            clock.pause();
             if (now - menu_clock_refresh >= 0.5) {
                 const FlightSimState &menu_state = ac_hud.state();
                 const bool menu_walking = frontend.walking();
@@ -1793,6 +1821,7 @@ int main(int argc, char **argv) {
         if (frontend.walking()) {
             if (win.key_pressed(KEY_U)) audio.set_muted(!audio.is_muted());
             sim_time += dt;
+            update_environment();
             render_one_frame(true);
             push_audio_state(dt, false);
             const double spare = frame_period - (PlatformWindow::now_sec() - now);
@@ -1866,14 +1895,19 @@ int main(int argc, char **argv) {
             audio.set_muted(!audio.is_muted());
             std::printf("[AUDIO] %s\n", audio.is_muted() ? "Muted" : "Unmuted");
         }
-        step_flight(dt);
-        frontend.step_flight(ac_hud, dt);
+        const double simulated = clock.consume(frame_sec);
+        sim_time += simulated;
+        update_environment();
+        step_flight(simulated);
+        frontend.step_flight(ac_hud, simulated);
         // Silently shift local terrain anchor on long cross-country legs (>60 km) with NO loading screen in flight.
         const double anchor_drift_m = nspain::haversine_m(
             ac_hud.state().lat_deg, ac_hud.state().lon_deg, pack.anchor_lat(), pack.anchor_lon());
-        if (anchor_drift_m > 60000.0 && transition_world(ac_hud.state().lat_deg, ac_hud.state().lon_deg))
-            last_t = PlatformWindow::now_sec();
-        sim_time += dt;
+        const auto &flight = ac_hud.state();
+        const auto *flight_region = pack.find_region_at(flight.lat_deg, flight.lon_deg);
+        const auto *anchor_region = pack.find_region_at(pack.anchor_lat(), pack.anchor_lon());
+        if ((anchor_drift_m > 60000.0 || (flight_region && flight_region != anchor_region)) &&
+            transition_world(flight.lat_deg, flight.lon_deg)) last_t = PlatformWindow::now_sec();
         render_one_frame(true);
         push_audio_state(dt, ac_hud.state().paused || ac_hud.state().menu_open);
         // Pace strictly to display refresh rate (capped <= 60 FPS) so GPU/CPU never boost unnecessarily (<80 C).

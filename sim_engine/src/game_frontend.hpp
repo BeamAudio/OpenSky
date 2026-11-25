@@ -30,6 +30,9 @@ public:
     void draw_menu(AircraftAndHud &aircraft, SkyAndClouds &sky, const PlatformWindow &win,
                    bool preparing_airfield, int &time_of_day,
                    RegionalAtmosphere *reg_atmo = nullptr, double sim_time_sec = 0.0);
+    void focus_map(const AirportInfo &airport) { focus_airport(airport, 48.0f); }
+    bool capture_world(AircraftAndHud &aircraft, SkyAndClouds &sky, const PlatformWindow &win,
+                       int &time_of_day, RegionalAtmosphere *weather, const std::string &path);
     void draw_walk(AircraftAndHud &aircraft, const PlatformWindow &win,
                    const RegionalAtmosphere *reg_atmo = nullptr, const AtmosphereState *atmo = nullptr,
                    double sim_time_sec = 0.0);
@@ -96,6 +99,7 @@ private:
     std::string selected_id_;
     AircraftSession session_;
     int model_history_page_ = 0;
+    bool show_outlook_ = false;
     bool add_waypoint_ = false;
     bool walking_ = false, inspecting_ = false;
     WalkStation active_station_ = WalkStation::Door;

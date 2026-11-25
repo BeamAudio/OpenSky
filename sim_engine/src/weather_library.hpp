@@ -42,6 +42,7 @@ struct WeatherModelHistoryEntry {
     float wind_speed_10m_mps = 0.0f;
     float cloud_cover_pct = 0.0f;
     float precipitation_mm_hr = 0.0f;
+    std::string region_id;
 };
 
 struct WeatherCell {

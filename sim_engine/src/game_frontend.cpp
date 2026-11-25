@@ -430,6 +430,12 @@ void GameFrontend::draw_menu(AircraftAndHud &aircraft, SkyAndClouds &sky, const 
     aircraft.flush_hud(w, h, font_);
 }
 
+bool GameFrontend::capture_world(AircraftAndHud &aircraft, SkyAndClouds &sky, const PlatformWindow &win,
+                                 int &time_of_day, RegionalAtmosphere *weather, const std::string &path) {
+    draw_menu(aircraft, sky, win, false, time_of_day, weather);
+    return PlatformWindow::save_framebuffer_png(path, GAME_OUTPUT_W, GAME_OUTPUT_H);
+}
+
 void GameFrontend::draw_world(AircraftAndHud &ui, const PlatformWindow &win,
                               RegionalAtmosphere *reg_atmo, const AtmosphereState *atmo, double sim_time_sec) {
     label(ui, 64, 111, 44, "World");
@@ -594,12 +600,7 @@ void GameFrontend::draw_world(AircraftAndHud &ui, const PlatformWindow &win,
                                                                 selected->rwy_lat_b, selected->rwy_lon_b));
         const char *srf = selected->surface.empty() ? "strip" : selected->surface.c_str();
         if (reg_atmo && atmo) {
-            const Vec4 bounds = reg_atmo->domain_bounds();
-            const double east_m = (selected->lon - pack_->anchor_lon()) * pack_->anchor_m_lon();
-            const double north_m = (selected->lat - pack_->anchor_lat()) * pack_->anchor_m_lat();
-            const double u = (east_m - bounds.x) * bounds.z;
-            const double v = (north_m - bounds.y) * bounds.w;
-            if (u >= 0.0 && u <= 1.0 && v >= 0.0 && v <= 1.0) {
+            if (reg_atmo->covers(selected->lat, selected->lon)) {
                 const float wx_est = std::clamp((atmo->cloud_cov - 0.16f) / 0.78f, 0.0f, 1.0f);
                 const LocalAirSample wx = reg_atmo->sample_at(selected->lat, selected->lon, selected->elev_m + 10.0,
                                                               atmo->sun_dir, sim_time_sec, wx_est);
@@ -628,36 +629,62 @@ void GameFrontend::draw_world(AircraftAndHud &ui, const PlatformWindow &win,
     const size_t history_count = history ? history->size() : 0;
     const int history_pages = std::max(1, static_cast<int>((history_count + 3) / 4));
     model_history_page_ = std::clamp(model_history_page_, 0, history_pages - 1);
-    label(ui, 1318, 778, 19, "REGIONAL MODEL HISTORY");
-    const char *input_label = reg_atmo && reg_atmo->live_weather_available()
-        ? "OPEN-METEO CURRENT" : "BAKED CLIMATE";
-    label(ui, 1580, 781, 13, input_label, true);
-    if (button(ui, {1738,770,40,30}, "<", model_history_page_ > 0)) --model_history_page_;
-    if (button(ui, {1790,770,40,30}, ">", model_history_page_ + 1 < history_pages)) ++model_history_page_;
-    if (history_count == 0) {
-        label(ui, 1318, 827, 15, "Model history appears as the in-game weather solver advances.", true);
-    } else {
-        for (int card = 0; card < 4; ++card) {
-            const size_t back = static_cast<size_t>(model_history_page_ * 4 + card);
-            if (back >= history_count) break;
-            const auto &entry = (*history)[history_count - 1 - back];
-            const float x = 1318.0f + card * 128.0f;
-            ui.hud_rect(x, 805, 120, 88, .065f, .105f, .133f, 1.0f);
-            ui.hud_border(x, 805, 120, 88, 1, .20f, .31f, .38f, .78f);
-            const double age_min = std::max(0.0, (sim_time_sec - entry.sim_time_sec) / 60.0);
-            if (age_min < 0.25) std::snprintf(line, sizeof(line), "NOW");
-            else std::snprintf(line, sizeof(line), "T-%.0fm", age_min);
-            label(ui, x + 8, 811, 14, line, true);
-            std::snprintf(line, sizeof(line), "CLOUD %.0f%%", entry.cloud_cover_pct);
-            label(ui, x + 8, 829, 12, line, true);
-            std::snprintf(line, sizeof(line), "%.0f C", entry.temperature_c);
-            label(ui, x + 8, 845, 17, line);
-            std::snprintf(line, sizeof(line), "%s %.0fkt", wind_cardinal(entry.wind_direction_from_deg),
-                          entry.wind_speed_10m_mps * 1.94384f);
-            label(ui, x + 8, 860, 12, line, true);
-            std::snprintf(line, sizeof(line), "RAIN %.1fmm/h", entry.precipitation_mm_hr);
-            label(ui, x + 8, 874, 12, line, true);
+    const auto source = reg_atmo ? reg_atmo->model_source() : WeatherSource::Default;
+    const char *input_label = source == WeatherSource::Live ? "Open-Meteo input"
+        : source == WeatherSource::Baked ? "Baked climate" : source == WeatherSource::Manual
+        ? "Manual weather" : "Default weather";
+    if (button(ui, {1598,770,130,30}, show_outlook_ ? "History" : "Outlook", reg_atmo != nullptr)) {
+        show_outlook_ = !show_outlook_;
+        if (show_outlook_ && reg_atmo->outlook().status == WeatherOutlook::Status::Idle) reg_atmo->request_outlook();
+    }
+    const auto outlook = show_outlook_ && reg_atmo ? reg_atmo->outlook() : WeatherOutlook{};
+    if (show_outlook_) {
+        label(ui, 1318, 778, 18, "REGIONAL MODEL OUTLOOK");
+        if (outlook.status == WeatherOutlook::Status::Running) {
+            if (button(ui, {1738,770,92,30}, "Cancel")) reg_atmo->cancel_outlook();
+        } else if (button(ui, {1738,770,92,30}, "Run", reg_atmo && reg_atmo->has_model())) {
+            reg_atmo->request_outlook();
         }
+        if (outlook.status != WeatherOutlook::Status::Idle) {
+            std::snprintf(line, sizeof(line), "Fixed inputs | issued at T+%.2fm", outlook.issue_sim_time / 60.0);
+            label(ui, 1318, 803, 12, line, true);
+        }
+        if (outlook.predictions.empty())
+            label(ui, 1320, 842, 15, outlook.status == WeatherOutlook::Status::Running
+                  ? "Calculating outlook for +1, +3 and +5 minutes..." : "Run an outlook from the current model.", true);
+    } else {
+        label(ui, 1318, 778, 18, "REGIONAL MODEL HISTORY");
+        label(ui, 1318, 802, 12, input_label, true);
+        if (button(ui, {1738,770,40,30}, "<", model_history_page_ > 0)) --model_history_page_;
+        if (button(ui, {1790,770,40,30}, ">", model_history_page_ + 1 < history_pages)) ++model_history_page_;
+        if (history_count == 0)
+            label(ui, 1318, 842, 15, "History appears as the weather model advances.", true);
+    }
+
+    for (int card = 0; card < 4; ++card) {
+        const size_t idx = static_cast<size_t>(model_history_page_ * 4 + card);
+        if (show_outlook_ ? size_t(card) >= outlook.predictions.size() : idx >= history_count) break;
+        const auto &entry = show_outlook_ ? outlook.predictions[card] : (*history)[history_count - 1 - idx];
+        const float x = 1318.0f + card * 128.0f;
+        ui.hud_rect(x, 818, 120, 74, .065f, .105f, .133f, 1.0f);
+        ui.hud_border(x, 818, 120, 74, 1, .20f, .31f, .38f, .78f);
+        if (show_outlook_) {
+            std::snprintf(line, sizeof(line), "+%.0fm | T+%.2fm",
+                          (entry.sim_time_sec - outlook.issue_sim_time) / 60.0, entry.sim_time_sec / 60.0);
+        } else {
+            const double age_min = std::max(0.0, (sim_time_sec - entry.sim_time_sec) / 60.0);
+            const char *region = entry.region_id.find("catalonia") != std::string::npos ? "CAT"
+                : entry.region_id.find("aragon") != std::string::npos ? "ARA" : entry.region_id.c_str();
+            std::snprintf(line, sizeof(line), "T-%.1fm %.7s", age_min, region);
+        }
+        label(ui, x + 8, 822, 12, line, true);
+        std::snprintf(line, sizeof(line), "%.0f C  CLOUD %.0f%%", entry.temperature_c, entry.cloud_cover_pct);
+        label(ui, x + 8, 838, 12, line);
+        std::snprintf(line, sizeof(line), "%s %.0fkt", wind_cardinal(entry.wind_direction_from_deg),
+                      entry.wind_speed_10m_mps * 1.94384f);
+        label(ui, x + 8, 854, 12, line, true);
+        std::snprintf(line, sizeof(line), "RAIN %.1fmm/h", entry.precipitation_mm_hr);
+        label(ui, x + 8, 870, 12, line, true);
     }
     ui.hud_rect(1318, 895, 512, 1, .20f, .31f, .38f, .78f);
     double total = 0;

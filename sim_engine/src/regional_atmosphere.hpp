@@ -5,6 +5,7 @@
 #include "pack_reader.hpp"
 #include "weather_library.hpp"
 
+#include <optional>
 #include <array>
 #include <algorithm>
 #include <cstdint>
@@ -114,7 +115,7 @@ public:
     DrydenGustSample step(double dt_sec, double tas_mps, double agl_m,
                           double sigma_u, double sigma_v, double sigma_w,
                           double wingspan_m = 11.0);
-    DrydenGustSample current() const { return last_; }
+    void set_seed(uint32_t seed) { rng_.seed(seed); norm_.reset(); }
 
 private:
     std::mt19937 rng_;
@@ -128,6 +129,16 @@ private:
 
 // Advances a terrain-following regional model on a worker thread using
 // baked or live boundary conditions. The renderer consumes completed fields.
+enum class WeatherSource { Baked, Live, Manual, Default };
+
+struct WeatherOutlook {
+    enum class Status { Idle, Running, Complete };
+    Status status = Status::Idle;
+    double issue_sim_time = 0;
+    std::string region_id;
+    std::vector<WeatherModelHistoryEntry> predictions;
+};
+
 class RegionalAtmosphere {
 public:
     // Regional weather is a mesoscale field; shader noise supplies finer cloud structure.
@@ -161,6 +172,13 @@ public:
         const int64_t last = live_last_success_utc_.load(std::memory_order_acquire);
         return last > 0 ? std::max<int64_t>(0, static_cast<int64_t>(std::time(nullptr)) - last) : -1;
     }
+    void set_solver_seed(uint32_t seed, bool synchronous = false) { solver_seed_ = seed; synchronous_solver_ = synchronous; }
+    void request_outlook();
+    void cancel_outlook();
+    WeatherOutlook outlook() const;
+    WeatherSource model_source() const { return frame_weather_.source; }
+    bool has_model() const { return weather_model_ready_ && !frame_weather_.grid.empty(); }
+    bool covers(double lat, double lon) const;
     const std::vector<WeatherModelHistoryEntry> &model_history() const { return model_history_; }
     void set_manual_weather_override(bool enabled) {
         if (manual_weather_override_ != enabled) { manual_weather_override_ = enabled; dirty_ = true; }
@@ -211,18 +229,56 @@ private:
         float rain_mm_hr = 0.0f, cloud_fraction = 0.0f, tke = 0.1f;
     };
 
+    struct WeatherSolver {
+        std::vector<SimWeatherCell> weather_grid_, weather_next_;
+        std::vector<float> weather_rain_flux_, terrain_height_, terrain_slope_e_, terrain_slope_n_;
+        std::vector<float> terrain_ridge_exposure_, terrain_valley_basin_, weather_worker_climate_field_;
+        WeatherSnapshot weather_worker_active_{}, synoptic_weather_{};
+        double min_e_ = 0, min_n_ = 0, span_e_ = 1, span_n_ = 1;
+        double weather_anchor_lat_ = 0, anchor_lon = 0, metres_lat = 1, metres_lon = 1;
+        double solved_time = 0;
+        std::string region_id;
+        WeatherSource source = WeatherSource::Default;
+        Vec3 sun{0, 1, 0};
+        WindRegime regime_ = WindRegime::PYRENEAN_THERMAL;
+        std::array<DynamicCell, 6> dyn_cells_{};
+        int dyn_cell_count_ = 0;
+        std::mt19937 solver_rng_{};
+        void spawn_dynamic_cell(DynamicCell &c, bool initial_spread);
+        void seed_dynamic_cells();
+        void advance_dynamic_cells(float dt, float solar);
+        void step(float dt, const Vec3 &sun_dir, const WeatherSnapshot &forcing);
+    };
+
+    struct WeatherPublication {
+        std::vector<SimWeatherCell> grid;
+        std::vector<float> field;
+        std::array<DynamicCell, 6> cells{};
+        int cell_count = 0;
+        WeatherSnapshot summary, forcing;
+        WeatherSource source = WeatherSource::Default;
+        WindRegime regime = WindRegime::PYRENEAN_THERMAL;
+        uint64_t generation = 0;
+        double solved_time = 0;
+        double anchor_lat = 0, anchor_lon = 0, metres_lat = 1, metres_lon = 1;
+        double min_e = 0, min_n = 0, span_e = 1, span_n = 1;
+        std::string region_id;
+    };
+
+    void latch_weather();
+    static WeatherModelHistoryEntry summarize(double time, const WeatherSnapshot &weather, const std::string &region);
+    const WeatherSnapshot &frame_forcing() const {
+        return has_model() ? frame_weather_.forcing : synoptic_weather_;
+    }
+    WindRegime frame_regime() const { return has_model() ? frame_weather_.regime : regime_; }
     void upload_field();
     void live_weather_worker();
     void initialize_weather_model();
-    void advance_weather_model(float dt, const Vec3 &sun_dir, const WeatherSnapshot &forcing);
     void weather_worker_loop();
     void start_weather_worker();
     void stop_weather_worker();
     void publish_weather_model();
     void refresh_climate_field();
-    void seed_dynamic_cells();
-    void spawn_dynamic_cell(DynamicCell &c, bool initial_spread);
-    void advance_dynamic_cells(float dt, float solar);
     void evaluate_dynamic_cells(double east_m, double north_m, double agl_m,
                                 float &out_cloud_add, float &out_rain_add, float &out_w_add,
                                 float &out_outflow_e, float &out_outflow_n, float &out_tke_add) const;
@@ -255,42 +311,36 @@ private:
     bool active_weather_init_ = false;
     bool manual_weather_override_ = false;
     double active_weather_time_ = -1.0;
-    double last_live_field_upload_ = -999.0;
-    std::vector<float> field_upload_;
     std::vector<float> terrain_upload_;
     std::vector<float> climate_field_;
-    std::vector<SimWeatherCell> weather_grid_;
-    std::vector<SimWeatherCell> weather_next_;
+    WeatherSolver solver_; // Mutated by the weather worker, or with that worker stopped.
+    WeatherPublication frame_weather_, pending_weather_, staging_weather_;
     mutable std::mutex weather_publish_mtx_;
-    std::vector<SimWeatherCell> weather_published_;
-    std::vector<SimWeatherCell> weather_staging_;
-    std::vector<float> field_published_;
-    std::vector<float> field_staging_;
-    WeatherSnapshot weather_published_snapshot_{};
     uint64_t weather_generation_ = 0;
     uint64_t uploaded_weather_generation_ = 0;
     uint64_t field_uploads_ = 0;
     std::atomic<uint64_t> weather_steps_{0}, weather_solve_us_{0}, weather_publish_us_{0};
-    std::vector<float> weather_rain_flux_;
-    std::vector<float> terrain_height_;
-    std::vector<float> terrain_slope_e_;
-    std::vector<float> terrain_slope_n_;
-    std::vector<float> terrain_ridge_exposure_;
-    std::vector<float> terrain_valley_basin_;
+    std::optional<uint32_t> solver_seed_;
+    bool synchronous_solver_ = false;
+    std::string active_region_id_;
+    uint64_t live_request_id_ = 0; // guarded by live_mtx_
+    WeatherOutlook outlook_; // guarded by weather_job_mtx_
+    uint64_t outlook_request_id_ = 0;
+    bool outlook_requested_ = false;
     bool weather_model_ready_ = false;
     double weather_model_time_ = -1.0;
     double weather_model_accum_ = 0.0;
     double weather_anchor_lat_ = 0.0, weather_anchor_lon_ = 0.0;
     std::thread weather_worker_;
-    std::mutex weather_job_mtx_;
+    mutable std::mutex weather_job_mtx_;
     std::condition_variable weather_job_cv_;
     std::atomic<bool> weather_worker_stop_{false};
     int weather_pending_steps_ = 0;
     bool weather_pending_climate_ = false;
     std::vector<float> weather_pending_climate_field_;
-    std::vector<float> weather_worker_climate_field_;
     WeatherSnapshot weather_worker_forcing_{};
-    WeatherSnapshot weather_worker_active_{};
+    WeatherSource weather_worker_source_ = WeatherSource::Default;
+    WindRegime weather_worker_regime_ = WindRegime::PYRENEAN_THERMAL;
     Vec3 weather_worker_sun_{0.0f, 1.0f, 0.0f};
     double min_e_ = 0.0, min_n_ = 0.0, span_e_ = 163840.0, span_n_ = 122880.0;
     int season_override_ = -1;
@@ -301,13 +351,6 @@ private:
     int last_state_ = -1;
     double last_update_t_ = -999.0;
     bool dirty_ = true;
-    std::array<DynamicCell, 6> dyn_cells_{};
-    std::array<DynamicCell, 6> dyn_cells_published_{};
-    int dyn_cell_count_ = 0;
-    int dyn_cell_count_published_ = 0;
-    double dyn_cell_time_ = 0.0;
-    std::mt19937 solver_rng_{};
-    bool solver_rng_seeded_ = false;
     mutable StochasticDrydenFilter dryden_filter_{};
 };
 

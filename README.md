@@ -10,7 +10,7 @@ The product target is 1920×1080 output at 60 FPS on integrated graphics, with t
 - `protocol/` — Shared `.nspack` binary pack specification ([pack_format.h](protocol/pack_format.h) / [pack_format.py](protocol/pack_format.py)).
 - `builder/` — Offline regional pack baker ([build_region.py](builder/build_region.py)) ingesting **IGN Spain PNOA**, **IGN MDT05/MDT25**, **OurAirports**, and **OpenStreetMap**. The World Editor also accepts user-licensed XYZ imagery and Terrarium elevation tiles outside Spain, or builds explicit elevation-only regions.
 - `sim_engine/` — C++20/OpenGL renderer with CDLOD terrain, instanced and baked city meshes, vegetation shading, reduced-resolution volumetric clouds, baked solar and night lighting, and reverse-Z terrain depth.
-- `engine/` — WGS84 geometry, C172S systems, mountain wind, OpenTrack UDP and the adapter to upstream JSBSim. The project-authored C172S aircraft data is kept separate from the LGPL library.
+- `engine/` — WGS84 geometry, C172S systems, OpenTrack UDP and the adapter to upstream JSBSim. The project-authored C172S aircraft data is kept separate from the LGPL library.
 - `game/` — Runtime textures, GLB models, factory C172S configuration and native libraries.
 - `docs/OPENSKY_VFR_DELIVERY_PLAN.md` — Product gates, delivery milestones and engine evolution plan.
 
@@ -61,6 +61,14 @@ and verification cases.
 See the [current flight and weather audit](docs/2026-11-23_flight-weather-audit.md)
 for the JSBSim wiring, Earth curvature review, weather limitations and next gates.
 
+### Runtime verification
+
+Run `./run_sim.sh --runtime-check --online-ortho off` with Aragón and Catalonia
+installed. `--runtime-check-gpu` runs the same replay with GPU weather uploads and
+checks stale terrain jobs. `--outlook-check` also waits for all three forecast leads.
+These checks use their own temporary aircraft profile. Capture the World menu
+with `./run_sim.sh --world-qa /tmp/world.png --airport ES-0098 --online-ortho off`.
+
 ### Start a flight
 
 Open **World** to find the C172S at its home airport, Castejón de Sos, on a new save. Select an installed
@@ -70,12 +78,14 @@ to the active waypoint in flight.
 
 Choose **Enter airport on foot**, then use `WASD` to walk and drag either mouse
 button or use the arrow keys to look around. Press `E` near the aircraft to refuel, repair, or
-board it. **Board at parking** starts from the parking spot. **Start on
-runway** lines the aircraft up for a manual departure. After landing, stop
+board it. **Board at parking** starts from the parking spot. Taxi to the runway for departure. After landing, stop
 near an installed airfield and choose **Park and step outside** from the pause
 menu. That airfield becomes your temporary base, and the next session resumes
 from there. Castejón de Sos remains home. The aircraft's parked location, fuel,
-condition, engine hours, and route are saved locally.
+condition, engine hours, and route are saved locally. The World menu shows
+the regional weather model's current conditions and recent history. **Outlook**
+runs a separate projection at +1, +3, and +5 simulation minutes using the
+current model inputs.
 
 ### World Editor
 

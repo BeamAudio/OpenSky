@@ -10,6 +10,7 @@
 #include "pack_reader.hpp"
 #include "platform_window.hpp"
 #include "regional_atmosphere.hpp"
+#include "runtime_checks.hpp"
 #include "simulation_clock.hpp"
 #include "volumetric_clouds.hpp"
 #include "world_objects.hpp"
@@ -290,6 +291,7 @@ int run_selftest(const PackReader &pack) {
 
 int main(int argc, char **argv) {
     bool selftest_only = false;
+    bool runtime_check = false, runtime_check_gpu = false, outlook_check = false;
     bool only_region = false;
     bool bench_only = false;
     bool cloud_qa = false;
@@ -317,6 +319,9 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--selftest") selftest_only = true;
+        else if (a == "--runtime-check") runtime_check = true;
+        else if (a == "--runtime-check-gpu") runtime_check = runtime_check_gpu = true;
+        else if (a == "--outlook-check") runtime_check = outlook_check = true;
         else if (a == "--bench-only") bench_only = true;
         else if (a == "--debug-overlays") debug_overlays = true;
         else if (a == "--no-audio") no_audio = true;
@@ -411,11 +416,15 @@ int main(int argc, char **argv) {
         if (!start_ap && !pack.airports().empty()) start_ap = &pack.airports().front();
     }
 
-    if (start_ap) {
+    if (start_ap && world_qa_png.empty()) {
         const double distance = nspain::haversine_m(start_ap->lat, start_ap->lon, pack.anchor_lat(), pack.anchor_lon());
         if (!req_airport.empty() || distance > 65000.0) pack.reanchor_to(start_ap->lat, start_ap->lon);
     }
     if (selftest_only) return run_selftest(pack);
+    if (runtime_check) {
+        if (runtime_check_gpu && !win.create("OpenSky runtime check", 960, 540)) return 1;
+        return run_runtime_checks(pack, runtime_check_gpu, outlook_check);
+    }
     profiler.startup_stage("spawn_anchor");
 
     const int output_w = !topdown_dir.empty() ? 1024 : GAME_OUTPUT_W;
@@ -529,6 +538,18 @@ int main(int argc, char **argv) {
         ac_hud.state().paused = false;
     }
 
+    if (!world_qa_png.empty()) {
+        if (!start_ap) return 1;
+        const FlightSimState before = ac_hud.state();
+        const auto *parked = frontend.parked_airport();
+        frontend.focus_map(*start_ap);
+        const bool captured = frontend.capture_world(ac_hud, sky_clouds, win, tod_slot, &reg_atmo, world_qa_png);
+        const auto &after = ac_hud.state();
+        const bool stayed_put = before.lat_deg == after.lat_deg && before.lon_deg == after.lon_deg &&
+            before.alt_msl_m == after.alt_msl_m && parked == frontend.parked_airport();
+        if (!stayed_put) std::fprintf(stderr, "[WORLD] Map browsing moved the aircraft\n");
+        return captured && stayed_put ? 0 : 1;
+    }
     if (start_ap) {
         reg_atmo.sync_region(start_ap->lat, start_ap->lon);
         if (!interactive) ac_hud.teleport_to_airport(*start_ap, 1200.0, 145.0);
@@ -541,12 +562,6 @@ int main(int argc, char **argv) {
         std::printf("[OPENSKY] Region '%s' has no runway; starting at its center.\n", req_region.c_str());
     }
     profiler.startup_stage("initialize_flight");
-    if (!world_qa_png.empty()) {
-        if (!start_ap) return 1;
-        frontend.focus_map(*start_ap);
-        const bool captured = frontend.capture_world(ac_hud, sky_clouds, win, tod_slot, &reg_atmo, world_qa_png);
-        return captured ? 0 : 1;
-    }
     const auto &spawn = ac_hud.state();
     const WeatherSnapshot *baked0 = reg_atmo.has_weather() ? &reg_atmo.weather() : nullptr;
     sky_clouds.update_solar_and_weather(spawn.lat_deg, spawn.lon_deg, spawn.ground_m,

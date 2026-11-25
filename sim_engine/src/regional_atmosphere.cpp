@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -56,14 +57,42 @@ double json_or(const char *json, const char *key, double fallback) {
     return json_number(json, key, v) ? v : fallback;
 }
 
+std::string json_object_text(const char *json, const char *key) {
+    char needle[96];
+    std::snprintf(needle, sizeof(needle), "\"%s\"", key);
+    const char *p = std::strstr(json, needle);
+    if (!p) return {};
+    p = std::strchr(p + std::strlen(needle), ':');
+    if (!p) return {};
+    while (*++p && std::isspace(static_cast<unsigned char>(*p))) {}
+    if (*p != '{') return {};
+    const char *begin = p;
+    int depth = 0;
+    bool quoted = false, escaped = false;
+    for (; *p; ++p) {
+        if (quoted) {
+            if (escaped) escaped = false;
+            else if (*p == '\\') escaped = true;
+            else if (*p == '"') quoted = false;
+            continue;
+        }
+        if (*p == '"') quoted = true;
+        else if (*p == '{') ++depth;
+        else if (*p == '}' && --depth == 0) return std::string(begin, p + 1);
+    }
+    return {};
+}
+
 WeatherSnapshot parse_live_weather(const char *json, double elevation_m) {
     WeatherSnapshot w{};
-    const double temp = json_or(json, "temperature_2m", 16.0);
-    const double dew = json_or(json, "dew_point_2m", temp - 7.0);
-    const double cover = std::clamp(json_or(json, "cloud_cover", 35.0), 0.0, 100.0);
-    const double mm = std::max(json_or(json, "precipitation", 0.0),
-                               json_or(json, "rain", 0.0) + json_or(json, "showers", 0.0));
-    const int code = static_cast<int>(json_or(json, "weather_code", 0.0));
+    const std::string current = json_object_text(json, "current");
+    const char *source = current.empty() ? json : current.c_str();
+    const double temp = json_or(source, "temperature_2m", 16.0);
+    const double dew = json_or(source, "dew_point_2m", temp - 7.0);
+    const double cover = std::clamp(json_or(source, "cloud_cover", 35.0), 0.0, 100.0);
+    const double mm = std::max(json_or(source, "precipitation", 0.0),
+                               json_or(source, "rain", 0.0) + json_or(source, "showers", 0.0));
+    const int code = static_cast<int>(json_or(source, "weather_code", 0.0));
     float precip = static_cast<float>(std::clamp(mm / 1.2, 0.0, 1.0));
     if (code >= 95) precip = std::max(precip, 0.78f);
     else if (code >= 80) precip = std::max(precip, 0.52f);
@@ -75,9 +104,9 @@ WeatherSnapshot parse_live_weather(const char *json, double elevation_m) {
     // simulator stores sea-level references and applies elevation per column.
     w.oat_sl_c = static_cast<float>(temp + elevation_m * 0.0065);
     w.dewpoint_sl_c = static_cast<float>(dew + elevation_m * 0.0017);
-    w.qnh_hpa = static_cast<float>(std::clamp(json_or(json, "pressure_msl", 1015.0), 940.0, 1060.0));
-    w.wind_dir_from_deg = static_cast<float>(std::fmod(json_or(json, "wind_direction_10m", 270.0) + 360.0, 360.0));
-    w.wind_speed_10m_mps = static_cast<float>(std::clamp(json_or(json, "wind_speed_10m", 4.0), 0.0, 45.0));
+    w.qnh_hpa = static_cast<float>(std::clamp(json_or(source, "pressure_msl", 1015.0), 940.0, 1060.0));
+    w.wind_dir_from_deg = static_cast<float>(std::fmod(json_or(source, "wind_direction_10m", 270.0) + 360.0, 360.0));
+    w.wind_speed_10m_mps = static_cast<float>(std::clamp(json_or(source, "wind_speed_10m", 4.0), 0.0, 45.0));
     w.cloud_base_m = static_cast<float>(std::clamp(125.0 * std::max(2.0, temp - dew), 350.0, 3400.0)); // LCL AGL estimate
     w.cloud_thick_m = std::lerp(850.0f, 3000.0f, std::clamp(0.56f * w.cloud_cov + 0.74f * precip, 0.0f, 1.0f));
     w.storm_int = std::clamp(std::max(precip, code >= 95 ? 0.80f : 0.0f), 0.0f, 1.0f);
@@ -108,6 +137,8 @@ bool RegionalAtmosphere::init(const PackReader *pack, bool create_gpu_tex, const
     live_lat_ = pack_->anchor_lat();
     live_lon_ = pack_->anchor_lon();
     live_elevation_m_ = pack_->sample_elevation(live_lat_, live_lon_);
+    last_model_history_sec_ = -1.0;
+    model_history_.clear();
     live_last_success_utc_.store(0, std::memory_order_release);
     live_overlay_applied_ = false;
 
@@ -191,6 +222,9 @@ void RegionalAtmosphere::shutdown() {
     live_enabled_ = false;
     live_available_.store(false, std::memory_order_release);
     live_last_success_utc_.store(0, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lk(live_mtx_);
+    }
     live_overlay_applied_ = false;
     if (field_tex_) { glDeleteTextures(1, &field_tex_); field_tex_ = 0; }
     if (terrain_field_tex_) { glDeleteTextures(1, &terrain_field_tex_); terrain_field_tex_ = 0; }
@@ -212,7 +246,7 @@ void RegionalAtmosphere::shutdown() {
 
 void RegionalAtmosphere::live_weather_worker() {
     while (!live_stop_.load(std::memory_order_acquire)) {
-        double lat, lon, elevation_m;
+        double lat = 0.0, lon = 0.0, elevation_m = 0.0;
         {
             std::unique_lock<std::mutex> lk(live_mtx_);
             if (live_stop_.load(std::memory_order_acquire)) break;
@@ -242,16 +276,17 @@ void RegionalAtmosphere::live_weather_worker() {
             int status = pclose(pipe);
             success = status == 0 && used > 32 && std::strstr(response.data(), "\"current\"");
             if (success) {
+                const int64_t refreshed = static_cast<int64_t>(std::time(nullptr));
                 WeatherSnapshot fresh = parse_live_weather(response.data(), elevation_m);
                 {
                     std::lock_guard<std::mutex> lk(live_mtx_);
                     live_target_ = std::move(fresh);
                 }
                 live_available_.store(true, std::memory_order_release);
-                live_last_success_utc_.store(static_cast<int64_t>(std::time(nullptr)), std::memory_order_release);
+                live_last_success_utc_.store(refreshed, std::memory_order_release);
                 std::printf("[WX] Open-Meteo current conditions refreshed for %.3f, %.3f\n", lat, lon);
             } else {
-                std::fprintf(stderr, "[WX] Open-Meteo fetch failed; retaining baked/default conditions.\n");
+                std::fprintf(stderr, "[WX] Open-Meteo fetch failed; retaining the last available weather.\n");
             }
         }
         std::unique_lock<std::mutex> lk(live_mtx_);
@@ -1374,6 +1409,15 @@ void RegionalAtmosphere::update_field(const Vec3 &sun_dir, double sim_time_sec, 
             upload_field();
             last_live_field_upload_ = sim_time_sec;
         }
+    }
+
+    if (model_history_.empty() || sim_time_sec - last_model_history_sec_ >= 30.0) {
+        const WeatherSnapshot &model = active_weather_;
+        model_history_.push_back({sim_time_sec, model.oat_sl_c, model.wind_dir_from_deg,
+                                  model.wind_speed_10m_mps, model.cloud_cov * 100.0f,
+                                  model.precip_mm_hr});
+        if (model_history_.size() > 48) model_history_.erase(model_history_.begin());
+        last_model_history_sec_ = sim_time_sec;
     }
 }
 

@@ -161,6 +161,7 @@ public:
         const int64_t last = live_last_success_utc_.load(std::memory_order_acquire);
         return last > 0 ? std::max<int64_t>(0, static_cast<int64_t>(std::time(nullptr)) - last) : -1;
     }
+    const std::vector<WeatherModelHistoryEntry> &model_history() const { return model_history_; }
     void set_manual_weather_override(bool enabled) {
         if (manual_weather_override_ != enabled) { manual_weather_override_ = enabled; dirty_ = true; }
     }
@@ -246,6 +247,8 @@ private:
     bool live_enabled_ = false;
     bool live_force_fetch_ = false;
     double live_lat_ = 42.1, live_lon_ = -0.3;
+    double last_model_history_sec_ = -1.0;
+    std::vector<WeatherModelHistoryEntry> model_history_;
     WeatherSnapshot live_target_{};
     WeatherSnapshot synoptic_weather_{}; // Baked/observed boundary conditions fed into the runtime solve
     WeatherSnapshot active_weather_{};

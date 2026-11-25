@@ -8,6 +8,7 @@
 #include "regional_atmosphere.hpp"
 
 #include <cstdint>
+#include <future>
 #include <optional>
 #include <string>
 #include <vector>
@@ -69,8 +70,14 @@ private:
     enum class Page { World, Logbook, Settings, Controls };
     enum class WalkStation { Nose = 0, LeftWing, RightWing, Gear, Tail, Door };
     struct RoutePoint { std::string label; double lat, lon; };
+    struct RegionMapPreview {
+        double center_lat = 0.0, center_lon = 0.0;
+        float zoom = 0.0f;
+        // RG: sampled elevation in metres and installed-region coverage mask.
+        std::vector<float> elevation_rg;
+    };
     void draw_world(AircraftAndHud &aircraft, const PlatformWindow &win,
-                    const RegionalAtmosphere *reg_atmo, const AtmosphereState *atmo, double sim_time_sec);
+                    RegionalAtmosphere *reg_atmo, const AtmosphereState *atmo, double sim_time_sec);
     void draw_logbook(AircraftAndHud &aircraft);
     void draw_settings(AircraftAndHud &aircraft, int &time_of_day, RegionalAtmosphere *reg_atmo);
     void draw_controls(AircraftAndHud &aircraft);
@@ -79,7 +86,6 @@ private:
     void add_point(RoutePoint point);
     float distance_to_plane() const;
     WalkStation nearest_walk_station(float &out_dist_m) const;
-    const AirportInfo *suggest_vfr_outing() const;
     PassportStamp *find_stamp(const std::string &id);
     const PassportStamp *find_stamp(const std::string &id) const;
 
@@ -89,10 +95,12 @@ private:
     void label(AircraftAndHud &ui, float x, float y, float size, const char *text, bool muted = false);
     void panel(AircraftAndHud &ui, PixelRect area);
     void draw_globe();
+    void update_region_map_preview();
 
     const PackReader *pack_ = nullptr;
-    GLuint backdrop_ = 0, land_ = 0, bounds_ = 0, vao_ = 0, font_ = 0, relief_ = 0;
-    GLint globe_uniform_ = -1, region_count_uniform_ = -1, aspect_uniform_ = -1, relief_bounds_uniform_ = -1;
+    GLuint backdrop_ = 0, land_ = 0, bounds_ = 0, vao_ = 0, font_ = 0, relief_ = 0, region_map_ = 0;
+    GLint globe_uniform_ = -1, region_count_uniform_ = -1, aspect_uniform_ = -1, relief_bounds_uniform_ = -1,
+          region_map_ready_uniform_ = -1;
     Vec4 relief_bounds_{};
     int region_count_ = 0;
     Page page_ = Page::World;
@@ -105,6 +113,10 @@ private:
     int airport_page_ = 0, route_page_ = 0, passport_page_ = 0;
     std::string parked_id_, selected_id_;
     std::vector<RoutePoint> route_;
+    int model_history_page_ = 0;
+    std::future<RegionMapPreview> region_map_future_;
+    RegionMapPreview region_map_preview_;
+    bool region_map_preview_dirty_ = true;
     size_t active_leg_ = 0;
     bool add_waypoint_ = false;
     bool walking_ = false, inspecting_ = false, flight_active_ = false;

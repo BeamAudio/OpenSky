@@ -35,6 +35,15 @@ struct WeatherSnapshot {
     std::string summary;
 };
 
+struct WeatherModelHistoryEntry {
+    double sim_time_sec = 0.0;
+    float temperature_c = 0.0f;
+    float wind_direction_from_deg = 0.0f;
+    float wind_speed_10m_mps = 0.0f;
+    float cloud_cover_pct = 0.0f;
+    float precipitation_mm_hr = 0.0f;
+};
+
 struct WeatherCell {
     float u = 0.0f, v = 0.0f, w = 0.0f, cloud = 0.0f, w_upper = 0.0f;
 };

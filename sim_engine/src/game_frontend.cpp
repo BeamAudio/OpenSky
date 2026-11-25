@@ -53,6 +53,12 @@ double bearing(double a_lat, double a_lon, double b_lat, double b_lon) {
         std::cos(a) * std::sin(b) - std::sin(a) * std::cos(b) * std::cos(d)) * RAD2DEG_D, 360.0);
 }
 
+const char *wind_cardinal(float degrees) {
+    static constexpr const char *directions[] = {"N", "NE", "E", "SE", "S", "SW", "W", "NW"};
+    const int index = static_cast<int>(std::lround(std::fmod(degrees + 360.0f, 360.0f) / 45.0f)) % 8;
+    return directions[index];
+}
+
 Vec3 globe_xyz(double lat_deg, double lon_deg) {
     const double lat = lat_deg * DEG2RAD_D, lon = lon_deg * DEG2RAD_D;
     return {float(std::cos(lat) * std::cos(lon)), float(std::cos(lat) * std::sin(lon)), float(std::sin(lat))};
@@ -88,11 +94,13 @@ std::filesystem::path profile_path() {
 } // namespace
 
 GameFrontend::~GameFrontend() {
+    if (region_map_future_.valid()) region_map_future_.wait();
     if (vao_) glDeleteVertexArrays(1, &vao_);
     if (bounds_) glDeleteBuffers(1, &bounds_);
     if (land_) glDeleteTextures(1, &land_);
     if (font_) glDeleteTextures(1, &font_);
     if (relief_) glDeleteTextures(1, &relief_);
+    if (region_map_) glDeleteTextures(1, &region_map_);
     if (backdrop_) glDeleteProgram(backdrop_);
 }
 
@@ -104,6 +112,7 @@ bool GameFrontend::init(const PackReader &pack, const std::string &shader_root, 
     globe_uniform_ = glGetUniformLocation(backdrop_, "u_globe");
     region_count_uniform_ = glGetUniformLocation(backdrop_, "u_region_count");
     aspect_uniform_ = glGetUniformLocation(backdrop_, "u_aspect");
+    region_map_ready_uniform_ = glGetUniformLocation(backdrop_, "u_region_map_ready");
     int tw, th, channels;
     unsigned char *pixels = stbi_load((asset_root + "/ui/globe_land.png").c_str(), &tw, &th, &channels, 1);
     if (!pixels) {
@@ -138,6 +147,12 @@ bool GameFrontend::init(const PackReader &pack, const std::string &shader_root, 
     glTextureParameteri(relief_, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTextureParameteri(relief_, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTextureParameteri(relief_, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glCreateTextures(GL_TEXTURE_2D, 1, &region_map_);
+    glTextureStorage2D(region_map_, 1, GL_RG32F, map_area.w, map_area.h);
+    glTextureParameteri(region_map_, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTextureParameteri(region_map_, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTextureParameteri(region_map_, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTextureParameteri(region_map_, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     relief_bounds_ = {float(pack.anchor_lon() + pack.corridor_min_e() / pack.anchor_m_lon()),
                       float(pack.anchor_lat() + pack.corridor_min_n() / pack.anchor_m_lat()),
                       float(pack.corridor_span_e() / pack.anchor_m_lon()),
@@ -311,26 +326,6 @@ const GameFrontend::PassportStamp *GameFrontend::find_stamp(const std::string &i
     return nullptr;
 }
 
-const AirportInfo *GameFrontend::suggest_vfr_outing() const {
-    const auto *parked = parked_airport();
-    if (!parked) return nullptr;
-    const AirportInfo *best = nullptr;
-    double best_score = -1e9;
-    const int day_seed = static_cast<int>(std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()) / 86400);
-    for (size_t i = 0; i < pack_->airports().size(); ++i) {
-        const auto &ap = pack_->airports()[i];
-        if (ap.id == parked->id) continue;
-        const double dist_nm = nspain::haversine_m(parked->lat, parked->lon, ap.lat, ap.lon) / nm_m;
-        if (dist_nm < 8.0 || dist_nm > 130.0) continue;
-        // Prefer unvisited airfields in a pleasant 15..85 NM VFR range, rotated daily
-        double score = find_stamp(ap.id) ? 0.0 : 40.0;
-        score -= std::abs(dist_nm - 42.0) * 0.45;
-        score += static_cast<double>((static_cast<int>(i) * 17 + day_seed * 13) % 19);
-        if (score > best_score) { best_score = score; best = &ap; }
-    }
-    return best;
-}
-
 GameFrontend::Request GameFrontend::take_request() {
     return std::exchange(request_, Request::None);
 }
@@ -340,6 +335,7 @@ void GameFrontend::focus_airport(const AirportInfo &airport, float zoom) {
     globe_lat_ = airport.lat;
     globe_lon_ = airport.lon;
     globe_zoom_ = zoom;
+    region_map_preview_dirty_ = true;
 }
 
 void GameFrontend::add_point(RoutePoint point) {
@@ -349,7 +345,7 @@ void GameFrontend::add_point(RoutePoint point) {
     }
     if (!route_.empty() && nspain::haversine_m(route_.back().lat, route_.back().lon, point.lat, point.lon) < 30) return;
     route_.push_back(std::move(point));
-    route_page_ = static_cast<int>((route_.size() - 1) / 5);
+    route_page_ = static_cast<int>((route_.size() - 1) / 2);
     status_.clear();
     save_profile();
 }
@@ -734,12 +730,81 @@ void GameFrontend::draw_globe() {
     glUniform1i(region_count_uniform_, region_count_);
     glUniform1f(aspect_uniform_, float(a.w) / a.h);
     glUniform3f(globe_uniform_, float(globe_lat_ * DEG2RAD_D), float(globe_lon_ * DEG2RAD_D), globe_radius * globe_zoom_);
+    const bool preview_matches = !region_map_preview_.elevation_rg.empty() &&
+        std::abs(region_map_preview_.center_lat - globe_lat_) < 1e-7 &&
+        std::abs(region_map_preview_.center_lon - globe_lon_) < 1e-7 &&
+        std::abs(region_map_preview_.zoom - globe_zoom_) < 1e-5f;
+    glUniform1i(region_map_ready_uniform_, preview_matches ? 1 : 0);
     glBindTextureUnit(0, land_);
     glBindTextureUnit(1, relief_);
+    glBindTextureUnit(2, region_map_);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, bounds_);
     glBindVertexArray(vao_);
     glDrawArrays(GL_TRIANGLES, 0, 3);
     glBindVertexArray(0);
+}
+
+void GameFrontend::update_region_map_preview() {
+    const bool has_regions = !pack_->regions().empty();
+    if (region_map_future_.valid() &&
+        region_map_future_.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+        try {
+            RegionMapPreview fresh = region_map_future_.get();
+            const bool same_target = has_regions &&
+                std::abs(fresh.center_lat - globe_lat_) < 1e-7 &&
+                std::abs(fresh.center_lon - globe_lon_) < 1e-7 &&
+                std::abs(fresh.zoom - globe_zoom_) < 1e-5f;
+            if (same_target && fresh.elevation_rg.size() == static_cast<size_t>(map_area.w * map_area.h * 2)) {
+                glTextureSubImage2D(region_map_, 0, 0, 0, map_area.w, map_area.h,
+                                    GL_RG, GL_FLOAT, fresh.elevation_rg.data());
+                region_map_preview_ = std::move(fresh);
+                region_map_preview_dirty_ = false;
+            } else {
+                region_map_preview_dirty_ = true;
+            }
+        } catch (const std::exception &e) {
+            std::fprintf(stderr, "[WORLD] Regional map preview failed: %s\n", e.what());
+            region_map_preview_dirty_ = false;
+        }
+    }
+    if (!has_regions || region_map_future_.valid() || !region_map_preview_dirty_) return;
+
+    const PackReader *pack = pack_;
+    const double center_lat = globe_lat_, center_lon = globe_lon_;
+    const float zoom = globe_zoom_;
+    region_map_preview_dirty_ = false;
+    region_map_future_ = std::async(std::launch::async,
+        [pack, center_lat, center_lon, zoom]() {
+            RegionMapPreview result;
+            result.center_lat = center_lat;
+            result.center_lon = center_lon;
+            result.zoom = zoom;
+            result.elevation_rg.assign(static_cast<size_t>(map_area.w * map_area.h * 2), 0.0f);
+            const double center_lat_r = center_lat * DEG2RAD_D;
+            const double center_lon_r = center_lon * DEG2RAD_D;
+            const double aspect = static_cast<double>(map_area.w) / map_area.h;
+            const double radius = globe_radius * zoom;
+            const double sl = std::sin(center_lat_r), cl = std::cos(center_lat_r);
+            for (int y = 0; y < map_area.h; ++y) {
+                const double py = ((y + 0.5) / map_area.h - 0.5) / radius;
+                for (int x = 0; x < map_area.w; ++x) {
+                    const double px = ((x + 0.5) / map_area.w - 0.5) * aspect / radius;
+                    const double r2 = px * px + py * py;
+                    if (r2 > 1.0) continue;
+                    const double z = std::sqrt(std::max(0.0, 1.0 - r2));
+                    const double lat = std::asin(std::clamp(py * cl + z * sl, -1.0, 1.0)) * RAD2DEG_D;
+                    const double lon = std::remainder(center_lon_r + std::atan2(px, z * cl - py * sl),
+                                                      2.0 * PI_D) * RAD2DEG_D;
+                    // Use high-resolution elevation data across every installed
+                    // region so the menu keeps one shaded-relief map style.
+                    if (!pack->find_region_at(lat, lon)) continue;
+                    const size_t offset = (static_cast<size_t>(y) * map_area.w + x) * 2;
+                    result.elevation_rg[offset] = static_cast<float>(pack->sample_elevation(lat, lon));
+                    result.elevation_rg[offset + 1] = 1.0f;
+                }
+            }
+            return result;
+        });
 }
 
 void GameFrontend::draw_menu(AircraftAndHud &aircraft, SkyAndClouds &sky, const PlatformWindow &win,
@@ -784,9 +849,9 @@ void GameFrontend::draw_menu(AircraftAndHud &aircraft, SkyAndClouds &sky, const 
 }
 
 void GameFrontend::draw_world(AircraftAndHud &ui, const PlatformWindow &win,
-                              const RegionalAtmosphere *reg_atmo, const AtmosphereState *atmo, double sim_time_sec) {
+                              RegionalAtmosphere *reg_atmo, const AtmosphereState *atmo, double sim_time_sec) {
     label(ui, 64, 111, 44, "World");
-    label(ui, 66, 166, 21, "Inspect your Skyhawk, check live regional winds, and plan a VFR leg.", true);
+    label(ui, 66, 166, 21, "Explore airfields, local weather, and routes across the region.", true);
     char line[192];
     std::snprintf(line, sizeof(line), "%zu installed region%s  |  Passport %zu / %zu airfields",
                   pack_->regions().size(), pack_->regions().size() == 1 ? "" : "s",
@@ -794,18 +859,28 @@ void GameFrontend::draw_world(AircraftAndHud &ui, const PlatformWindow &win,
     label(ui, 790, 168, 18, line, true);
 
     const auto *parked = parked_airport();
-    if (button(ui, {64, 986, 149, 47}, "Globe view")) globe_zoom_ = 1.0f;
+    if (button(ui, {64, 986, 149, 47}, "Globe view")) {
+        globe_zoom_ = 1.0f;
+        region_map_preview_dirty_ = true;
+    }
     if (button(ui, {225, 986, 194, 47}, "Find aircraft", parked)) {
         focus_airport(*parked, 90.0f);
         airport_page_ = 0;
     }
-    if (button(ui, {431, 986, 62, 47}, "-")) globe_zoom_ = std::max(1.0f, globe_zoom_ / 1.8f);
-    if (button(ui, {505, 986, 62, 47}, "+")) globe_zoom_ = std::min(180.0f, globe_zoom_ * 1.8f);
+    if (button(ui, {431, 986, 62, 47}, "-")) {
+        globe_zoom_ = std::max(1.0f, globe_zoom_ / 1.8f);
+        region_map_preview_dirty_ = true;
+    }
+    if (button(ui, {505, 986, 62, 47}, "+")) {
+        globe_zoom_ = std::min(180.0f, globe_zoom_ * 1.8f);
+        region_map_preview_dirty_ = true;
+    }
     if (button(ui, {579, 986, 235, 47}, add_waypoint_ ? "Cancel map point" : "Add map point", !flight_active_, add_waypoint_))
         add_waypoint_ = !add_waypoint_;
     label(ui, 837, 1000, 16, add_waypoint_ ? "Click inside installed terrain" : "Drag to move the globe", true);
     if (win.key_pressed(KEY_ESC)) add_waypoint_ = false;
 
+    const bool was_map_dragging = map_dragging_;
     if (!win.mouse_left_down()) map_dragging_ = false;
     if (map_dragging_ && !win.mouse_left_clicked()) {
         const double scale = .19 / globe_zoom_;
@@ -813,8 +888,10 @@ void GameFrontend::draw_world(AircraftAndHud &ui, const PlatformWindow &win,
         const double lon_scale = scale / std::max(.21, std::cos(globe_lat_ * DEG2RAD_D));
         globe_lon_ = std::remainder(globe_lon_ - win.mouse_dx() * lon_scale, 360.0);
     }
+    if (was_map_dragging && !win.mouse_left_down()) region_map_preview_dirty_ = true;
 
     GlobeProjection projection(globe_lat_, globe_lon_, globe_zoom_);
+    update_region_map_preview();
     draw_globe();
     ui.hud_border(map_area.x, map_area.y, map_area.w, map_area.h, 1, .29f, .42f, .50f, .8f);
 
@@ -865,7 +942,7 @@ void GameFrontend::draw_world(AircraftAndHud &ui, const PlatformWindow &win,
         const float distance = std::hypot(p->x - pointer_.x, p->y - pointer_.y);
         if (distance < closest) { closest = distance; hit = &ap; }
     }
-    if (click_ && contains(map_area)) {
+    if (click_ && contains(map_area) && !inside({82, 916, 690, 42}, pointer_)) {
         if (add_waypoint_ && !flight_active_) {
             if (auto p = projection.unproject(pointer_)) {
                 const auto [lat,lon] = globe_geo(*p);
@@ -877,10 +954,23 @@ void GameFrontend::draw_world(AircraftAndHud &ui, const PlatformWindow &win,
             }
         } else if (hit) {
             selected_id_ = hit->id;
+            region_map_preview_dirty_ = true;
             if (globe_zoom_ < 8) focus_airport(*hit, 75.0f);
         } else map_dragging_ = true;
         click_ = false;
     }
+
+    // Map key: make the aircraft, visited airfields, open airfields, and route easy to distinguish.
+    ui.hud_rect(82, 916, 690, 42, .025f, .048f, .068f, .91f);
+    ui.hud_border(82, 916, 690, 42, 1, .20f, .31f, .38f, .80f);
+    const auto legend_item = [&](float x, float r, float g, float b, const char *text) {
+        ui.hud_rect(x, 930, 12, 12, r, g, b, 1.0f);
+        label(ui, x + 20, 930, 14, text, true);
+    };
+    legend_item(98, .96f, .68f, .57f, "YOUR CESSNA");
+    legend_item(260, .32f, .92f, .42f, "VISITED");
+    legend_item(383, .40f, .82f, .57f, "AIRFIELD");
+    legend_item(525, .98f, .70f, .33f, "PLANNED ROUTE");
 
     // Top-right: Parked Aircraft Ownership Card
     panel(ui, {1292,225,564,218});
@@ -923,78 +1013,104 @@ void GameFrontend::draw_world(AircraftAndHud &ui, const PlatformWindow &win,
     }
     const auto *selected = pack_->find_airport(selected_id_);
     if (selected) {
+        label(ui, 1318, 648, 13, "IN-GAME MODEL NOW - " , true);
+        label(ui, 1495, 648, 13, selected->id.c_str(), true);
         const double len_m = std::max(100.0, nspain::haversine_m(selected->rwy_lat_a, selected->rwy_lon_a,
                                                                 selected->rwy_lat_b, selected->rwy_lon_b));
         const char *srf = selected->surface.empty() ? "strip" : selected->surface.c_str();
         if (reg_atmo && atmo) {
-            const float wx_est = std::clamp((atmo->cloud_cov - 0.16f) / 0.78f, 0.0f, 1.0f);
-            const LocalAirSample wx = reg_atmo->sample_at(selected->lat, selected->lon, selected->elev_m + 10.0,
-                                                          atmo->sun_dir, sim_time_sec, wx_est);
-            const double w_kt = std::hypot(wx.wind_east_mps, wx.wind_north_mps) * 1.94384;
-            const int w_from = int(std::lround(std::fmod(std::atan2(-wx.wind_east_mps, -wx.wind_north_mps) * RAD2DEG_D + 360.0, 360.0))) % 360;
-            std::snprintf(line, sizeof(line), "%s %.0fm | %03d/%.0fkt | %.0fC | QNH %.0f | %s",
-                          srf, len_m, w_from, w_kt, wx.oat_c, wx.qnh_hpa,
-                          is_full_service_airport(selected->id) ? "Hangar" : "Field kit");
+            const Vec4 bounds = reg_atmo->domain_bounds();
+            const double east_m = (selected->lon - pack_->anchor_lon()) * pack_->anchor_m_lon();
+            const double north_m = (selected->lat - pack_->anchor_lat()) * pack_->anchor_m_lat();
+            const double u = (east_m - bounds.x) * bounds.z;
+            const double v = (north_m - bounds.y) * bounds.w;
+            if (u >= 0.0 && u <= 1.0 && v >= 0.0 && v <= 1.0) {
+                const float wx_est = std::clamp((atmo->cloud_cov - 0.16f) / 0.78f, 0.0f, 1.0f);
+                const LocalAirSample wx = reg_atmo->sample_at(selected->lat, selected->lon, selected->elev_m + 10.0,
+                                                              atmo->sun_dir, sim_time_sec, wx_est);
+                const double w_kt = std::hypot(wx.wind_east_mps, wx.wind_north_mps) * 1.94384;
+                const int w_from = int(std::lround(std::fmod(std::atan2(-wx.wind_east_mps, -wx.wind_north_mps) * RAD2DEG_D + 360.0, 360.0))) % 360;
+                std::snprintf(line, sizeof(line), "%s %.0fm | W %03d/%.0fkt | T %.0fC | QNH %.0f | C %.0f%% | R %.1fmm/h",
+                              srf, len_m, w_from, w_kt, wx.oat_c, wx.qnh_hpa,
+                              wx.local_cloud_frac * 100.0f, wx.precipitation_mm_hr);
+            } else {
+                std::snprintf(line, sizeof(line), "Airfield is outside the active regional model grid.");
+            }
         } else {
             std::snprintf(line, sizeof(line), "Surface: %s  %.0fm  |  Elev %.0fm  |  %s",
                           srf, len_m, selected->elev_m,
                           is_full_service_airport(selected->id) ? "Full hangar" : "Remote strip");
         }
-        label(ui, 1318, 656, 15, line, true);
+        label(ui, 1318, 670, 15, line, true);
     }
-    if (button(ui, {1318, 692, 512, 38}, "Add selected airfield to route",
+    if (button(ui, {1318, 704, 512, 38}, "Add selected airfield to route",
                parked && selected && !flight_active_ && (selected != parked || !route_.empty())))
         add_point({selected->id, selected->lat, selected->lon});
 
-    // Bottom-right: VFR Route + Today's VFR Outing
+    // Bottom-right: actual regional model history and an editable route.
     panel(ui, {1292,763,564,270});
+    const auto *history = reg_atmo ? &reg_atmo->model_history() : nullptr;
+    const size_t history_count = history ? history->size() : 0;
+    const int history_pages = std::max(1, static_cast<int>((history_count + 3) / 4));
+    model_history_page_ = std::clamp(model_history_page_, 0, history_pages - 1);
+    label(ui, 1318, 778, 19, "REGIONAL MODEL HISTORY");
+    const char *input_label = reg_atmo && reg_atmo->live_weather_available()
+        ? "OPEN-METEO CURRENT" : "BAKED CLIMATE";
+    label(ui, 1580, 781, 13, input_label, true);
+    if (button(ui, {1738,770,40,30}, "<", model_history_page_ > 0)) --model_history_page_;
+    if (button(ui, {1790,770,40,30}, ">", model_history_page_ + 1 < history_pages)) ++model_history_page_;
+    if (history_count == 0) {
+        label(ui, 1318, 827, 15, "Model history appears as the in-game weather solver advances.", true);
+    } else {
+        for (int card = 0; card < 4; ++card) {
+            const size_t back = static_cast<size_t>(model_history_page_ * 4 + card);
+            if (back >= history_count) break;
+            const auto &entry = (*history)[history_count - 1 - back];
+            const float x = 1318.0f + card * 128.0f;
+            ui.hud_rect(x, 805, 120, 88, .065f, .105f, .133f, 1.0f);
+            ui.hud_border(x, 805, 120, 88, 1, .20f, .31f, .38f, .78f);
+            const double age_min = std::max(0.0, (sim_time_sec - entry.sim_time_sec) / 60.0);
+            if (age_min < 0.25) std::snprintf(line, sizeof(line), "NOW");
+            else std::snprintf(line, sizeof(line), "T-%.0fm", age_min);
+            label(ui, x + 8, 811, 14, line, true);
+            std::snprintf(line, sizeof(line), "CLOUD %.0f%%", entry.cloud_cover_pct);
+            label(ui, x + 8, 829, 12, line, true);
+            std::snprintf(line, sizeof(line), "%.0f C", entry.temperature_c);
+            label(ui, x + 8, 845, 17, line);
+            std::snprintf(line, sizeof(line), "%s %.0fkt", wind_cardinal(entry.wind_direction_from_deg),
+                          entry.wind_speed_10m_mps * 1.94384f);
+            label(ui, x + 8, 860, 12, line, true);
+            std::snprintf(line, sizeof(line), "RAIN %.1fmm/h", entry.precipitation_mm_hr);
+            label(ui, x + 8, 874, 12, line, true);
+        }
+    }
+    ui.hud_rect(1318, 895, 512, 1, .20f, .31f, .38f, .78f);
     double total = 0;
     if (parked) {
         double a = parked->lat, b = parked->lon;
         for (const auto &p : route_) { total += nspain::haversine_m(a,b,p.lat,p.lon); a=p.lat; b=p.lon; }
     }
-    std::snprintf(line, sizeof(line), "VFR route     %.1f NM", total / nm_m);
-    label(ui, 1318, 779, 21, line);
-    if (button(ui, {1738,770,40,30}, "<", route_page_ > 0)) --route_page_;
-    if (button(ui, {1790,770,40,30}, ">", (route_page_+1)*4 < int(route_.size()))) ++route_page_;
-    const AirportInfo *outing = suggest_vfr_outing();
-    if (route_.empty()) {
-        if (outing && parked) {
-            const double dist_nm = nspain::haversine_m(parked->lat, parked->lon, outing->lat, outing->lon) / nm_m;
-            const int brg = int(std::lround(bearing(parked->lat, parked->lon, outing->lat, outing->lon))) % 360;
-            label(ui, 1318, 820, 17, "Today's VFR outing:");
-            std::snprintf(line, sizeof(line), "%s (%s) - %.0f NM (%03d T)",
-                          outing->name.c_str(), outing->id.c_str(), dist_nm, brg);
-            label(ui, 1318, 850, 16, line, true);
-            std::snprintf(line, sizeof(line), "Elev %.0fm | %s%s",
-                          outing->elev_m, outing->surface.empty() ? "strip" : outing->surface.c_str(),
-                          find_stamp(outing->id) ? " (visited)" : " (new passport stamp!)");
-            label(ui, 1318, 878, 15, line, true);
-        } else {
-            label(ui, 1318, 828, 18, "Add an airfield or a visual waypoint.", true);
-        }
-    }
-    for (int i = 0; i < 4 && size_t(route_page_*4+i) < route_.size(); ++i) {
-        const int index = route_page_*4+i;
+    std::snprintf(line, sizeof(line), "ROUTE  %.1f NM", total / nm_m);
+    label(ui, 1318, 901, 18, line);
+    if (button(ui, {1738,898,40,28}, "<", route_page_ > 0)) --route_page_;
+    if (button(ui, {1790,898,40,28}, ">", (route_page_+1)*2 < int(route_.size()))) ++route_page_;
+    if (route_.empty()) label(ui, 1318, 940, 15, "Add an airfield or a visual waypoint to plan a route.", true);
+    for (int i = 0; i < 2 && size_t(route_page_*2+i) < route_.size(); ++i) {
+        const int index = route_page_*2+i;
         const auto &p = route_[index];
         std::snprintf(line, sizeof(line), "%02d   %s    %+.3f  %+.3f", index+1, p.label.c_str(), p.lat, p.lon);
-        label(ui, 1320, 818+i*32, 16, line);
-        if (button(ui, {1784, 812+i*32, 46, 27}, "X", !flight_active_)) {
+        label(ui, 1320, 934+i*28, 15, line);
+        if (button(ui, {1784, 928+i*28, 46, 25}, "X", !flight_active_)) {
             route_.erase(route_.begin()+index);
-            route_page_ = std::min(route_page_, route_.empty() ? 0 : int((route_.size()-1)/4));
+            route_page_ = std::min(route_page_, route_.empty() ? 0 : int((route_.size()-1)/2));
             save_profile();
             break;
         }
     }
-    if (button(ui, {1318, 978, 150, 36}, "Clear route", !route_.empty() && !flight_active_)) {
+    if (button(ui, {1318, 985, 150, 36}, "Clear route", !route_.empty() && !flight_active_)) {
         route_.clear();
         route_page_ = 0;
         save_profile();
-    }
-    if (outing && button(ui, {1484, 978, 346, 36}, "Load today's VFR outing", !flight_active_)) {
-        route_.clear();
-        add_point({outing->id, outing->lat, outing->lon});
-        focus_airport(*outing, 55.0f);
     }
     if (!status_.empty()) label(ui, 67, 200, 16, status_.c_str());
 }

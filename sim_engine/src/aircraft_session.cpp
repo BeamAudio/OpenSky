@@ -230,8 +230,6 @@ std::string AircraftSession::begin_walkaround(const AirportInfo &ap, const Local
         save_profile();
     } else if (parked_weather) {
         const double wind_kt = std::hypot(parked_weather->wind_east_mps, parked_weather->wind_north_mps) * 1.94384;
-        if (parked_weather->precipitation_mm_hr > 0.5 && profile_.care_.sump_water < 0.25)
-            profile_.care_.sump_water = std::min(1.0, profile_.care_.sump_water + 0.20);
         if (parked_weather->oat_c < 6.0)
             notice = "Cold air outside - prime engine and warm oil before full power.";
         else if (wind_kt > 16.0 && !profile_.care_.tie_downs_on)

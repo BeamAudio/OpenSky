@@ -1,160 +1,111 @@
-# OpenSky VFR Simulator
+# OpenSky VFR
 
-OpenSky is an iGPU-first VFR simulator project built around a native **C++20 / OpenGL 4.6** renderer. The first curated flight region is the Pyrenees in Aragón, with a Cessna 172S and an **OpenSky World Editor** in the source checkout. The current runnable target is Linux with X11/GLX; Windows packaging and measured 1080p High support remain release milestones.
+OpenSky is an open-source, free-roam VFR flying sandbox. Take a Cessna 172S from Castejón de Sos (`ES-0205`), explore the Pyrenees and nearby regions, and make each new airfield your temporary base by landing and parking there.
 
-The product target is 1920×1080 output at 60 FPS on integrated graphics, with the renderer allowed a bounded internal reconstruction scale. The documented Renoir baseline is below that target in several High scenarios. See the dated [engine audit](docs/2026-11-23_opensky-engine-audit.md) and [flight/weather audit](docs/2026-11-23_flight-weather-audit.md) for measurements and known gaps.
+The game is built around unhurried exploration rather than missions or ownership progression. The World map is for browsing and planning: selecting an airport or drawing a route never relocates the aircraft. A successful parking action saves the new base. The save keeps the aircraft's location, heading, condition, fuel and logbook; leaving before parking keeps the previous base.
 
-## Install and launch the game
+## Project status
 
-The Debian/Ubuntu release is packaged as `opensky-vfr_<version>_amd64.deb` (the app and Aragón) plus `opensky-vfr-catalonia_<version>_all.deb` (Catalonia Coast and Pyrenees). Install both with the graphical Software app, or run `sudo apt install ./opensky-vfr_<version>_amd64.deb ./opensky-vfr-catalonia_<version>_all.deb`, then launch **OpenSky VFR** from the Games menu. Players do not compile the source or start the game from a script. The package recipe is in `tools/package_deb.py`; these downloads are not published yet because the asset and data rights listed in [release readiness](docs/RELEASE_READINESS.md) still need to be cleared. Windows 11 is not supported yet.
+- **Supported development runtime:** C++20, OpenGL 4.6, Linux/X11/GLX.
+- **Aircraft simulation:** upstream JSBSim, dynamically linked under LGPL; the game advances it at 120 Hz independently of rendering.
+- **Release scenery baseline:** Aragón and Catalunya belong together in the complete release. Neither region is intended to be an optional paid or separate gameplay tier.
+- **Windows 11:** a supported build and installer are not available yet.
+- **Commercial release:** not published. Asset and data redistribution rights still need to clear the gates in [release readiness](docs/RELEASE_READINESS.md).
 
-Add-on regions can be installed in `~/.local/share/opensky-vfr/packs/`. Saves and aircraft packages stay in the user's config folder; downloaded imagery stays in the user's cache folder.
+## Getting started
 
----
+Players should eventually install a complete desktop release. Until that release is published, contributors can build the Linux development version from source:
+
+```bash
+make -C sim_engine -j"$(nproc)"
+./run_sim.sh
+```
+
+The build needs a C++20 compiler, CMake, OpenGL development files, X11 development files, and the system dependencies listed in [contributing](CONTRIBUTING.md). Run from the repository root. The source checkout does not contain generated scenery packs; region data is built or installed separately.
+
+On a new save the aircraft is based at Castejón de Sos. Open **World** to explore installed airports and landmarks. Select an airfield or landmark and add route points if you want a plan. Choose **Walk to aircraft** to inspect and board at the saved stand. After landing, taxi clear of the runway, shut down, and use **Esc → Park** to save a temporary base.
+
+A first-flight guide introduces these steps. During flight the interface overlays are hidden by default; turn them back on in **Settings → In-flight overlays**, or press `T` to show the controls guide. Display mode can be set to windowed, fullscreen, or fullscreen windowed in Settings and takes effect after restarting.
 
 ## Architecture
-- `protocol/` — Shared `.nspack` binary pack specification ([pack_format.h](protocol/pack_format.h) / [pack_format.py](protocol/pack_format.py)).
-- `builder/` — Offline regional pack baker ([build_region.py](builder/build_region.py)) ingesting **IGN Spain PNOA**, **IGN MDT05/MDT25**, **OurAirports**, and **OpenStreetMap**. The World Editor also accepts user-licensed XYZ imagery and Terrarium elevation tiles outside Spain, or builds explicit elevation-only regions.
-- `sim_engine/` — C++20/OpenGL renderer with CDLOD terrain, instanced and baked city meshes, vegetation shading, reduced-resolution volumetric clouds, baked solar and night lighting, and reverse-Z terrain depth.
-- `engine/` — WGS84 geometry, light-piston aircraft systems, OpenTrack UDP and the adapter to upstream JSBSim. Aircraft packages keep project aircraft data separate from the LGPL library.
-- `game/` — Runtime textures, GLB models, the factory aircraft package, and native libraries.
-- [Engine audit](docs/2026-11-23_opensky-engine-audit.md) and [flight/weather audit](docs/2026-11-23_flight-weather-audit.md) — Dated performance and implementation evidence.
 
----
-
-## Build from source (developers)
-
-These steps are for contributors building the source checkout. Players use the installable app package described above when a release is published.
-
-### 1. Bake a regional pack (Zaragoza LEZG – Huesca LEHC – Pyrenees corridor)
-```bash
-python3 builder/build_region.py --preset zaragoza-pyrenees-quick
-python3 builder/test_pack.py packs/es_aragon_pyrenees.nspack
-```
-For higher detail (`z15–z16` insets, full cruise `z10–z13`):
-```bash
-python3 builder/build_region.py --preset zaragoza-pyrenees
+```mermaid
+flowchart LR
+    Builder[Builder and World Editor] --> Protocol[Pack protocols]
+    Protocol --> Packs[Regional scenery and weather packs]
+    Packs --> Reader[PackReader and immutable WorldFrame]
+    Reader --> Streamer[Async terrain streamer]
+    Streamer --> Renderer[OpenGL terrain and world renderer]
+    Main[Simulation loop] --> Clock[120 Hz simulation clock]
+    Clock --> Aircraft[AircraftAndHud and piston systems]
+    Aircraft --> JSBSim[JSBSim flight dynamics]
+    Weather[WeatherLibrary and Open-Meteo inputs] --> Model[RegionalAtmosphere worker]
+    Model --> Snapshot[Published weather snapshots]
+    Snapshot --> Aircraft
+    Snapshot --> Renderer
+    Session[AircraftSession and fleet profile] --> Aircraft
+    Frontend[GameFrontend] --> Session
+    Main --> Frontend
 ```
 
-### 2. Build the native C++20 renderer
-```bash
-cd sim_engine && make -j"$(nproc)"
-```
-The build creates upstream JSBSim as a separate LGPL shared library in
-`game/bin/libJSBSim.so.1` and links the simulator to it dynamically. A clean
-build needs CMake 3.18 or newer. `CMAKE=/path/to/cmake` selects a non-default
-installation.
+`sim_engine/` owns the player executable, world rendering, asset streaming, interface and runtime coordination. `engine/` contains the JSBSim adapter, aircraft systems and geodesy. `builder/` turns licensed source data into installable scenery and weather packs. `protocol/` defines the pack formats shared by the C++ reader and Python builder. The architecture and thread boundaries are described in [architecture](docs/ARCHITECTURE.md); responsibilities for each runtime system are in [systems](docs/SYSTEMS.md).
 
-### 3. Run the simulator
-```bash
-./run_sim.sh --online-ortho pnoa
-```
-Flights and visual QA start with online-first IGN PNOA imagery, distance-tiered
-(Z20 within 200 m, Z19 within 500 m, down to Z14 at 20 km). A cached online tile
-replaces the matching pack imagery; the installed imagery remains visible while
-downloads complete and remains the fallback offline. Downloads are asynchronous
-and the decoded tile cache is bounded. `O` toggles online imagery. Use
-`--online-ortho off` to force installed imagery for an offline comparison. The
-four-season review is `./run_sim.sh --season-qa /tmp/opensky-seasons`; a single
-season can be selected with `--season winter|spring|summer|autumn`.
+## The game engine
 
-Run `./run_sim.sh --selftest` for the headless verification suite and
-`make -C sim_engine flight-test` for JSBSim trim, controls, terrain contacts,
-and braking checks. For GPU screenshots run
-`./run_sim.sh -- --autotest /tmp/opensky-visual-qa --online-ortho pnoa`.
-`./run_sim.sh -- --quick-profile /tmp/opensky-profile` captures two short High routes
-with startup, frame, GPU and resource traces. Use `--profile <dir>` to record while flying.
-See the [engine audit](docs/2026-11-23_opensky-engine-audit.md) for the compression comparison
-and verification cases.
-See the [current flight and weather audit](docs/2026-11-23_flight-weather-audit.md)
-for the JSBSim wiring, Earth curvature review, weather limitations and next gates.
+The renderer streams nearby terrain pages around the aircraft and reuses them as the player moves. A bounded worker pool reads and prepares pages; GPU uploads are budgeted across frames. The terrain uses CDLOD, array textures, mipmapped imagery, baked relief, weather-aware lighting and distance-based detail. The cockpit is rendered at the output resolution while the exterior scene follows the selected quality tier.
 
-### Runtime verification
+The main loop polls controls, advances simulation time in fixed 1/120-second steps, updates weather and aircraft state, then renders. A render call does not itself move the aircraft forward in simulation time. Region transitions pass through the central world-frame path so delayed terrain and weather jobs cannot publish results for an obsolete region.
 
-Run `./run_sim.sh --runtime-check --online-ortho off` with Aragón and Catalonia
-installed. `--runtime-check-gpu` runs the same replay with GPU weather uploads and
-checks stale terrain jobs. `--outlook-check` also waits for all three forecast leads.
-These checks use their own temporary aircraft profile. Capture the World menu
-with `./run_sim.sh --world-qa /tmp/world.png --airport ES-0098 --online-ortho off`.
+See [system descriptions](docs/SYSTEMS.md) for aircraft ownership, terrain streaming, rendering, audio, traffic, saves and QA tools. The maintained source file map is in [file reference](docs/FILE_REFERENCE.md).
 
-### Start a flight
+## Weather system
 
-Open **World** to find the C172S at its home airport, Castejón de Sos, on a new save. Select an installed
-airfield and add it to your route, or use **Add map point** for a visual
-waypoint. The route appears on the globe and gives a true bearing and distance
-to the active waypoint in flight.
+Weather displayed as current or historical comes from a published in-game model snapshot. When live input is available, Open-Meteo supplies boundary conditions; the local model then evolves wind, cloud, turbulence and precipitation through four terrain-following vertical layers. The World screen identifies the input source and shows when an airport lies outside model coverage. Outlook runs project the current model at +1, +3 and +5 simulation minutes under fixed inputs.
 
-Choose **Enter airport on foot**, then use `WASD` to walk and drag either mouse
-button or use the arrow keys to look around. Press `E` near the aircraft to refuel, repair, or
-board it. **Board at parking** starts from the parking spot. Taxi to the runway for departure. After landing, stop
-near an installed airfield and choose **Park and step outside** from the pause
-menu. That airfield becomes your temporary base, and the next session resumes
-from there. Castejón de Sos remains home. The aircraft's parked location, fuel,
-condition, engine hours, and route are saved locally. The World menu shows
-the regional weather model's current conditions and recent history. **Outlook**
-runs a separate projection at +1, +3, and +5 simulation minutes using the
-current model inputs.
+The current CPU solver uses a 384 × 288 × 4 grid. In the default corridor this is roughly 400 m per horizontal cell; the smaller visual flow marks do not imply metre-scale atmospheric physics. Resolution limits, snapshot publication and data provenance are covered in [weather system](docs/WEATHER.md).
 
-### World Editor
+## Make and install mods
 
-New packs include a shaded elevation image for the World menu. Bake images for
-already installed packs with `python3 builder/bake_map_relief.py packs/*.nspack`.
-The images are loaded at startup and travel with their packs.
+Aircraft are distributed as self-contained folders with a manifest, JSBSim flight data and exterior/cockpit GLB models. The current package format has a shared single-piston systems profile. It does not execute aircraft scripts yet, so a model and scripts alone are not currently a complete aircraft mod. Region mods are `.nspack` files with optional relief, city, scenery and weather companions.
 
-Start it with `./run_builder.sh`. Choose a Northern Spain preset or draw custom bounds. For global regions, choose `local-xyz` and an imagery directory in `<root>/<z>/<x>/<y>.jpg|png|webp` layout, or choose `none` for terrain-only presentation. Elevation can use Terrarium XYZ PNG tiles in the same directory layout. Imported layers require an attribution string; the pack manifest records it. Custom region IDs derive from all four bounds so separate areas do not collide.
+- [Aircraft package format and first package](docs/MODDING.md#aircraft-packages)
+- [Building a region pack](docs/MODDING.md#regional-content)
+- [Current format limits and the planned script API](docs/MODDING.md#current-limits)
 
-For OSM roads and baked settlements outside the bundled Spain extracts, provide a local `.pbf` extract. Spanish region builds bake IGN LiDAR canopy across the full selected region at Z15 by default and derive coarser levels for distance. OSM taxiways and apron polygons are drawn with the airport runway surfaces in every region. In flight, canopy heights share the fixed terrain page cache with the orthophoto and ground elevation.
+OpenSky is based in Spain, with Aragón and Catalunya together in the baseline release. The World Editor lets users build and install additional licensed regions anywhere in the world. Compatible regions do not change the game's ownership rules. Generated packs, caches and temporary bakes belong outside tracked source.
 
-### Aircraft packages and source mods
+## Project guides
 
-List installed aircraft with `./run_sim.sh --list-aircraft`. Install a package folder in `game/aircraft/<id>/` or `~/.config/opensky-vfr/aircraft/<id>/`, then select it with `./run_sim.sh --aircraft <id>`. An interactive selection is saved in the fleet profile. Format 1 packages include an `aircraft.ini`, JSBSim aircraft/engine data, and exterior/cockpit GLB models. The current systems profile supports one piston engine and two tanks; Lua aircraft scripts and multi-engine/jet systems are future work.
+| Guide | What it covers |
+|---|---|
+| [Architecture](docs/ARCHITECTURE.md) | Runtime layers, data flow, ownership and thread boundaries |
+| [Systems](docs/SYSTEMS.md) | What each game subsystem does and where to change it |
+| [Weather system](docs/WEATHER.md) | Inputs, solver, snapshots, rendering, limitations and attribution |
+| [Modding](docs/MODDING.md) | Aircraft packages, region packs, installation and current limits |
+| [File reference](docs/FILE_REFERENCE.md) | Maintained source, shader, tool, protocol and asset responsibilities |
+| [Contributing](CONTRIBUTING.md) | Build workflow, code rules and verification commands |
+| [Release readiness](docs/RELEASE_READINESS.md) | Distribution gates, platform status and asset-rights checks |
 
-See [docs/MODDING.md](docs/MODDING.md) for the package format, model node mappings, region content workflow, and current limits. See [CONTRIBUTING.md](CONTRIBUTING.md) for code contribution rules and [docs/RELEASE_READINESS.md](docs/RELEASE_READINESS.md) for commercial release blockers.
+## Controls
 
-### Controls
 | Input | Action |
 |---|---|
-| `W` / `S` | Throttle up / down |
-| `A` / `D` | Roll / bank |
+| `W` / `S` | Increase / reduce throttle |
+| `A` / `D` | Roll left / right |
 | `↑` / `↓` | Pitch down / up |
 | `Q` / `E` | Rudder left / right |
-| Right-drag mouse | Look around in all camera views (`R` centers view and mouse yoke) |
-| Left-drag mouse | Look around when mouse yoke is off |
-| `Y` | Toggle mouse yoke (off by default); move the mouse to steer and hold the deflection |
-| `R` | Center the mouse yoke and cockpit view |
-| `C` | Cycle camera: Cockpit → Chase → Free Cam |
-| `Page Up` / `Page Down` | Raise / lower the cockpit seat |
-| `Home` / `End` | Move the cockpit seat forward / back |
-| `Backspace` | Reset the cockpit seat position |
-| `Esc` / `Space` | Pause to the World screen |
-| `X` | Release the parking brake, or hold for wheel brakes |
-| Settings | Adjust terrain LOD, online imagery, aircraft and weather detail, super-resolution, AA, and native cockpit resolution |
-| `K` | Toggle cold & dark / running engine |
+| `X` | Release parking brake; hold for wheel brakes |
 | `F` / `V` | Flaps down / up |
-| `F1`–`F4` | Graphics tier: Low (iGPU) → Medium → High → Ultra |
-| `F5` | Live CPU, GPU, memory and frame-time profiler |
-| `F6` | Cycle the four terrain-following weather debug layers |
-| `F7` | Aircraft physics telemetry and projected vectors |
-| `L` | Toggle real UTC sun vs fixed pre-baked TOD |
-| `P` | Cycle 10 pre-baked TODs + night |
-| `B` | Advance weather |
-| `M` | Cycle mesoscale wind regime |
-| `O` | Toggle distance-tiered PNOA online ortho |
-| `H` | Toggle diagnostic overlay |
+| `C` | Cycle cockpit, chase and free camera |
+| Right mouse drag | Look around |
+| `Esc` / `Space` | Pause and open the World screen |
+| `T` | Toggle the in-flight controls guide |
+| `F1`–`F4` | Change graphics quality tier |
 
----
+The in-game **Controls** page lists additional cockpit, camera and system keys.
 
-## Current status
+## Data and licenses
 
-The supported runtime is Linux/X11/GLX. The target is 1080p at 60 FPS on AMD Renoir, but the dated [Renoir benchmark](docs/benchmarks/2026-11-23-renoir-linux.md) does not meet the average-frame or p95 gates. Aircraft packages currently support one piston engine and two tanks; scripted and multi-engine systems are not implemented. See [release readiness](docs/RELEASE_READINESS.md) for the remaining product and redistribution blockers.
+OpenSky uses commercial-reuse-approved sources and retains required attribution. Approved inputs include IGN Spain PNOA, MDT05/MDT25 and INSPIRE Hidrografía (CC BY 4.0), OurAirports (public domain), OpenStreetMap (ODbL), Poly Haven (CC0) and Open-Meteo subject to its feed terms. See [third-party licenses](THIRD_PARTY_LICENSES.md) and the [airport source notes](docs/airport-data-sources.md). Esri imagery, GPL aircraft assets and assets without redistribution rights are not allowed in release packages.
 
-## Attribution (Required)
-- **Orthophoto:** PNOA cedido por © Instituto Geográfico Nacional de España (CC-BY 4.0).
-- **Elevation & Hydrography:** MDT05 / MDT25 & INSPIRE Hidrografía © Instituto Geográfico Nacional de España (CC-BY 4.0); border fallback AWS Terrain Tiles.
-- **Airports & Scenery:** OurAirports (Public Domain), OpenStreetMap contributors (ODbL); ENAIRE AIP reuse terms are under review.
-- **PBR Ground & Material Textures:** Poly Haven (CC0 1.0 Public Domain).
-
-## License
-Project source is MIT (`LICENSE`). Third-party code, data and assets keep their
-own licenses — see `THIRD_PARTY_LICENSES.md`. Generated OSM-derived packs are
-ODbL share-alike; do not redistribute them under MIT.
+Project source is MIT licensed. Vendored JSBSim remains under LGPL-2.1; generated OpenStreetMap-derived packs carry ODbL obligations. Each third-party asset and data source keeps its own license.

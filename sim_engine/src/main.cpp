@@ -490,7 +490,8 @@ int main(int argc, char **argv) {
 
     const int output_w = !topdown_dir.empty() ? 1024 : GAME_OUTPUT_W;
     const int output_h = !topdown_dir.empty() ? 1024 : GAME_OUTPUT_H;
-    if (!win.create("OpenSky VFR Simulator", output_w, output_h)) {
+    if (!win.create("OpenSky VFR Simulator", output_w, output_h,
+                    static_cast<DisplayMode>(graphics_settings.display_mode))) {
         return 1;
     }
     // Cap FPS to monitor refresh rate (<= 60 Hz for iGPU thermal stability <80C) and enable VSync interactively.
@@ -2423,7 +2424,9 @@ int main(int argc, char **argv) {
                                          ac_hud.state().vel_east_mps, ac_hud.state().vel_north_mps)) {
             last_t = PlatformWindow::now_sec();
         }
-        render_one_frame(true);
+        const bool show_flight_overlays = frontend.walking() || route_play.active ||
+            ac_hud.graphics_settings().show_flight_hud || frontend.tutorial_open();
+        render_one_frame(show_flight_overlays);
         push_audio_state(dt, ac_hud.state().paused || ac_hud.state().menu_open);
         // Closed-loop frame pacing caps GPU/CPU load so long flights remain cool (<80 C).
         const double eff_period = std::max(frame_period, 1.0 / thermal_fps_cap);

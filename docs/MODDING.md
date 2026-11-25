@@ -1,15 +1,45 @@
-# Community Modding
+# Modding OpenSky
 
-OpenSky content is installed as folders. The loader currently supports regional packs and aircraft packages. Keep downloaded data, generated packs, and caches outside the tracked source tree.
+OpenSky mods are installed content folders. The runtime currently supports two content types: aircraft packages and regional scenery packs. Both can be built without editing the C++ source, but the aircraft systems API is not scriptable yet.
 
-## Aircraft packages (format 1)
+Keep generated packs, downloaded data, caches and temporary bakes outside tracked source. Include attribution and redistribution rights for all content in a mod.
 
-Create one directory per aircraft under either:
+## Aircraft packages
 
-- `game/aircraft/<id>/` for a package shipped with a checkout or release.
+### Install or select an aircraft
+
+The simulator scans these locations:
+
+- `game/aircraft/<id>/` for content shipped with the game or a developer checkout.
 - `~/.config/opensky-vfr/aircraft/<id>/` for a user-installed package on Linux.
 
-The directory must contain `aircraft.ini`, a JSBSim model directory, an exterior GLB, and a cockpit GLB. The built-in [C172S manifest](../game/aircraft/c172s/aircraft.ini) is the working example.
+List packages and start one explicitly:
+
+```bash
+./run_sim.sh --list-aircraft
+./run_sim.sh --aircraft sample-aircraft
+```
+
+Interactive selection is saved in the user's fleet profile. If a saved package is missing, select the factory aircraft with `--aircraft c172s`.
+
+### Package layout
+
+```text
+sample-aircraft/
+├── aircraft.ini
+├── flight/
+│   ├── flight.xml
+│   └── engine/
+│       ├── sample-engine.xml
+│       └── sample-propeller.xml
+└── models/
+    ├── exterior.glb
+    └── cockpit.glb
+```
+
+`flight/` is the JSBSim model directory. Its main XML file has the same base name as the directory. Add every engine, propeller and other XML dependency referenced from that file. The loader requires a piston engine with a propeller, two fuel tanks and at least three gear units.
+
+The manifest is strict and uses paths relative to the package. Start from the working [C172S manifest](../game/aircraft/c172s/aircraft.ini):
 
 ```ini
 format = opensky-aircraft
@@ -33,30 +63,48 @@ node.exterior_Flap_L = LeftFlap
 node.exterior_Flap_R = RightFlap
 ```
 
-The example package also needs `flight/flight.xml`, `flight/engine/`, and any other JSBSim files referenced by the aircraft model. The model directory's XML file must have the same base name as the directory. Exterior and cockpit files must be GLB files with their textures embedded. Paths are relative to the package. `@shared/...` resolves against the shared game asset tree and is intended for built-in packages; user aircraft should include their own assets.
+Keep only supported manifest keys. The package loader rejects absolute paths, path traversal, missing files, duplicate IDs and unknown keys. `@shared/...` resolves against shared game assets and is intended for built-in content; community packages should include the assets they need.
 
-The package loader rejects absolute paths, path traversal, missing files, duplicate IDs, and unknown manifest keys. IDs may contain letters, digits, `_`, and `-`. `--list-aircraft` lists discovered packages. Start with `./run_sim.sh --aircraft sample-aircraft`; an interactive selection is stored in the fleet profile. A missing saved package is reported at startup; use `--aircraft c172s` to select the factory plane again.
+### Models and cockpit nodes
 
-### Format 1 systems support
+Export exterior and cockpit models as GLB with textures embedded. The runtime animates recognized canonical nodes for control surfaces, flaps, doors and aircraft parts. Map a canonical role to your GLTF node with `node.exterior_<CanonicalName>` or `node.cockpit_<CanonicalName>` in the manifest. Unmapped model nodes remain static. The shared systems profile still owns core instruments and systems behavior.
 
-The flight adapter currently requires one piston engine with a propeller, two fuel tanks, and at least three JSBSim gear units. `single_piston_v1` configures fuel capacity, oil capacity, maximum flap travel, and a 14V or 28V electrical bus. The gameplay systems use a shared light-aircraft piston profile. This does not yet cover twins, turboprops, jets, retractable-gear procedures, or aircraft-specific electrical and avionics logic.
+Test the manifest and package loader with `--list-aircraft`, then launch the aircraft with a fresh or isolated profile. Check that the startup model loads, control nodes animate, the engine can be started, and the package can taxi, take off, land and park. Do not test with your only saved profile if the package ID differs; saves retain the selected aircraft ID.
 
-GLTF control and cockpit nodes use the built-in canonical node names by default. A `node.exterior_<CanonicalName>` or `node.cockpit_<CanonicalName>` manifest entry maps one canonical role to a package's GLTF node. Unmapped nodes remain static. Core cockpit instruments and systems behavior still use the shared profile.
+### Aircraft system scripting status
 
-## Scripted aircraft systems: next milestone
+Format 1 packages do **not** run aircraft-specific scripts. Uploading a 3D model and Lua/JavaScript files will not make a new system profile work. The supported package uses the shared `single_piston_v1` behavior and one piston engine. Twins, turboprops, jets, retractable-gear procedures and package-specific electrical/avionics logic are outside this format.
 
-Aircraft-specific scripts are not executed by format 1. The recommended direction is embedded Lua rather than a new language: it is familiar to modders, small to ship, and available under the MIT license with an attribution notice. See the [Lua 5.5.1 reference manual](https://www.lua.org/manual/5.5/) and [license](https://www.lua.org/license.html).
-
-The proposed package adds `systems.lua` and `cockpit.lua`. Scripts should receive read-only snapshots and return bounded values through a documented API; they must not access files, network, native libraries, or the JSBSim executive. Run them at the fixed simulation step with per-call instruction and memory budgets. Invalid output should be clamped or rejected, and repeated script errors should disable the package script without stopping the simulator. Keep JavaScript-free and Lua-disabled packages loadable during migration.
-
-This scripting runtime and its API need implementation and review before authors can rely on those files. Do not add `systems.lua` or `cockpit.lua` to a format 1 manifest and expect the game to load them.
+The planned modding direction is a small embedded script API with read-only flight/system snapshots and bounded outputs. Lua is a candidate because it is familiar and lightweight. A safe API, execution budget, persistence rules and runtime error handling must be implemented and reviewed before scripts are accepted. Until then, do not add `systems.lua` or `cockpit.lua` to a format 1 package expecting them to run.
 
 ## Regional content
 
-Use the World Editor or `builder/build_region.py` to create a region pack. On Linux, install downloaded `.nspack` files and their companion files in `~/.local/share/opensky-vfr/packs/`; the game also loads the release's built-in `packs/` directory. A user pack with the same filename is loaded first, allowing it to replace a shipped region. Keep each pack's `.relief.png`, `_cities.nscity`, `_city_sh.nsshd`, `_scenery.nsscn`, and `_weather.nswx` companions together when present.
+The full game release is intended to contain both Aragón and Catalunya as baseline scenery. Compatible user regions remain add-ons and do not replace that baseline.
 
-Spanish presets provide the approved IGN/OurAirports/OSM pipeline. For another region, provide licensed XYZ imagery and Terrarium elevation, or build elevation-only scenery. Add source and attribution metadata to the pack, and retain any ODbL share-alike obligations for OSM-derived data.
+Build a region using the World Editor or `builder/build_region.py`. Run the editor from the repository root:
 
-## Sharing a mod
+```bash
+./run_builder.sh
+```
 
-Include the complete package folder, a short installation/readme note, and a license/attribution file. You must have redistribution rights for every model, texture, sound, data set, and script you include. Do not include Esri imagery or GPL aircraft content in an OpenSky-compatible package.
+Or use a supported builder preset:
+
+```bash
+python3 builder/build_region.py --preset zaragoza-pyrenees-quick
+```
+
+For a custom region, provide licensed XYZ imagery and Terrarium elevation tiles, or choose an elevation-only build. Spanish presets use the approved IGN/OurAirports/OSM sources. OSM roads and settlements outside the bundled Spain extracts need a local `.pbf` extract. Keep source attribution in the pack manifest and preserve ODbL share-alike obligations for OSM-derived output.
+
+The runtime loads `.nspack` and optional companions such as `.relief.png`, `_cities.nscity`, `_city_sh.nsshd`, `_scenery.nsscn` and `.nswx`. Keep companions beside the pack when sharing it. Install user region packs under `~/.local/share/opensky-vfr/packs/`; the application also loads its shipped data directory. A user pack with the same filename is considered before the shipped copy.
+
+## Redistribute a mod
+
+Publish the complete package folder, installation instructions, license/attribution file and a version number. State which game/package format the mod uses. Keep third-party licenses with the assets. Do not include Esri imagery, GPL aircraft models/configurations/textures, or any content without clear redistribution permission. See [third-party licenses](../THIRD_PARTY_LICENSES.md) before sharing.
+
+## Current limits
+
+- Aircraft packages use `single_piston_v1`; they are not a general aircraft-systems scripting environment.
+- The runtime requires a JSBSim-compatible flight model and the minimum aircraft hardware listed above.
+- Region packs must match the versioned shared protocol; the builder and C++ reader are separate programs.
+- Mods may replace or add content, but they cannot change the player-owned aircraft, saved-base or no-relocation rules without changing the game source.
+- The active supported native runtime is Linux/X11/GLX. Windows 11 package support is not available yet.

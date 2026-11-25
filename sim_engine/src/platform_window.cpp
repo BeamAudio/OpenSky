@@ -222,7 +222,7 @@ PlatformWindow::~PlatformWindow() {
     destroy();
 }
 
-bool PlatformWindow::create(const char *title, int aspect_w, int aspect_h) {
+bool PlatformWindow::create(const char *title, int aspect_w, int aspect_h, DisplayMode mode) {
     impl_ = new Impl();
     impl_->gl_lib = dlopen("libGL.so.1", RTLD_LAZY | RTLD_LOCAL);
     if (!impl_->gl_lib) {
@@ -255,10 +255,15 @@ bool PlatformWindow::create(const char *title, int aspect_w, int aspect_h) {
         {0, 0, DisplayWidth(impl_->dpy, scr), DisplayHeight(impl_->dpy, scr)});
     refresh_hz_ = detect_refresh_hz(impl_->dpy, root);
     const PixelRect work = window_bounds(impl_->dpy, root, monitor);
-    const int w = std::min(monitor.w * 9 / 10, work.w);
-    const int h = std::min(monitor.h * 9 / 10, std::max(1, work.h - 48));
-    const PixelRect bounds = fit_rect({work.x + (work.w - w) / 2, work.y + (work.h - h) / 2, w, h},
-                                      aspect_w, aspect_h);
+    PixelRect bounds{};
+    if (mode == DisplayMode::Fullscreen || mode == DisplayMode::FullscreenWindowed) {
+        bounds = monitor;
+    } else {
+        const int w = std::min(monitor.w * 9 / 10, work.w);
+        const int h = std::min(monitor.h * 9 / 10, std::max(1, work.h - 48));
+        bounds = fit_rect({work.x + (work.w - w) / 2, work.y + (work.h - h) / 2, w, h},
+                          aspect_w, aspect_h);
+    }
     width_ = bounds.w;
     height_ = bounds.h;
 
@@ -304,6 +309,21 @@ bool PlatformWindow::create(const char *title, int aspect_w, int aspect_h) {
     );
     XFree(vi);
 
+    // Keep the fullscreen-windowed mode managed by the desktop compositor,
+    // but ask the window manager to remove its title bar and frame.
+    if (mode == DisplayMode::FullscreenWindowed) {
+        struct MotifWmHints {
+            unsigned long flags;
+            unsigned long functions;
+            unsigned long decorations;
+            long input_mode;
+            unsigned long status;
+        } motif_hints{2, 0, 0, 0, 0}; // MWM_HINTS_DECORATIONS, no decorations
+        const Atom motif_atom = XInternAtom(impl_->dpy, "_MOTIF_WM_HINTS", False);
+        XChangeProperty(impl_->dpy, impl_->win, motif_atom, motif_atom, 32,
+                        PropModeReplace, reinterpret_cast<const unsigned char *>(&motif_hints), 5);
+    }
+
     XStoreName(impl_->dpy, impl_->win, title);
     XSizeHints hints{};
     hints.flags = PPosition | PSize;
@@ -315,6 +335,20 @@ bool PlatformWindow::create(const char *title, int aspect_w, int aspect_h) {
     impl_->wm_delete = XInternAtom(impl_->dpy, "WM_DELETE_WINDOW", False);
     XSetWMProtocols(impl_->dpy, impl_->win, &impl_->wm_delete, 1);
     XMapWindow(impl_->dpy, impl_->win);
+    if (mode == DisplayMode::Fullscreen) {
+        const Atom state_atom = XInternAtom(impl_->dpy, "_NET_WM_STATE", False);
+        const Atom fullscreen_atom = XInternAtom(impl_->dpy, "_NET_WM_STATE_FULLSCREEN", False);
+        XEvent request{};
+        request.xclient.type = ClientMessage;
+        request.xclient.window = impl_->win;
+        request.xclient.message_type = state_atom;
+        request.xclient.format = 32;
+        request.xclient.data.l[0] = 1; // _NET_WM_STATE_ADD
+        request.xclient.data.l[1] = static_cast<long>(fullscreen_atom);
+        request.xclient.data.l[2] = 0;
+        request.xclient.data.l[3] = 1; // application source
+        XSendEvent(impl_->dpy, root, False, SubstructureRedirectMask | SubstructureNotifyMask, &request);
+    }
     XFlush(impl_->dpy);
 
     auto create_ctx_attribs = reinterpret_cast<PFN_glXCreateContextAttribsARB>(get_proc("glXCreateContextAttribsARB"));

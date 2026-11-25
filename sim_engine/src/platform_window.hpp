@@ -18,6 +18,7 @@ enum KeyCode : uint16_t {
 };
 
 struct PixelRect { int x, y, w, h; };
+enum class DisplayMode : uint8_t { Windowed = 0, Fullscreen = 1, FullscreenWindowed = 2 };
 
 inline constexpr int GAME_OUTPUT_W = 1920;
 inline constexpr int GAME_OUTPUT_H = 1080;
@@ -27,7 +28,8 @@ public:
     PlatformWindow() = default;
     ~PlatformWindow();
 
-    bool create(const char *title, int aspect_w, int aspect_h);
+    bool create(const char *title, int aspect_w, int aspect_h,
+                DisplayMode mode = DisplayMode::Windowed);
     void destroy();
     void poll_events();
     void set_relative_mouse(bool enabled);

@@ -110,6 +110,16 @@ GameFrontend::~GameFrontend() {
 bool GameFrontend::init(const PackReader &pack, const std::string &shader_root, const std::string &asset_root,
                         std::filesystem::path profile_file, const AircraftPackage &aircraft) {
     pack_ = &pack;
+    if (!profile_file.empty()) {
+        first_flight_state_file_ = profile_file.parent_path() / "first_flight.ini";
+        std::ifstream tutorial_state(first_flight_state_file_);
+        std::string key;
+        int value = 0;
+        while (tutorial_state >> key >> value) {
+            if (key == "completed") first_flight_completed_ = value != 0;
+        }
+        first_flight_open_ = !first_flight_completed_;
+    }
     backdrop_ = compile_program_files(shader_root + "/fullscreen.vert", shader_root + "/frontend.frag");
     if (!backdrop_) return false;
     globe_uniform_ = glGetUniformLocation(backdrop_, "u_globe");
@@ -461,14 +471,16 @@ void GameFrontend::draw_menu(AircraftAndHud &aircraft, SkyAndClouds &sky, const 
     aircraft.hud_line({77, 41}, {97, 41}, 1.2f, {.77f, .86f, .80f});
     label(aircraft, 124, 18, 25, "OPENSKY");
     label(aircraft, 126, 48, 12, "VFR  /  FREE ROAM", true);
-    if (button(aircraft, {380, 17, 130, 48}, "World", true, page_ == Page::World)) page_ = Page::World;
-    if (button(aircraft, {520, 17, 152, 48}, "Logbook", true, page_ == Page::Logbook)) page_ = Page::Logbook;
-    if (button(aircraft, {682, 17, 140, 48}, "Settings", true, page_ == Page::Settings)) page_ = Page::Settings;
-    if (button(aircraft, {832, 17, 140, 48}, "Controls", true, page_ == Page::Controls)) page_ = Page::Controls;
-    if (button(aircraft, {982, 17, 106, 48}, "Credits", true, page_ == Page::Credits)) page_ = Page::Credits;
-    if (button(aircraft, {1754, 17, 102, 48}, "Quit")) request_ = Request::Quit;
+    const bool menu_enabled = !first_flight_open_;
+    if (button(aircraft, {380, 17, 130, 48}, "World", menu_enabled, page_ == Page::World)) page_ = Page::World;
+    if (button(aircraft, {520, 17, 152, 48}, "Logbook", menu_enabled, page_ == Page::Logbook)) page_ = Page::Logbook;
+    if (button(aircraft, {682, 17, 140, 48}, "Settings", menu_enabled, page_ == Page::Settings)) page_ = Page::Settings;
+    if (button(aircraft, {832, 17, 140, 48}, "Controls", menu_enabled, page_ == Page::Controls)) page_ = Page::Controls;
+    if (button(aircraft, {982, 17, 106, 48}, "Credits", menu_enabled, page_ == Page::Credits)) page_ = Page::Credits;
+    if (button(aircraft, {1754, 17, 102, 48}, "Quit", menu_enabled)) request_ = Request::Quit;
     if (session_.flight_active_) {
-        if (button(aircraft, {1100, 17, 174, 48}, "Resume flight", true, true) || win.key_pressed(KEY_ESC))
+        if (button(aircraft, {1100, 17, 174, 48}, "Resume flight", menu_enabled, true) ||
+            (menu_enabled && win.key_pressed(KEY_ESC)))
             aircraft.st_.menu_open = aircraft.st_.paused = false;
         const bool park_ok = can_park(aircraft);
         double re = 0.0, mu = 0.0, rough = 0.0;
@@ -476,13 +488,18 @@ void GameFrontend::draw_menu(AircraftAndHud &aircraft, SkyAndClouds &sky, const 
         const bool on_rwy = aircraft.jsb_state().on_ground &&
                             pack_->query_runway(aircraft.state().lat_deg, aircraft.state().lon_deg, re, mu, rough, rid);
         if (button(aircraft, {1286, 17, 306, 48},
-                   on_rwy ? "Taxi off runway to park" : "Park and step outside", park_ok))
+                   on_rwy ? "Taxi off runway to park" : "Park and step outside", park_ok && menu_enabled))
             request_ = Request::Park;
+    } else if (button(aircraft, {1100, 17, 174, 48}, "Flight guide", menu_enabled)) {
+        first_flight_step_ = 0;
+        first_flight_open_ = true;
     }
 #ifndef OPENSKY_PLAYER_PACKAGE
-    if (button(aircraft, {1606, 17, 140, 48}, "Region tools")) request_ = Request::Editor;
+    if (button(aircraft, {1606, 17, 140, 48}, "Region tools", menu_enabled)) request_ = Request::Editor;
 #endif
-    if (preparing_airfield) {
+    if (first_flight_open_) {
+        draw_first_flight_tutorial(aircraft);
+    } else if (preparing_airfield) {
         panel(aircraft, {640, 444, 640, 164});
         label(aircraft, 668, 474, 36, "Preparing the airfield");
         label(aircraft, 668, 536, 20, "Loading ground detail around your parking spot.", true);
@@ -493,6 +510,129 @@ void GameFrontend::draw_menu(AircraftAndHud &aircraft, SkyAndClouds &sky, const 
     else draw_credits(aircraft);
     glViewport(0, 0, w, h);
     aircraft.flush_hud(w, h, font_);
+}
+
+void GameFrontend::finish_first_flight_tutorial() {
+    first_flight_open_ = false;
+    first_flight_completed_ = true;
+    if (first_flight_state_file_.empty()) return;
+
+    std::error_code ec;
+    std::filesystem::create_directories(first_flight_state_file_.parent_path(), ec);
+    const auto temp = first_flight_state_file_.string() + ".tmp";
+    {
+        std::ofstream out(temp, std::ios::trunc);
+        if (!out) return;
+        out << "completed 1\n";
+        if (!out) return;
+    }
+    std::filesystem::rename(temp, first_flight_state_file_, ec);
+    if (ec) {
+        std::filesystem::remove(first_flight_state_file_, ec);
+        ec.clear();
+        std::filesystem::rename(temp, first_flight_state_file_, ec);
+        if (ec) std::filesystem::remove(temp, ec);
+    }
+}
+
+void GameFrontend::draw_first_flight_tutorial(AircraftAndHud &ui) {
+    static constexpr const char *steps[] = {"WELCOME", "WORLD MAP", "WALKAROUND", "TAKEOFF", "PARKING"};
+    static constexpr const char *titles[] = {
+        "Explore at your own pace",
+        "Plan without moving the aircraft",
+        "Start with a walkaround",
+        "Taxi, take off, and enjoy the view",
+        "Park to save your new base"
+    };
+    static constexpr const char *body[][4] = {
+        {"OpenSky is a Spain-based free-roam VFR simulator.",
+         "Aragón and Catalunya ship as the baseline world.",
+         "The World Editor can add compatible regions worldwide.",
+         "Your Cessna 172S starts at Castejon de Sos (ES-0205)."},
+        {"Drag the globe and use + or - to zoom. Select an airfield or",
+         "landmark, then add airfields to a route if you want a plan.",
+         "Browsing, selecting and route planning never move the aircraft.", ""},
+        {"Choose Walk to aircraft | Walkaround from the World screen.",
+         "W/A/S/D move, E inspects a nearby part, and Enter boards.",
+         "Remove chocks, tie-downs and the pitot cover before taxiing.", ""},
+        {"K runs the quick-start helper. X releases the brakes; W adds power.",
+         "Q/E steer while taxiing. A/D roll; Up/Down control pitch.",
+         "Taxi onto a clear runway and rotate at about 55 kt.", ""},
+        {"Land at a suitable airfield, taxi fully clear, shut down with K,",
+         "then press Esc and choose Park. A successful parking saves your",
+         "temporary base. Leaving before parking keeps the last saved base.", ""}
+    };
+    static constexpr const char *tips[] = {
+        "Use the World Editor to add regions beyond the Spanish baseline.",
+        "Map browsing and route planning are safe: your aircraft stays put.",
+        "The Controls page has the complete keyboard reference.",
+        "Press T any time in flight to show the cockpit controls guide.",
+        "Parking also preserves location, heading, condition, fuel and logbook."
+    };
+
+    first_flight_step_ = std::clamp(first_flight_step_, 0, 4);
+    ui.hud_rect(0, 0, w, h, .006f, .014f, .022f, .72f);
+    panel(ui, {460, 160, 1000, 760});
+    label(ui, 492, 188, 16, "OPENSKY  /  FIRST FLIGHT GUIDE", true);
+    label(ui, 492, 218, 30, "Your first flight, made simple");
+    if (button(ui, {1312, 187, 116, 38}, "Skip guide")) finish_first_flight_tutorial();
+
+    const float track_x = 492.0f, track_y = 266.0f, gap = 8.0f, segment_w = 181.0f;
+    for (int i = 0; i < 5; ++i) {
+        const float x = track_x + i * (segment_w + gap);
+        ui.hud_rect(x, track_y, segment_w, 4,
+                    i <= first_flight_step_ ? .27f : .11f,
+                    i <= first_flight_step_ ? .78f : .18f,
+                    i <= first_flight_step_ ? .65f : .23f, .92f);
+    }
+
+    panel(ui, {492, 292, 278, 564});
+    char number[16];
+    std::snprintf(number, sizeof(number), "%02d", first_flight_step_ + 1);
+    label(ui, 530, 342, 78, number);
+    label(ui, 532, 414, 15, "YOUR FLIGHT", true);
+    label(ui, 532, 455, 22, steps[first_flight_step_]);
+    ui.hud_rect(534, 502, 190, 1, .20f, .34f, .40f, .9f);
+    // A small route motif gives each step a visible sense of progress.
+    const Vec2 route[] = {{548, 625}, {592, 574}, {635, 604}, {684, 545}, {716, 565}};
+    for (int i = 0; i + 1 < 5; ++i)
+        ui.hud_line(route[i], route[i + 1], 3.0f,
+                    i < first_flight_step_ ? Vec3{.42f, .91f, .72f} : Vec3{.20f, .38f, .43f});
+    for (int i = 0; i < 5; ++i) {
+        const float radius = i == first_flight_step_ ? 8.0f : 5.0f;
+        const Vec3 c = i <= first_flight_step_ ? Vec3{.42f, .91f, .72f} : Vec3{.32f, .48f, .52f};
+        ui.hud_rect(route[i].x - radius, route[i].y - radius, radius * 2, radius * 2,
+                    c.x, c.y, c.z, .98f);
+    }
+    label(ui, 532, 705, 15, "PLAN  /  BOARD  /  FLY", true);
+    label(ui, 532, 740, 15, "At your own pace.", true);
+
+    label(ui, 812, 324, 28, titles[first_flight_step_]);
+    for (int i = 0; i < 4; ++i) {
+        if (body[first_flight_step_][i][0] != '\0')
+            label(ui, 814, 382 + i * 34, 18, body[first_flight_step_][i], i == 3);
+    }
+    panel(ui, {812, 574, 616, 150});
+    label(ui, 838, 598, 14, "KEEP IN MIND", true);
+    label(ui, 838, 634, 17, tips[first_flight_step_]);
+    if (first_flight_step_ == 4)
+        label(ui, 838, 666, 16, "Your aircraft state and logbook are saved with the parked base.", true);
+    else if (first_flight_step_ == 2)
+        label(ui, 838, 666, 16, "Enter boards the aircraft after you finish inspecting it.", true);
+    else if (first_flight_step_ == 3)
+        label(ui, 838, 666, 16, "Open Controls from the menu for the complete key list.", true);
+
+    ui.hud_rect(812, 776, 616, 1, .18f, .30f, .36f, .82f);
+    label(ui, 812, 792, 15, "You can reopen this guide from the World screen.", true);
+    if (button(ui, {812, 832, 154, 48}, "Previous", first_flight_step_ > 0)) --first_flight_step_;
+    char progress[32];
+    std::snprintf(progress, sizeof(progress), "STEP %d OF 5", first_flight_step_ + 1);
+    label(ui, 1038, 848, 15, progress, true);
+    if (first_flight_step_ < 4) {
+        if (button(ui, {1250, 832, 178, 48}, "Next step")) ++first_flight_step_;
+    } else if (button(ui, {1234, 832, 194, 48}, "Finish & explore")) {
+        finish_first_flight_tutorial();
+    }
 }
 
 bool GameFrontend::capture_world(AircraftAndHud &aircraft, SkyAndClouds &sky, const PlatformWindow &win,
@@ -1045,7 +1185,7 @@ void GameFrontend::draw_settings(AircraftAndHud &ui, int &time_of_day, RegionalA
     auto &s = ui.graphics_settings_;
     bool changed = false;
     auto setting = [&](int row, const char *name, const char *value) {
-        const int y = 296 + row * 72;
+        const int y = 296 + row * 60;
         ui.hud_rect(91,y+49,1046,1,.21f,.32f,.39f,.85f);
         label(ui, 91, y+10, 20, name);
         label(ui, 763, y+10, 19, value);
@@ -1073,6 +1213,11 @@ void GameFrontend::draw_settings(AircraftAndHud &ui, int &time_of_day, RegionalA
         else if (s.aircraft_detail == 0) { s.aircraft_detail = 1; }
         else { s.cockpit_native = false; s.aircraft_detail = 0; }
     }
+    if (setting(8, "In-flight overlays", s.show_flight_hud ? "On" : "Off"))
+        s.show_flight_hud = !s.show_flight_hud;
+    static const char *display_modes[] = {"Windowed", "Fullscreen", "Fullscreen windowed"};
+    s.display_mode = (s.display_mode + setting(9, "Display mode", display_modes[s.display_mode]) + 3) % 3;
+    label(ui, 91, 898, 13, "Display changes apply after restarting the game.", true);
 
     panel(ui, {1192,225,664,720});
     label(ui, 1218, 246, 24, "Cockpit POV & Audio");

@@ -27,6 +27,8 @@ struct GraphicsSettings {
     int audio_volume_percent = 85; // 0..100 master audio level
     int atmosphere_clarity = 0; // 0 = Crisp VFR, 1 = Natural, 2 = Hazy
     int quality_preset = 2; // 0 = Low, 1 = Medium, 2 = High, 3 = Ultra
+    bool show_flight_hud = false;
+    int display_mode = 0; // 0 = Windowed, 1 = Fullscreen, 2 = Fullscreen windowed
 };
 
 inline std::filesystem::path graphics_settings_path() {
@@ -52,6 +54,8 @@ inline GraphicsSettings load_graphics_settings() {
         else if (key == "audio_volume_percent") settings.audio_volume_percent = std::clamp(value, 0, 100);
         else if (key == "atmosphere_clarity") settings.atmosphere_clarity = std::clamp(value, 0, 2);
         else if (key == "quality_preset") settings.quality_preset = std::clamp(value, 0, 3);
+        else if (key == "show_flight_hud") settings.show_flight_hud = value != 0;
+        else if (key == "display_mode") settings.display_mode = std::clamp(value, 0, 2);
     }
     settings.pixel_percent = std::clamp(settings.pixel_percent, 40, 100);
     settings.aa_mode = std::clamp(settings.aa_mode, 0, 2);
@@ -61,6 +65,7 @@ inline GraphicsSettings load_graphics_settings() {
     settings.audio_volume_percent = std::clamp(settings.audio_volume_percent, 0, 100);
     settings.atmosphere_clarity = std::clamp(settings.atmosphere_clarity, 0, 2);
     settings.quality_preset = std::clamp(settings.quality_preset, 0, 3);
+    settings.display_mode = std::clamp(settings.display_mode, 0, 2);
     return settings;
 }
 
@@ -74,6 +79,7 @@ inline void save_graphics_settings(const GraphicsSettings &input) {
     settings.audio_volume_percent = std::clamp(settings.audio_volume_percent, 0, 100);
     settings.atmosphere_clarity = std::clamp(settings.atmosphere_clarity, 0, 2);
     settings.quality_preset = std::clamp(settings.quality_preset, 0, 3);
+    settings.display_mode = std::clamp(settings.display_mode, 0, 2);
     const auto path = graphics_settings_path();
     std::error_code ec;
     std::filesystem::create_directories(path.parent_path(), ec);
@@ -94,6 +100,8 @@ inline void save_graphics_settings(const GraphicsSettings &input) {
             << "audio_volume_percent " << settings.audio_volume_percent << '\n'
             << "atmosphere_clarity " << settings.atmosphere_clarity << '\n'
             << "quality_preset " << settings.quality_preset << '\n';
+        out << "show_flight_hud " << settings.show_flight_hud << '\n'
+            << "display_mode " << settings.display_mode << '\n';
         if (!out) return;
     }
     std::filesystem::rename(temp, path, ec);

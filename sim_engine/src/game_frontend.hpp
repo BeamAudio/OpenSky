@@ -78,6 +78,8 @@ private:
     void draw_settings(AircraftAndHud &aircraft, int &time_of_day, RegionalAtmosphere *reg_atmo);
     void draw_controls(AircraftAndHud &aircraft);
     void draw_credits(AircraftAndHud &aircraft);
+    void draw_first_flight_tutorial(AircraftAndHud &aircraft);
+    void finish_first_flight_tutorial();
     void load_profile();
     void focus_airport(const AirportInfo &airport, float zoom);
     void add_point(RoutePoint point);
@@ -116,7 +118,11 @@ private:
     bool walking_ = false, inspecting_ = false;
     WalkStation active_station_ = WalkStation::Door;
     bool walk_checked_[6] = {};
-    bool tutorial_open_ = true;
+    bool tutorial_open_ = false;
+    bool first_flight_open_ = false;
+    bool first_flight_completed_ = false;
+    int first_flight_step_ = 0;
+    std::filesystem::path first_flight_state_file_;
     bool kneeboard_open_ = false;
     bool replay_available_ = false;
     Location walker_{};

@@ -1085,7 +1085,6 @@ int main(int argc, char **argv) {
                     double f0 = PlatformWindow::now_sec();
                     win.poll_events();
                     update_environment();
-                    update_environment();
                     render_one_frame(true, 4);
                     double sp = (1.0 / 60.0) - (PlatformWindow::now_sec() - f0);
                     if (sp > 0.001) std::this_thread::sleep_for(std::chrono::duration<double>(sp));
@@ -1192,7 +1191,6 @@ int main(int argc, char **argv) {
                 if (step % 2 == 0) {
                     double f0 = PlatformWindow::now_sec();
                     win.poll_events();
-                    update_environment();
                     update_environment();
                     render_one_frame(true, 4);
                     double sp = (1.0 / 60.0) - (PlatformWindow::now_sec() - f0);

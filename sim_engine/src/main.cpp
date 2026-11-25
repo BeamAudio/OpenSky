@@ -550,6 +550,22 @@ int main(int argc, char **argv) {
     profiler.startup_stage("terrain_coarse_prewarm");
 
     uint64_t frame_idx = 1;
+    auto transition_world = [&](double lat, double lon, const char *loading_title = nullptr) {
+        if (loading_title) show_loading(loading_title, "Preparing world coordinates...", 0.20f);
+        const bool changed = pack.reanchor_to(lat, lon);
+        if (changed) {
+            vegetation.invalidate();
+            if (loading_title) show_loading(loading_title, "Streaming coarse terrain & IGN PNOA...", 0.50f);
+            streamer.invalidate_all_and_prewarm(sky_clouds.atmo().sun_dir);
+            if (loading_title) show_loading(loading_title, "Loading local buildings, roads & traffic...", 0.78f);
+            objects.on_reanchor();
+            living_traffic.on_reanchor();
+            sky_clouds.reset_temporal_history();
+        }
+        reg_atmo.sync_region(lat, lon);
+        return changed;
+    };
+
     double last_t = PlatformWindow::now_sec();
     double sim_time = 0.0;
     const double cycle_clock_origin = last_t;
@@ -931,13 +947,7 @@ int main(int argc, char **argv) {
         };
         if (req_region == "es_catalonia_coast") {
             auto reanchor_route = [&](const char *name, double lat, double lon, double agl, double heading) {
-                vegetation.invalidate();
-                if (pack.reanchor_to(lat, lon)) {
-                    streamer.invalidate_all_and_prewarm(sky_clouds.atmo().sun_dir);
-                    objects.on_reanchor();
-                    living_traffic.on_reanchor();
-                }
-                reg_atmo.sync_region(lat, lon);
+                transition_world(lat, lon);
                 route(name, lat, lon, agl, heading);
             };
             reanchor_route("barcelona_downtown", 41.3680, 2.1550, 290.0, 38.0);
@@ -1053,12 +1063,7 @@ int main(int argc, char **argv) {
         // 2. ALL-REGION VISUAL INSPECTION TOUR across Northern Spain (Aragon Pack)
         auto tour_snap = [&](const char *fname, double lat, double lon, double agl, double hdg) {
             const double d = nspain::haversine_m(lat, lon, pack.anchor_lat(), pack.anchor_lon());
-            if (d > 55000.0 && pack.reanchor_to(lat, lon)) {
-                streamer.invalidate_all_and_prewarm(sky_clouds.atmo().sun_dir);
-                objects.on_reanchor();
-                living_traffic.on_reanchor();
-                reg_atmo.sync_region(lat, lon);
-            } else streamer.clear_pending_requests();
+            if (d <= 55000.0 || !transition_world(lat, lon)) streamer.clear_pending_requests();
             ac_hud.state().view_mode = 0; ac_hud.state().look_yaw_deg = 0.0f; ac_hud.state().look_pitch_deg = -4.0f;
             ac_hud.reset_flight(lat, lon, pack.sample_elevation(lat, lon) + agl, hdg, 100.0, false);
             ac_hud.state().paused = true;
@@ -1072,13 +1077,8 @@ int main(int argc, char **argv) {
 
         // 3. REAL APPROACH, FLARE & LANDING onto Santa Cilia (LECI paved runway)
         if (const AirportInfo *leci = pack.find_airport("LECI")) {
-            if (nspain::haversine_m(leci->lat, leci->lon, pack.anchor_lat(), pack.anchor_lon()) > 45000.0 &&
-                pack.reanchor_to(leci->lat, leci->lon)) {
-                streamer.invalidate_all_and_prewarm(sky_clouds.atmo().sun_dir);
-                objects.on_reanchor();
-                living_traffic.on_reanchor();
-                reg_atmo.sync_region(leci->lat, leci->lon);
-            } else streamer.clear_pending_requests();
+            if (nspain::haversine_m(leci->lat, leci->lon, pack.anchor_lat(), pack.anchor_lon()) <= 45000.0 ||
+                !transition_world(leci->lat, leci->lon)) streamer.clear_pending_requests();
             const double dn = (leci->rwy_lat_b - leci->rwy_lat_a) * 111132.0;
             const double de = (leci->rwy_lon_b - leci->rwy_lon_a) * 111320.0 * std::cos(leci->rwy_lat_a * DEG2RAD_D);
             const double rwy_hdg = std::fmod(std::atan2(de, dn) * RAD2DEG_D + 360.0, 360.0);
@@ -1253,13 +1253,7 @@ int main(int argc, char **argv) {
         auto capture_airport_ground = [&](const char *ap_id, const char *tag) {
             const AirportInfo *ap = pack.find_airport(ap_id);
             if (!ap) return;
-            vegetation.invalidate();
-            if (pack.reanchor_to(ap->lat, ap->lon)) {
-                streamer.invalidate_all_and_prewarm(sky_clouds.atmo().sun_dir);
-                objects.on_reanchor();
-                living_traffic.on_reanchor();
-            }
-            reg_atmo.sync_region(ap->lat, ap->lon);
+            transition_world(ap->lat, ap->lon);
             frontend.open_airport(*ap);
             vegetation.prepare(pack, *ap);
             sky_clouds.reset_temporal_history();
@@ -1579,21 +1573,6 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    auto reanchor_world_with_loading = [&](const char *title, double target_lat, double target_lon) -> bool {
-        show_loading(title, "Re-anchoring elevation corridor...", 0.20f);
-        vegetation.invalidate();
-        if (!pack.reanchor_to(target_lat, target_lon)) return false;
-        show_loading(title, "Streaming coarse terrain & IGN PNOA...", 0.50f);
-        streamer.invalidate_all_and_prewarm(sky_clouds.atmo().sun_dir);
-        show_loading(title, "Loading local buildings, roads & traffic...", 0.78f);
-        objects.on_reanchor();
-        living_traffic.on_reanchor();
-        reg_atmo.sync_region(target_lat, target_lon);
-        sky_clouds.reset_temporal_history();
-        show_loading(title, "Finalizing local scene...", 0.96f);
-        return true;
-    };
-
     auto enter_region = [&](const AirportInfo &airport) {
         char title[128];
         std::snprintf(title, sizeof(title), "Loading %s - %s", airport.id.c_str(), airport.name.c_str());
@@ -1601,7 +1580,7 @@ int main(int argc, char **argv) {
         const auto *to = pack.find_region_by_id(airport.region_id);
         const double distance = nspain::haversine_m(airport.lat, airport.lon, pack.anchor_lat(), pack.anchor_lon());
         if (from != to || distance > 50000.0) {
-            reanchor_world_with_loading(title, airport.lat, airport.lon);
+            transition_world(airport.lat, airport.lon, title);
         } else {
             show_loading(title, "Clearing queued pages & syncing local ramp...", 0.55f);
             streamer.clear_pending_requests();
@@ -1904,7 +1883,7 @@ int main(int argc, char **argv) {
                     if (dist_m > 50000.0) {
                         char title[128];
                         std::snprintf(title, sizeof(title), "Transferring to %s - %s", target.id.c_str(), target.name.c_str());
-                        reanchor_world_with_loading(title, target.lat, target.lon);
+                        transition_world(target.lat, target.lon, title);
                     }
                     ac_hud.teleport_to_airport(target, 1400.0, 175.0);
                     sky_clouds.reset_temporal_history();
@@ -1918,17 +1897,8 @@ int main(int argc, char **argv) {
         // Silently shift local terrain anchor on long cross-country legs (>60 km) with NO loading screen in flight.
         const double anchor_drift_m = nspain::haversine_m(
             ac_hud.state().lat_deg, ac_hud.state().lon_deg, pack.anchor_lat(), pack.anchor_lon());
-        if (anchor_drift_m > 60000.0) {
-            vegetation.invalidate();
-            if (pack.reanchor_to(ac_hud.state().lat_deg, ac_hud.state().lon_deg)) {
-                streamer.invalidate_all_and_prewarm(sky_clouds.atmo().sun_dir);
-                objects.on_reanchor();
-                living_traffic.on_reanchor();
-                reg_atmo.sync_region(ac_hud.state().lat_deg, ac_hud.state().lon_deg);
-                sky_clouds.reset_temporal_history();
-                last_t = PlatformWindow::now_sec();
-            }
-        }
+        if (anchor_drift_m > 60000.0 && transition_world(ac_hud.state().lat_deg, ac_hud.state().lon_deg))
+            last_t = PlatformWindow::now_sec();
         render_one_frame(dt, true);
         push_audio_state(dt, ac_hud.state().paused || ac_hud.state().menu_open);
         // Pace strictly to display refresh rate (capped <= 60 FPS) so GPU/CPU never boost unnecessarily (<80 C).

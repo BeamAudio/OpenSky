@@ -143,7 +143,7 @@ void PackReader::clear_regions() {
     img_zooms_desc_.clear();
     surf_zooms_desc_.clear();
     vegetation_zooms_desc_.clear();
-    corridor_dem_.clear();
+    world_frame_ = std::make_shared<const WorldFrame>();
 }
 
 void PackReader::set_online_provider(OnlineOrthoProvider p) {
@@ -422,11 +422,48 @@ bool PackReader::append_pack_internal(const std::string &nspack_path) {
         return false;
     }
 
+    struct stat info{};
+    if (::fstat(fd, &info) != 0 || info.st_size < 0) {
+        ::close(fd);
+        return false;
+    }
+    const auto file_size = static_cast<uint64_t>(info.st_size);
+    const auto within_file = [file_size](uint64_t offset, uint64_t size) {
+        return offset >= sizeof(nspain::PackHeader) && offset <= file_size &&
+               size <= file_size - offset;
+    };
+    const auto index_size = static_cast<uint64_t>(hdr.index_count) * sizeof(nspain::PackTileEntry);
+    constexpr uint64_t max_manifest_size = 64 * 1024 * 1024;
+    constexpr uint64_t max_index_size = 256 * 1024 * 1024;
+    if (index_size > max_index_size || !within_file(hdr.index_offset, index_size) ||
+        hdr.manifest_size > max_manifest_size ||
+        (hdr.manifest_size != 0 && !within_file(hdr.manifest_offset, hdr.manifest_size)) ||
+        !(hdr.lat_min >= -90 && hdr.lat_min < hdr.lat_max && hdr.lat_max <= 90 &&
+          hdr.lon_min >= -180 && hdr.lon_min < hdr.lon_max && hdr.lon_max <= 180)) {
+        std::fprintf(stderr, "[PACK] Invalid bounds, index or manifest in %s\n", nspack_path.c_str());
+        ::close(fd);
+        return false;
+    }
+
     std::vector<nspain::PackTileEntry> raw_idx(hdr.index_count);
     ssize_t idx_bytes = static_cast<ssize_t>(raw_idx.size() * sizeof(nspain::PackTileEntry));
     if (idx_bytes > 0 && ::pread(fd, raw_idx.data(), static_cast<size_t>(idx_bytes), static_cast<off_t>(hdr.index_offset)) != idx_bytes) {
         ::close(fd);
         return false;
+    }
+    for (const auto &tile : raw_idx) {
+        const auto zoom = (tile.key >> 48) & 0xff;
+        const auto x = (tile.key >> 24) & 0xffffff;
+        const auto y = tile.key & 0xffffff;
+        constexpr uint32_t max_tile_bytes = 16 * 1024 * 1024;
+        constexpr uint16_t max_tile_side = 2048;
+        if (tile.size == 0 || tile.size > max_tile_bytes || !within_file(tile.offset, tile.size) ||
+            tile.width == 0 || tile.width > max_tile_side || tile.height == 0 || tile.height > max_tile_side ||
+            zoom > 23 || x >= (1u << zoom) || y >= (1u << zoom)) {
+            std::fprintf(stderr, "[PACK] Invalid tile record in %s\n", nspack_path.c_str());
+            ::close(fd);
+            return false;
+        }
     }
     std::string manifest(hdr.manifest_size, '\0');
     if (hdr.manifest_size > 0 &&
@@ -489,6 +526,8 @@ void PackReader::finalize_packs(double anchor_lat, double anchor_lon) {
         header_.lon_max = std::max(header_.lon_max, r.hdr.lon_max);
         header_.lat_max = std::max(header_.lat_max, r.hdr.lat_max);
     }
+    // For equal layer and XYZ keys the first installed pack in sorted path order wins.
+    // All tile readers resolve through find_entry(), including cached sampling.
     std::sort(index_.begin(), index_.end(), [](const IndexedTile &a, const IndexedTile &b) {
         if (a.key != b.key) return a.key < b.key;
         return a.pack_idx < b.pack_idx;
@@ -596,13 +635,15 @@ bool PackReader::reanchor_to(double lat_deg, double lon_deg) {
             lon_deg = r->anchor_lon;
         }
     }
-    if (!corridor_dem_.empty() &&
-        nspain::haversine_m(lat_deg, lon_deg, anchor_lat_, anchor_lon_) < 500.0) return false;
-    anchor_lat_ = lat_deg;
-    anchor_lon_ = lon_deg;
-    nspain::meters_per_degree(anchor_lat_, anchor_m_lat_, anchor_m_lon_);
-    set_online_camera(anchor_lat_, anchor_lon_);
-    bake_corridor_dem();
+    if (!world_frame_->dem.empty() &&
+        nspain::haversine_m(lat_deg, lon_deg, anchor_lat(), anchor_lon()) < 500.0) return false;
+    auto next = std::make_shared<WorldFrame>();
+    next->anchor_lat = lat_deg;
+    next->anchor_lon = lon_deg;
+    nspain::meters_per_degree(lat_deg, next->metres_lat, next->metres_lon);
+    bake_corridor_dem(*next);
+    world_frame_ = std::move(next);
+    set_online_camera(lat_deg, lon_deg);
     return true;
 }
 
@@ -1214,15 +1255,15 @@ bool PackReader::is_excluded_for_vegetation(double lat_deg, double lon_deg) cons
     // Oriented runway corridor clearance (keeps runway & approach clear while allowing trees right beside strip borders!)
     for (const auto &a : airports_) {
         auto excluded_by = [&](double lat_a, double lon_a, double lat_b, double lon_b, double width) {
-            double ax = (lon_a - lon_deg) * anchor_m_lon_;
-            double ay = (lat_a - lat_deg) * anchor_m_lat_;
-            double bx = (lon_b - lon_deg) * anchor_m_lon_;
-            double by = (lat_b - lat_deg) * anchor_m_lat_;
+            double ax = (lon_a - lon_deg) * world_frame_->metres_lon;
+            double ay = (lat_a - lat_deg) * world_frame_->metres_lat;
+            double bx = (lon_b - lon_deg) * world_frame_->metres_lon;
+            double by = (lat_b - lat_deg) * world_frame_->metres_lat;
             double dx = bx - ax, dy = by - ay;
             double len2 = dx * dx + dy * dy;
             if (len2 < 100.0) {
-                double dn = (lat_deg - a.lat) * anchor_m_lat_;
-                double de = (lon_deg - a.lon) * anchor_m_lon_;
+                double dn = (lat_deg - a.lat) * world_frame_->metres_lat;
+                double de = (lon_deg - a.lon) * world_frame_->metres_lon;
                 return dn * dn + de * de < 95.0 * 95.0;
             }
             double len = std::sqrt(len2);
@@ -1253,8 +1294,8 @@ bool PackReader::is_near_building(double lat_deg, double lon_deg, double pad_m) 
             if (it == bldg_grid_.end()) continue;
             for (uint32_t idx : it->second) {
                 const BuildingRec &b = buildings_[idx];
-                double de = (lon_deg - b.lon) * anchor_m_lon_;
-                double dn = (lat_deg - b.lat) * anchor_m_lat_;
+                double de = (lon_deg - b.lon) * world_frame_->metres_lon;
+                double dn = (lat_deg - b.lat) * world_frame_->metres_lat;
                 double r = 0.52 * std::max(b.width_m, b.depth_m) + pad_m;
                 if (de * de + dn * dn < r * r) return true;
             }
@@ -1280,10 +1321,10 @@ bool PackReader::is_near_road(double lat_deg, double lon_deg, double pad_m) cons
                 for (uint16_t pi = 0; pi + 1 < rr.count; pi++) {
                     const RoadPt &p0 = road_pts_[rr.offset + pi];
                     const RoadPt &p1 = road_pts_[rr.offset + pi + 1];
-                    double ax = (p0.lon_e6 * 1e-6 - lon_deg) * anchor_m_lon_;
-                    double ay = (p0.lat_e6 * 1e-6 - lat_deg) * anchor_m_lat_;
-                    double bx = (p1.lon_e6 * 1e-6 - lon_deg) * anchor_m_lon_;
-                    double by = (p1.lat_e6 * 1e-6 - lat_deg) * anchor_m_lat_;
+                    double ax = (p0.lon_e6 * 1e-6 - lon_deg) * world_frame_->metres_lon;
+                    double ay = (p0.lat_e6 * 1e-6 - lat_deg) * world_frame_->metres_lat;
+                    double bx = (p1.lon_e6 * 1e-6 - lon_deg) * world_frame_->metres_lon;
+                    double by = (p1.lat_e6 * 1e-6 - lat_deg) * world_frame_->metres_lat;
                     double sx = bx - ax, sy = by - ay;
                     double l2 = sx * sx + sy * sy;
                     double t = (l2 > 1e-4) ? std::clamp((-ax * sx - ay * sy) / l2, 0.0, 1.0) : 0.0;
@@ -1299,17 +1340,22 @@ bool PackReader::is_near_road(double lat_deg, double lon_deg, double pad_m) cons
 
 void PackReader::fill_cell_occupancy(double min_e, double min_n, double span_m, int res, uint8_t *out_mask,
                                     bool include_verges) const {
+    fill_cell_occupancy(*world_frame_, min_e, min_n, span_m, res, out_mask, include_verges);
+}
+
+void PackReader::fill_cell_occupancy(const WorldFrame &frame, double min_e, double min_n,
+                                     double span_m, int res, uint8_t *out_mask, bool include_verges) const {
     if (!out_mask || res <= 0 || span_m <= 1.0) return;
     std::memset(out_mask, 0, static_cast<size_t>(res) * static_cast<size_t>(res));
     double max_e = min_e + span_m, max_n = min_n + span_m;
     double cell_m = span_m / static_cast<double>(res);
     double inv_cell = 1.0 / cell_m;
-    double pad_lat = 40.0 / anchor_m_lat_;
-    double pad_lon = 40.0 / anchor_m_lon_;
-    double lat0 = anchor_lat_ + min_n / anchor_m_lat_ - pad_lat;
-    double lat1 = anchor_lat_ + max_n / anchor_m_lat_ + pad_lat;
-    double lon0 = anchor_lon_ + min_e / anchor_m_lon_ - pad_lon;
-    double lon1 = anchor_lon_ + max_e / anchor_m_lon_ + pad_lon;
+    double pad_lat = 40.0 / frame.metres_lat;
+    double pad_lon = 40.0 / frame.metres_lon;
+    double lat0 = frame.anchor_lat + min_n / frame.metres_lat - pad_lat;
+    double lat1 = frame.anchor_lat + max_n / frame.metres_lat + pad_lat;
+    double lon0 = frame.anchor_lon + min_e / frame.metres_lon - pad_lon;
+    double lon1 = frame.anchor_lon + max_e / frame.metres_lon + pad_lon;
 
     int32_t cx0 = static_cast<int32_t>(std::floor(lon0 / BLDG_CELL_DEG));
     int32_t cx1 = static_cast<int32_t>(std::floor(lon1 / BLDG_CELL_DEG));
@@ -1335,8 +1381,8 @@ void PackReader::fill_cell_occupancy(double min_e, double min_n, double span_m, 
                 if (it == bldg_grid_.end()) continue;
                 for (uint32_t idx : it->second) {
                     const BuildingRec &b = buildings_[idx];
-                    double be = (b.lon - anchor_lon_) * anchor_m_lon_;
-                    double bn = (b.lat - anchor_lat_) * anchor_m_lat_;
+                    double be = (b.lon - frame.anchor_lon) * frame.metres_lon;
+                    double bn = (b.lat - frame.anchor_lat) * frame.metres_lat;
                     // Keep strict roof interior when !include_verges so urban park, courtyard & street trees keep LiDAR volume.
                     double r = include_verges
                         ? (0.54 * std::max(b.width_m, b.depth_m) + 5.5)
@@ -1362,10 +1408,10 @@ void PackReader::fill_cell_occupancy(double min_e, double min_n, double span_m, 
                     for (uint16_t pi = 0; pi + 1 < rr.count; pi++) {
                         const RoadPt &p0 = road_pts_[rr.offset + pi];
                         const RoadPt &p1 = road_pts_[rr.offset + pi + 1];
-                        double e0 = (p0.lon_e6 * 1e-6 - anchor_lon_) * anchor_m_lon_;
-                        double n0 = (p0.lat_e6 * 1e-6 - anchor_lat_) * anchor_m_lat_;
-                        double e1 = (p1.lon_e6 * 1e-6 - anchor_lon_) * anchor_m_lon_;
-                        double n1 = (p1.lat_e6 * 1e-6 - anchor_lat_) * anchor_m_lat_;
+                        double e0 = (p0.lon_e6 * 1e-6 - frame.anchor_lon) * frame.metres_lon;
+                        double n0 = (p0.lat_e6 * 1e-6 - frame.anchor_lat) * frame.metres_lat;
+                        double e1 = (p1.lon_e6 * 1e-6 - frame.anchor_lon) * frame.metres_lon;
+                        double n1 = (p1.lat_e6 * 1e-6 - frame.anchor_lat) * frame.metres_lat;
                         if (std::max(e0, e1) + rad < min_e || std::min(e0, e1) - rad > max_e ||
                             std::max(n0, n1) + rad < min_n || std::min(n0, n1) - rad > max_n) continue;
                         double len = std::hypot(e1 - e0, n1 - n0);
@@ -1383,10 +1429,10 @@ void PackReader::fill_cell_occupancy(double min_e, double min_n, double span_m, 
     // 3. Clear airport runway corridors (bit 2) so LiDAR vegetation never pops up on runways
     for (const auto &a : airports_) {
         auto stamp_rwy = [&](double lat_a, double lon_a, double lat_b, double lon_b, double width) {
-            double e0 = (lon_a - anchor_lon_) * anchor_m_lon_;
-            double n0 = (lat_a - anchor_lat_) * anchor_m_lat_;
-            double e1 = (lon_b - anchor_lon_) * anchor_m_lon_;
-            double n1 = (lat_b - anchor_lat_) * anchor_m_lat_;
+            double e0 = (lon_a - frame.anchor_lon) * frame.metres_lon;
+            double n0 = (lat_a - frame.anchor_lat) * frame.metres_lat;
+            double e1 = (lon_b - frame.anchor_lon) * frame.metres_lon;
+            double n1 = (lat_b - frame.anchor_lat) * frame.metres_lat;
             double rad = std::max(22.0, width * 0.85);
             if (std::max(e0, e1) + rad < min_e || std::min(e0, e1) - rad > max_e ||
                 std::max(n0, n1) + rad < min_n || std::min(n0, n1) - rad > max_n) return;
@@ -1409,10 +1455,10 @@ bool PackReader::query_runway(double lat_deg, double lon_deg, double &out_elev_m
     for (const auto &a : airports_) {
         auto query = [&](double lat_a, double lon_a, double elev_a, double lat_b, double lon_b,
                          double elev_b, double width, const std::string &surface) {
-            double ax = (lon_a - lon_deg) * anchor_m_lon_;
-            double ay = (lat_a - lat_deg) * anchor_m_lat_;
-            double bx = (lon_b - lon_deg) * anchor_m_lon_;
-            double by = (lat_b - lat_deg) * anchor_m_lat_;
+            double ax = (lon_a - lon_deg) * world_frame_->metres_lon;
+            double ay = (lat_a - lat_deg) * world_frame_->metres_lat;
+            double bx = (lon_b - lon_deg) * world_frame_->metres_lon;
+            double by = (lat_b - lat_deg) * world_frame_->metres_lat;
             double dx = bx - ax, dy = by - ay;
             double len2 = dx * dx + dy * dy;
             if (len2 < 100.0) return false;
@@ -1600,32 +1646,32 @@ Vec3 PackReader::sample_imagery_rgb(double lat_deg, double lon_deg) const {
     return {0.16f, 0.22f, 0.11f};
 }
 
-void PackReader::bake_corridor_dem() {
+void PackReader::bake_corridor_dem(WorldFrame &frame) const {
     double b_lon0 = header_.lon_min, b_lat0 = header_.lat_min;
     double b_lon1 = header_.lon_max, b_lat1 = header_.lat_max;
-    if (const LoadedRegion *ar = find_region_at(anchor_lat_, anchor_lon_)) {
+    if (const LoadedRegion *ar = find_region_at(frame.anchor_lat, frame.anchor_lon)) {
         b_lon0 = ar->hdr.lon_min; b_lat0 = ar->hdr.lat_min;
         b_lon1 = ar->hdr.lon_max; b_lat1 = ar->hdr.lat_max;
     }
-    sh_min_e_ = (b_lon0 - anchor_lon_) * anchor_m_lon_;
-    sh_min_n_ = (b_lat0 - anchor_lat_) * anchor_m_lat_;
-    double max_e = (b_lon1 - anchor_lon_) * anchor_m_lon_;
-    double max_n = (b_lat1 - anchor_lat_) * anchor_m_lat_;
-    sh_span_e_ = std::max(1000.0, max_e - sh_min_e_);
-    sh_span_n_ = std::max(1000.0, max_n - sh_min_n_);
-    corridor_dem_.resize(SH_W * SH_H);
-    corridor_gi_u32_.assign(static_cast<size_t>(SH_W) * SH_H, 0x0FFFFFFFu);
+    frame.min_e = (b_lon0 - frame.anchor_lon) * frame.metres_lon;
+    frame.min_n = (b_lat0 - frame.anchor_lat) * frame.metres_lat;
+    double max_e = (b_lon1 - frame.anchor_lon) * frame.metres_lon;
+    double max_n = (b_lat1 - frame.anchor_lat) * frame.metres_lat;
+    frame.span_e = std::max(1000.0, max_e - frame.min_e);
+    frame.span_n = std::max(1000.0, max_n - frame.min_n);
+    frame.dem.resize(SH_W * SH_H);
+    frame.lighting.assign(static_cast<size_t>(SH_W) * SH_H, 0x0FFFFFFFu);
     for (int y = 0; y < SH_H; y++) {
         double lat = b_lat0 + (y + 0.5) / SH_H * (b_lat1 - b_lat0);
         for (int x = 0; x < SH_W; x++) {
             double lon = b_lon0 + (x + 0.5) / SH_W * (b_lon1 - b_lon0);
-            corridor_dem_[y * SH_W + x] = static_cast<float>(sample_elevation(lat, lon));
+            frame.dem[y * SH_W + x] = static_cast<float>(sample_elevation(lat, lon));
         }
     }
 
     // Pre-bake whole-corridor 50km 10-Time-of-Day mountain horizon shadows + 8-dir Valley Sky AO in PARALLEL across CPU cores!
-    const float cell_e = static_cast<float>(sh_span_e_ / SH_W);
-    const float cell_n = static_cast<float>(sh_span_n_ / SH_H);
+    const float cell_e = static_cast<float>(frame.span_e / SH_W);
+    const float cell_n = static_cast<float>(frame.span_n / SH_H);
     const float cell_m = 0.5f * (cell_e + cell_n);
     const size_t npix = static_cast<size_t>(SH_W) * SH_H;
     std::vector<uint8_t> phase_q[10];
@@ -1641,7 +1687,7 @@ void PackReader::bake_corridor_dem() {
         float tan_el = std::tan(el);
         for (int y = 0; y < SH_H; y++) {
             for (int x = 0; x < SH_W; x++) {
-                float h0 = corridor_dem_[y * SH_W + x];
+                float h0 = frame.dem[y * SH_W + x];
                 float max_occ = 0.0f;
                 for (int s = 1; s <= 44; s++) {
                     float dist_px = (s <= 14) ? static_cast<float>(s) : (14.0f + (s - 14) * 2.4f);
@@ -1649,7 +1695,7 @@ void PackReader::bake_corridor_dem() {
                     int ty = static_cast<int>(std::lround(y + dn_u * dist_px));
                     if (tx < 0 || tx >= SH_W || ty < 0 || ty >= SH_H) break;
                     float dist_m = dist_px * cell_m;
-                    float dh = corridor_dem_[ty * SH_W + tx] - (h0 + dist_m * tan_el + 10.0f);
+                    float dh = frame.dem[ty * SH_W + tx] - (h0 + dist_m * tan_el + 10.0f);
                     if (dh > 0.0f) {
                         max_occ = std::max(max_occ, std::min(1.0f, dh / std::max(34.0f, dist_m * 0.042f)));
                         if (max_occ >= 0.99f) break;
@@ -1676,7 +1722,7 @@ void PackReader::bake_corridor_dem() {
         static constexpr float kAoDistPx[4] = {1.5f, 3.5f, 7.5f, 15.0f};
         for (int y = 0; y < SH_H; y++) {
             for (int x = 0; x < SH_W; x++) {
-                float h0 = corridor_dem_[y * SH_W + x];
+                float h0 = frame.dem[y * SH_W + x];
                 float ao_sum = 0.0f;
                 for (int d = 0; d < 8; d++) {
                     float a = (2.0f * PI_F * d) / 8.0f;
@@ -1685,7 +1731,7 @@ void PackReader::bake_corridor_dem() {
                     for (float r : kAoDistPx) {
                         int tx = std::clamp(static_cast<int>(std::lround(x + cx * r)), 0, SH_W - 1);
                         int ty = std::clamp(static_cast<int>(std::lround(y + sy * r)), 0, SH_H - 1);
-                        float dh = std::max(0.0f, corridor_dem_[ty * SH_W + tx] - h0);
+                        float dh = std::max(0.0f, frame.dem[ty * SH_W + tx] - h0);
                         float dm = r * cell_m;
                         max_sin = std::max(max_sin, dh / std::sqrt(dh * dh + dm * dm));
                     }
@@ -1721,23 +1767,23 @@ void PackReader::bake_corridor_dem() {
         for (int ch = 0; ch < 10; ch++) v |= (static_cast<uint32_t>(phase_q[ch][i]) << (ch * 2));
         acc[i] = v;
     }
-    corridor_gi_u32_.swap(acc);
+    frame.lighting.swap(acc);
 }
 
-float PackReader::sample_global_shadow(double east_m, double north_m, float phase10) const {
-    if (corridor_gi_u32_.empty()) return 1.0f;
-    double u = (east_m - sh_min_e_) / sh_span_e_;
-    double v = (north_m - sh_min_n_) / sh_span_n_;
+float PackReader::sample_global_shadow(const WorldFrame &frame, double east_m, double north_m, float phase10) {
+    if (frame.lighting.empty()) return 1.0f;
+    double u = (east_m - frame.min_e) / frame.span_e;
+    double v = (north_m - frame.min_n) / frame.span_n;
     if (u <= 0.002 || u >= 0.998 || v <= 0.002 || v >= 0.998) return 1.0f;
     double fx = std::clamp(u * SH_W - 0.5, 0.0, static_cast<double>(SH_W - 1));
     double fy = std::clamp(v * SH_H - 0.5, 0.0, static_cast<double>(SH_H - 1));
     int x0 = std::min(SH_W - 2, static_cast<int>(fx));
     int y0 = std::min(SH_H - 2, static_cast<int>(fy));
     float dx = static_cast<float>(fx - x0), dy = static_cast<float>(fy - y0);
-    float s00 = unpack_tod10_vis(corridor_gi_u32_[y0 * SH_W + x0], phase10);
-    float s10 = unpack_tod10_vis(corridor_gi_u32_[y0 * SH_W + x0 + 1], phase10);
-    float s01 = unpack_tod10_vis(corridor_gi_u32_[(y0 + 1) * SH_W + x0], phase10);
-    float s11 = unpack_tod10_vis(corridor_gi_u32_[(y0 + 1) * SH_W + x0 + 1], phase10);
+    float s00 = unpack_tod10_vis(frame.lighting[y0 * SH_W + x0], phase10);
+    float s10 = unpack_tod10_vis(frame.lighting[y0 * SH_W + x0 + 1], phase10);
+    float s01 = unpack_tod10_vis(frame.lighting[(y0 + 1) * SH_W + x0], phase10);
+    float s11 = unpack_tod10_vis(frame.lighting[(y0 + 1) * SH_W + x0 + 1], phase10);
     float a = s00 * (1.0f - dx) + s10 * dx;
     float b = s01 * (1.0f - dx) + s11 * dx;
     return a * (1.0f - dy) + b * dy;
@@ -1777,14 +1823,14 @@ uint32_t PackReader::sample_baked_gi_u32_en(double east_m, double north_m) const
     };
 
     // 1. Whole-corridor 50km 10-TOD mountain horizon shadows + valley Sky AO
-    if (!corridor_gi_u32_.empty()) {
-        double fx = std::clamp((east_m  - sh_min_e_) / sh_span_e_, 0.0, 0.9999) * (SH_W - 1);
-        double fy = std::clamp((north_m - sh_min_n_) / sh_span_n_, 0.0, 0.9999) * (SH_H - 1);
-        sample_grid_bilerp(corridor_gi_u32_.data(), SH_W, SH_H, fx, fy, false);
+    if (!world_frame_->lighting.empty()) {
+        double fx = std::clamp((east_m  - world_frame_->min_e) / world_frame_->span_e, 0.0, 0.9999) * (SH_W - 1);
+        double fy = std::clamp((north_m - world_frame_->min_n) / world_frame_->span_n, 0.0, 0.9999) * (SH_H - 1);
+        sample_grid_bilerp(world_frame_->lighting.data(), SH_W, SH_H, fx, fy, false);
     }
     // 2. Populated-zone 3.9m/px 10-TOD building shadows + street-canyon Sky AO + RT Night Local Lights!
-    double pt_lat = anchor_lat_ + north_m / anchor_m_lat_;
-    double pt_lon = anchor_lon_ + east_m / anchor_m_lon_;
+    double pt_lat = world_frame_->anchor_lat + north_m / world_frame_->metres_lat;
+    double pt_lon = world_frame_->anchor_lon + east_m / world_frame_->metres_lon;
     if (const LoadedRegion *sr = find_sh_region_at_ll(pt_lat, pt_lon)) {
         double re = (pt_lon - sr->anchor_lon) * sr->m_lon;
         double rn = (pt_lat - sr->anchor_lat) * sr->m_lat;
@@ -1801,12 +1847,12 @@ uint32_t PackReader::sample_baked_gi_u32_en(double east_m, double north_m) const
 
 void PackReader::fill_corridor_gi_rg8(float phase10, std::vector<uint8_t> &out_rg) const {
     out_rg.resize(static_cast<size_t>(SH_W) * SH_H * 2u);
-    if (corridor_gi_u32_.empty()) {
+    if (world_frame_->lighting.empty()) {
         std::fill(out_rg.begin(), out_rg.end(), 255u);
         return;
     }
-    for (size_t i = 0; i < corridor_gi_u32_.size(); i++) {
-        uint32_t b = corridor_gi_u32_[i];
+    for (size_t i = 0; i < world_frame_->lighting.size(); i++) {
+        uint32_t b = world_frame_->lighting[i];
         out_rg[i * 2 + 0] = static_cast<uint8_t>(std::clamp(unpack_tod10_vis(b, phase10) * 255.0f + 0.5f, 0.0f, 255.0f));
         out_rg[i * 2 + 1] = static_cast<uint8_t>((b >> 20u) & 0xFFu);
     }
@@ -1866,6 +1912,7 @@ void PackReader::rasterize_building_mask(
 }
 
 void PackReader::fill_page_data(
+    const WorldFrame &frame,
     double center_east_m, double center_north_m, double half_span_m,
     int height_n, int ortho_res, int aux_res,
     const Vec3 &sun_dir,
@@ -1874,8 +1921,8 @@ void PackReader::fill_page_data(
     std::vector<uint8_t> &out_norm_ao_rgba,
     std::vector<uint8_t> &out_surf_rgba
 ) const {
-    const double center_lat = anchor_lat_ + center_north_m / anchor_m_lat_;
-    const double center_lon = anchor_lon_ + center_east_m / anchor_m_lon_;
+    const double center_lat = frame.anchor_lat + center_north_m / frame.metres_lat;
+    const double center_lon = frame.anchor_lon + center_east_m / frame.metres_lon;
     const double span_m = half_span_m * 2.0;
 
     // 1. Height grid (with 1-cell border gutter so normals & vertex morphing are 100% crack-free across CDLOD quads!)
@@ -1888,11 +1935,11 @@ void PackReader::fill_page_data(
         for (int k = 0; k < 24; k++) z_key[k] = UINT64_MAX;
         for (int j = 0; j < height_n; j++) {
             double north_m = center_north_m - half_span_m + static_cast<double>(j - 1) * h_step;
-            double clat = std::clamp(anchor_lat_ + north_m / anchor_m_lat_, header_.lat_min, header_.lat_max);
+            double clat = std::clamp(frame.anchor_lat + north_m / frame.metres_lat, header_.lat_min, header_.lat_max);
             double merc_y01 = (1.0 - std::asinh(std::tan(clat * DEG2RAD_D)) / PI_D) * 0.5;
             for (int i = 0; i < height_n; i++) {
                 double east_m = center_east_m - half_span_m + static_cast<double>(i - 1) * h_step;
-                double clon = std::clamp(anchor_lon_ + east_m / anchor_m_lon_, header_.lon_min, header_.lon_max);
+                double clon = std::clamp(frame.anchor_lon + east_m / frame.metres_lon, header_.lon_min, header_.lon_max);
                 double merc_x01 = (clon + 180.0) / 360.0;
                 float val = 400.0f;
                 for (int z : elev_zooms_desc_) {
@@ -1965,12 +2012,12 @@ void PackReader::fill_page_data(
         thread_local std::vector<double> col_east, col_x01;
         col_east.resize(res);
         col_x01.resize(res);
-        const double inv_m_lon = 1.0 / anchor_m_lon_;
-        const double inv_m_lat = 1.0 / anchor_m_lat_;
+        const double inv_m_lon = 1.0 / frame.metres_lon;
+        const double inv_m_lat = 1.0 / frame.metres_lat;
         for (int i = 0; i < res; i++) {
             double em = center_east_m - half_span_m + i * step;
             col_east[i] = em;
-            double clon = std::clamp(anchor_lon_ + em * inv_m_lon, header_.lon_min, header_.lon_max);
+            double clon = std::clamp(frame.anchor_lon + em * inv_m_lon, header_.lon_min, header_.lon_max);
             col_x01[i] = (clon + 180.0) * (1.0 / 360.0);
         }
 
@@ -1981,8 +2028,8 @@ void PackReader::fill_page_data(
             int32_t lim = 0, tx0 = 0, ty0 = 0, nx = 0, ny = 0;
             std::vector<std::shared_ptr<DecodedRgbTile>> tiles;
         };
-        double clat_s = std::clamp(anchor_lat_ + (center_north_m - half_span_m) * inv_m_lat, header_.lat_min, header_.lat_max);
-        double clat_n = std::clamp(anchor_lat_ + (center_north_m + half_span_m) * inv_m_lat, header_.lat_min, header_.lat_max);
+        double clat_s = std::clamp(frame.anchor_lat + (center_north_m - half_span_m) * inv_m_lat, header_.lat_min, header_.lat_max);
+        double clat_n = std::clamp(frame.anchor_lat + (center_north_m + half_span_m) * inv_m_lat, header_.lat_min, header_.lat_max);
         double my_top = (1.0 - std::asinh(std::tan(clat_n * DEG2RAD_D)) / PI_D) * 0.5;
         double my_bot = (1.0 - std::asinh(std::tan(clat_s * DEG2RAD_D)) / PI_D) * 0.5;
         double mx_min = col_x01[0], mx_max = col_x01[res - 1];
@@ -2023,7 +2070,7 @@ void PackReader::fill_page_data(
         (void)jitter_coarse;
         for (int j = 0; j < res; j++) {
             const double north_m = center_north_m - half_span_m + j * step;
-            const double clat = std::clamp(anchor_lat_ + north_m * inv_m_lat, header_.lat_min, header_.lat_max);
+            const double clat = std::clamp(frame.anchor_lat + north_m * inv_m_lat, header_.lat_min, header_.lat_max);
             const double merc_y01 = (1.0 - std::asinh(std::tan(clat * DEG2RAD_D)) / PI_D) * 0.5;
             uint8_t *row_out = dst.data() + static_cast<size_t>(j) * res * 3;
 
@@ -2132,7 +2179,7 @@ void PackReader::fill_page_data(
     std::vector<uint8_t> vegetation_exclusions;
     if (span_m <= 2500.0) {
         vegetation_exclusions.resize(static_cast<size_t>(aux_res) * aux_res);
-        fill_cell_occupancy(center_east_m - half_span_m, center_north_m - half_span_m,
+        fill_cell_occupancy(frame, center_east_m - half_span_m, center_north_m - half_span_m,
                             span_m, aux_res, vegetation_exclusions.data(), false);
     }
 
@@ -2176,15 +2223,15 @@ void PackReader::fill_page_data(
             w_raw *= (1.0f - smoothstep_f(0.16f, 0.34f, sl));
 
             // Pre-bake 50km planetary 10-TOD horizon shadow + local cliff shadow + UNIVERSAL populated-zone 10-TOD shadows!
-            float occ = 1.0f - sample_global_shadow(east_m, north_m, phase10);
+            float occ = 1.0f - sample_global_shadow(frame, east_m, north_m, phase10);
 
             // Fold pre-baked 3.9m/px populated-zone 10-TOD building shadows, Sky AO & RT Night Local Lights into EVERY town/village!
             float rt_night = 0.0f;
             if (has_city_sh && w_raw < 0.35f) {
                 double re = east_m, rn = north_m;
-                if (sh_reg->anchor_lat != anchor_lat_ || sh_reg->anchor_lon != anchor_lon_) {
-                    double p_lat = anchor_lat_ + north_m / anchor_m_lat_;
-                    double p_lon = anchor_lon_ + east_m  / anchor_m_lon_;
+                if (sh_reg->anchor_lat != frame.anchor_lat || sh_reg->anchor_lon != frame.anchor_lon) {
+                    double p_lat = frame.anchor_lat + north_m / frame.metres_lat;
+                    double p_lon = frame.anchor_lon + east_m  / frame.metres_lon;
                     re = (p_lon - sh_reg->anchor_lon) * sh_reg->m_lon;
                     rn = (p_lat - sh_reg->anchor_lat) * sh_reg->m_lat;
                 }

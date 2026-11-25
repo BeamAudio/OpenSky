@@ -143,7 +143,7 @@ private:
 
     void worker_loop();
     bool coarse_root_ready() const;
-    void fill_staging_slot(StagingSlot &slot, uint64_t key);
+    void fill_staging_slot(StagingSlot &slot, uint64_t key, const PackReader::WorldFrame &frame);
     int allocate_cache_slice(uint64_t key, float now_sec);
     static void downsample_rgba_box2(const uint8_t *src, int sw, int sh, uint8_t *dst);
 
@@ -166,6 +166,7 @@ private:
     std::unordered_map<uint64_t, float> pending_reqs_;
     std::unordered_map<uint64_t, uint64_t> inflight_keys_;
     std::atomic<uint64_t> generation_{1};
+    std::shared_ptr<const PackReader::WorldFrame> world_frame_; // guarded by req_mtx_
     Vec3 sun_dir_{0.86f, 0.32f, 0.38f};
 
     std::atomic<bool> stop_{false};

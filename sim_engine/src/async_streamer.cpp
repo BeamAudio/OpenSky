@@ -70,6 +70,7 @@ AsyncTerrainStreamer::PageLayout AsyncTerrainStreamer::make_page_layout(OrthoFor
 
 bool AsyncTerrainStreamer::init(const PackReader *pack, int worker_count, OrthoFormat format) {
     pack_ = pack;
+    world_frame_ = pack_->world_frame();
     format_ = format;
     layout_ = make_page_layout(format);
     if (!pack_) return false;
@@ -174,7 +175,7 @@ void AsyncTerrainStreamer::downsample_rgba_box2(const uint8_t *src, int sw, int 
     }
 }
 
-void AsyncTerrainStreamer::fill_staging_slot(StagingSlot &slot, uint64_t key) {
+void AsyncTerrainStreamer::fill_staging_slot(StagingSlot &slot, uint64_t key, const PackReader::WorldFrame &frame) {
     double t0 = PlatformWindow::now_sec();
     QuadKey qk = QuadKey::unpack(key);
     double ce = 0.0, cn = 0.0, hs = 1000.0;
@@ -188,7 +189,7 @@ void AsyncTerrainStreamer::fill_staging_slot(StagingSlot &slot, uint64_t key) {
 
     thread_local std::vector<float> tmp_h;
     thread_local std::vector<uint8_t> tmp_ortho, tmp_norm, tmp_surf;
-    pack_->fill_page_data(ce, cn, hs, HEIGHT_N, ORTHO_RES, AUX_RES, sdir, tmp_h, tmp_ortho, tmp_norm, tmp_surf);
+    pack_->fill_page_data(frame, ce, cn, hs, HEIGHT_N, ORTHO_RES, AUX_RES, sdir, tmp_h, tmp_ortho, tmp_norm, tmp_surf);
 
     // PBO storage is mapped write-only and may be write-combined. Build and
     // encode in cached system RAM, then make one sequential copy to staging.
@@ -266,6 +267,7 @@ void AsyncTerrainStreamer::worker_loop() {
             pending_reqs_.erase(best_it);
             const uint64_t job_gen = generation_.load(std::memory_order_acquire);
             inflight_keys_[best_key] = job_gen;
+            const auto frame = world_frame_;
             lk.unlock();
 
             if (job_gen != generation_.load(std::memory_order_acquire)) {
@@ -273,7 +275,7 @@ void AsyncTerrainStreamer::worker_loop() {
                 continue;
             }
             staging_[free_slot].generation = job_gen;
-            fill_staging_slot(staging_[free_slot], best_key);
+            fill_staging_slot(staging_[free_slot], best_key, *frame);
             if (job_gen != generation_.load(std::memory_order_acquire)) {
                 // Re-anchor happened mid-build: discard cleanly without entering READY upload queue.
                 staging_[free_slot].key = UINT64_MAX;
@@ -412,10 +414,10 @@ void AsyncTerrainStreamer::clear_pending_requests() {
 }
 
 void AsyncTerrainStreamer::invalidate_all_and_prewarm(const Vec3 &sun_dir) {
-    // Advance generation counter immediately so any in-flight old-anchor jobs self-discard cleanly with 0 ms block.
-    generation_.fetch_add(1, std::memory_order_acq_rel);
     {
         std::lock_guard<std::mutex> lk(req_mtx_);
+        world_frame_ = pack_->world_frame();
+        generation_.fetch_add(1, std::memory_order_acq_rel);
         pending_reqs_.clear();
         inflight_keys_.clear();
         key_to_slot_.clear();

@@ -147,6 +147,17 @@ public:
         std::unordered_map<int64_t, CityShEntry> sh_idx;
     };
 
+    struct WorldFrame {
+        double anchor_lat = 42.10, anchor_lon = -0.30;
+        double metres_lat = 111132.0, metres_lon = 82600.0;
+        double min_e = 0.0, min_n = 0.0, span_e = 1.0, span_n = 1.0;
+        std::vector<float> dem;
+        std::vector<uint32_t> lighting;
+    };
+
+    // Capture on the runtime thread, then pass the immutable frame to workers.
+    std::shared_ptr<const WorldFrame> world_frame() const { return world_frame_; }
+
     PackReader() = default;
     ~PackReader();
 
@@ -162,10 +173,10 @@ public:
     const std::deque<LoadedRegion> &regions() const { return regions_; }
     std::string active_weather_path(double lat_deg, double lon_deg) const;
 
-    double anchor_lat() const { return anchor_lat_; }
-    double anchor_lon() const { return anchor_lon_; }
-    double anchor_m_lat() const { return anchor_m_lat_; }
-    double anchor_m_lon() const { return anchor_m_lon_; }
+    double anchor_lat() const { return world_frame_->anchor_lat; }
+    double anchor_lon() const { return world_frame_->anchor_lon; }
+    double anchor_m_lat() const { return world_frame_->metres_lat; }
+    double anchor_m_lon() const { return world_frame_->metres_lon; }
     double lon_min() const { return header_.lon_min; }
     double lat_min() const { return header_.lat_min; }
     double lon_max() const { return header_.lon_max; }
@@ -197,6 +208,7 @@ public:
     // Fill a terrain page covering [center_e - half_span .. +half_span, center_n - half_span .. +half_span]
     // Height grid has border gutter (grid_n = 35 for 33x33 vertices); ortho has Kramer-Bruckner shock de-blurring!
     void fill_page_data(
+        const WorldFrame &frame,
         double center_east_m, double center_north_m, double half_span_m,
         int height_n, int ortho_res, int aux_res,
         const Vec3 &sun_dir,
@@ -207,11 +219,9 @@ public:
     ) const;
 
     // Pre-bake whole-corridor 50km planetary DEM 10-time-of-day horizon shadows + 8-dir Valley Sky AO (uint32 packed!)
-    void bake_corridor_dem();
-    float sample_global_shadow(double east_m, double north_m, float phase10) const;
     uint32_t sample_baked_gi_u32_en(double east_m, double north_m) const;
     void fill_corridor_gi_rg8(float phase10, std::vector<uint8_t> &out_rg) const;
-    const std::vector<uint32_t> &corridor_gi_u32() const { return corridor_gi_u32_; }
+    const std::vector<uint32_t> &corridor_gi_u32() const { return world_frame_->lighting; }
 
     // Splatters real OSM building footprints & heights into [0..255] alpha mask for PMRF far villages
     void rasterize_building_mask(
@@ -222,11 +232,11 @@ public:
     // Read-only access to the baked 512x384 corridor DEM (shared by RegionalAtmosphere mesoscale wind/wave solver!)
     int corridor_dem_w() const { return SH_W; }
     int corridor_dem_h() const { return SH_H; }
-    const std::vector<float> &corridor_dem() const { return corridor_dem_; }
-    double corridor_min_e() const { return sh_min_e_; }
-    double corridor_min_n() const { return sh_min_n_; }
-    double corridor_span_e() const { return sh_span_e_; }
-    double corridor_span_n() const { return sh_span_n_; }
+    const std::vector<float> &corridor_dem() const { return world_frame_->dem; }
+    double corridor_min_e() const { return world_frame_->min_e; }
+    double corridor_min_n() const { return world_frame_->min_n; }
+    double corridor_span_e() const { return world_frame_->span_e; }
+    double corridor_span_n() const { return world_frame_->span_n; }
 
     // Check if aircraft wheel is on any OurAirports runway (returns runway elevation + friction mu)
     bool query_runway(double lat_deg, double lon_deg, double &out_elev_m, double &out_mu, double &out_rough, std::string &out_id) const;
@@ -248,6 +258,10 @@ private:
         nspain::PackTileEntry entry{};
     };
 
+    void bake_corridor_dem(WorldFrame &frame) const;
+    static float sample_global_shadow(const WorldFrame &frame, double east_m, double north_m, float phase10);
+    void fill_cell_occupancy(const WorldFrame &frame, double min_e, double min_n,
+                             double span_m, int res, uint8_t *out_mask, bool include_verges) const;
     void clear_regions();
     bool append_pack_internal(const std::string &nspack_path);
     void finalize_packs(double anchor_lat, double anchor_lon);
@@ -306,10 +320,7 @@ private:
     std::vector<int> img_zooms_desc_;
     std::vector<int> surf_zooms_desc_;
     std::vector<int> vegetation_zooms_desc_;
-    double anchor_lat_ = 42.10;
-    double anchor_lon_ = -0.30;
-    double anchor_m_lat_ = 111132.0;
-    double anchor_m_lon_ = 82600.0;
+    std::shared_ptr<const WorldFrame> world_frame_ = std::make_shared<const WorldFrame>();
 
     mutable SyncLru<DecodedElevTile> elev_cache_{1024};
     mutable SyncLru<DecodedRgbTile> img_cache_{2048};
@@ -319,10 +330,6 @@ private:
     // 50km corridor DEM 10-time-of-day horizon shadow + Valley Sky AO table (uint32 packed!)
     static constexpr int SH_W = 512;
     static constexpr int SH_H = 384;
-    std::vector<float> corridor_dem_;
-    std::vector<uint32_t> corridor_gi_u32_; // 512x384 packed: bits 0..19 = 10x2-bit sun vis, bits 20..27 = 8-bit Sky AO!
-    double sh_min_e_ = 0.0, sh_min_n_ = 0.0, sh_span_e_ = 1.0, sh_span_n_ = 1.0;
-
     std::vector<AirportInfo> airports_;
     std::vector<BuildingRec> buildings_;
     std::unordered_map<int64_t, std::vector<uint32_t>> bldg_grid_;

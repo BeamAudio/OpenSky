@@ -439,9 +439,7 @@ int main(int argc, char **argv) {
     int tod_slot = (quick_profile || !autotest_dir.empty() || !topdown_dir.empty() || !airport_qa_dir.empty()) ? 2 : graphics_settings.time_of_day;
     // CLI selection enables repeatable QA captures; N cycles the same states during play.
     float wx_advance = 0.28f; // 0.0=Clear, 0.28=Fair SCT, 0.60=Broken, 0.92=Overcast/Rain!
-    bool show_airports = false;
     bool show_diagnostics = !autotest_dir.empty();
-    int airport_page = 0;
     int weather_debug_level = debug_overlays ? 1 : -1;
     bool physics_debug = debug_overlays;
 
@@ -597,8 +595,7 @@ int main(int argc, char **argv) {
     bool first_presented = false;
     int thermal_pixel_cap = 72;
     double last_thermal_check_t = -10.0;
-    auto render_one_frame = [&](double dt, bool draw_hud, int max_new_tree_cells = 1, const std::string &save_png = "", float fov_deg = 50.0f) {
-        sim_time += dt;
+    auto render_one_frame = [&](bool draw_hud, int max_new_tree_cells = 1, const std::string &save_png = "", float fov_deg = 50.0f) {
         frame_idx++;
         profiler.start_frame(frame_idx, quality);
         double prepare_start = profiler.cpu_start();
@@ -885,10 +882,10 @@ int main(int argc, char **argv) {
                 output_w, output_h, sky_clouds.atmo(), reg_atmo,
                 stream, terrain.last_stats(),
                 quality, objects.total_buildings(),
-                cur_fps, cur_avg_ms, cur_p95_ms, show_airports,
+                cur_fps, cur_avg_ms, cur_p95_ms,
                 (reg_atmo.has_weather() && !reg_atmo.manual_weather_override()) ? &reg_atmo.weather() : nullptr,
                 reg_atmo.regime_name(), reg_atmo.has_library() ? reg_atmo.library().provenance() : nullptr,
-                airport_page, show_diagnostics, debug_active ? &debug : nullptr
+                show_diagnostics, debug_active ? &debug : nullptr
             );
             frontend.draw_navigation(ac_hud, win);
         }
@@ -919,6 +916,13 @@ int main(int argc, char **argv) {
         }
     };
 
+    // Captures can intentionally advance the world clock without accepting player input.
+    const auto capture_frame = [&](double elapsed, bool draw_hud, int tree_budget = 1,
+                                   const std::string &png = "", float fov = 50.0f) {
+        sim_time += elapsed;
+        render_one_frame(draw_hud, tree_budget, png, fov);
+    };
+
     if (quick_profile) {
         tod_slot = (weather_arg == "fog") ? 0 : 2;
         const auto route = [&](const char *name, double lat, double lon, double agl, double heading) {
@@ -929,20 +933,20 @@ int main(int argc, char **argv) {
             for (int i = 0; i < 30 && !win.should_close(); ++i) {
                 win.poll_events();
                 step_flight(1.0 / 60.0);
-                render_one_frame(1.0 / 60.0, true);
+                capture_frame(1.0 / 60.0, true);
             }
             profiler.set_scene(name);
             for (int i = 0; i < 240 && !win.should_close(); ++i) {
                 double f0 = PlatformWindow::now_sec();
                 win.poll_events();
                 step_flight(1.0 / 60.0);
-                render_one_frame(1.0 / 60.0, true);
+                capture_frame(1.0 / 60.0, true);
                 double spare = (1.0 / 60.0) - (PlatformWindow::now_sec() - f0);
                 if (spare > 0.001) std::this_thread::sleep_for(std::chrono::duration<double>(spare));
             }
             if (!win.should_close()) {
                 profiler.set_scene(std::string(name) + "_capture");
-                render_one_frame(1.0 / 60.0, debug_overlays, 1, profile_dir + "/" + name + ".png");
+                capture_frame(1.0 / 60.0, debug_overlays, 1, profile_dir + "/" + name + ".png");
             }
         };
         if (req_region == "es_catalonia_coast") {
@@ -959,7 +963,7 @@ int main(int argc, char **argv) {
                 sky_clouds.reset_temporal_history();
                 for (int f = 0; f < 4; ++f) {
                     win.poll_events();
-                    render_one_frame(1.0 / 60.0, false, 1, (f == 3) ? (profile_dir + "/barcelona_chase.png") : "");
+                    capture_frame(1.0 / 60.0, false, 1, (f == 3) ? (profile_dir + "/barcelona_chase.png") : "");
                 }
                 ac_hud.state().view_mode = 0;
                 ac_hud.state().look_yaw_deg = 0.0f;
@@ -978,7 +982,7 @@ int main(int argc, char **argv) {
             ac_hud.state().look_pitch_deg = -8.0f;
             weather_debug_level = 0;
             sky_clouds.reset_temporal_history();
-            render_one_frame(1.0 / 60.0, true, 1, profile_dir + "/debug_chase.png");
+            capture_frame(1.0 / 60.0, true, 1, profile_dir + "/debug_chase.png");
         }
         profiler.finish();
         std::printf("[PROFILE] Capture complete -> %s\n", profile_dir.c_str());
@@ -1002,7 +1006,7 @@ int main(int argc, char **argv) {
             for (int f = 0; f < frames && !win.should_close(); ++f) {
                 double f0 = PlatformWindow::now_sec();
                 win.poll_events();
-                render_one_frame(1.0 / 60.0, false, 64);
+                capture_frame(1.0 / 60.0, false, 64);
                 streamer.flush_pending_sync(16, 0.25);
                 double sp = (1.0 / 60.0) - (PlatformWindow::now_sec() - f0);
                 if (sp > 0.001) std::this_thread::sleep_for(std::chrono::duration<double>(sp));
@@ -1021,7 +1025,7 @@ int main(int argc, char **argv) {
             ac_hud.reset_flight(start_lat, start_lon, es->rwy_elev_b + 1.0, rwy_hdg, 0.0, true);
             ac_hud.state().paused = false; ac_hud.state().parking_brake = false;
             wait_tiles(16);
-            render_one_frame(1.0 / 60.0, true, 1, region_test_dir + "/01_castejon_grass_lineup.png");
+            capture_frame(1.0 / 60.0, true, 1, region_test_dir + "/01_castejon_grass_lineup.png");
 
             double liftoff_ias = 0.0, roll_dist_m = 0.0, max_hdg_dev = 0.0, max_climb_fpm = 0.0;
             bool lifted = false;
@@ -1046,13 +1050,13 @@ int main(int argc, char **argv) {
                 if (step % 2 == 0) {
                     double f0 = PlatformWindow::now_sec();
                     win.poll_events();
-                    render_one_frame(dt * 2.0, true, 4);
+                    render_one_frame(true, 4);
                     double sp = (1.0 / 60.0) - (PlatformWindow::now_sec() - f0);
                     if (sp > 0.001) std::this_thread::sleep_for(std::chrono::duration<double>(sp));
                 }
                 if (lifted && !captured_climb && ns.agl_m > 65.0) {
                     captured_climb = true;
-                    render_one_frame(dt, true, 1, region_test_dir + "/02_castejon_departure_climb.png");
+                    render_one_frame(true, 1, region_test_dir + "/02_castejon_departure_climb.png");
                     break;
                 }
             }
@@ -1068,7 +1072,7 @@ int main(int argc, char **argv) {
             ac_hud.reset_flight(lat, lon, pack.sample_elevation(lat, lon) + agl, hdg, 100.0, false);
             ac_hud.state().paused = true;
             wait_tiles(16);
-            render_one_frame(1.0 / 60.0, true, 1, region_test_dir + "/" + fname);
+            capture_frame(1.0 / 60.0, true, 1, region_test_dir + "/" + fname);
             std::printf("[FLIGHT-DEMO REGION] Captured %s (%.4f, %.4f @ %.0fm AGL)\n", fname, lat, lon, agl);
         };
         tour_snap("03_mediano_reservoir.png", 42.3120,  0.1940, 180.0, 15.0);
@@ -1136,7 +1140,7 @@ int main(int argc, char **argv) {
                 const auto &ns = ac_hud.jsb_state();
                 if (!captured_final && !touched && d_thr < 380.0) {
                     captured_final = true;
-                    render_one_frame(dt, true, 1, region_test_dir + "/06_leci_short_final.png");
+                    render_one_frame(true, 1, region_test_dir + "/06_leci_short_final.png");
                 }
                 if (!touched && ns.on_ground) {
                     touched = true;
@@ -1144,12 +1148,12 @@ int main(int argc, char **argv) {
                     td_ias = ns.ias_kt;
                     td_g = ns.g_load;
                     td_lat = ns.lat_deg; td_lon = ns.lon_deg;
-                    render_one_frame(dt, true, 1, region_test_dir + "/07_leci_touchdown.png");
+                    render_one_frame(true, 1, region_test_dir + "/07_leci_touchdown.png");
                 }
                 if (step % 2 == 0) {
                     double f0 = PlatformWindow::now_sec();
                     win.poll_events();
-                    render_one_frame(dt * 2.0, true, 4);
+                    render_one_frame(true, 4);
                     double sp = (1.0 / 60.0) - (PlatformWindow::now_sec() - f0);
                     if (sp > 0.001) std::this_thread::sleep_for(std::chrono::duration<double>(sp));
                 }
@@ -1206,14 +1210,14 @@ int main(int argc, char **argv) {
             sky_clouds.reset_temporal_history();
             for (int w = 0; w < 12; w++) {
                 win.poll_events();
-                render_one_frame(1.0 / 60.0, false, 64, "", td_fov);
+                capture_frame(1.0 / 60.0, false, 64, "", td_fov);
                 streamer.flush_pending_sync(16, 0.25);
             }
             std::string png_name = std::string(site.name) + ".png";
             std::string png_path = topdown_dir + "/" + png_name;
             for (int f = 0; f < 4; f++) {
                 win.poll_events();
-                render_one_frame(1.0 / 60.0, false, 64, (f == 3) ? png_path : "", td_fov);
+                capture_frame(1.0 / 60.0, false, 64, (f == 3) ? png_path : "", td_fov);
             }
             double half_n_m = site.agl_m * std::tan(0.5 * td_fov * DEG2RAD_D);
             double half_e_m = half_n_m * aspect;
@@ -1259,12 +1263,12 @@ int main(int argc, char **argv) {
             sky_clouds.reset_temporal_history();
             for (int w = 0; w < 14; ++w) {
                 win.poll_events();
-                render_one_frame(1.0 / 60.0, false, 64, "", 58.0f);
+                capture_frame(1.0 / 60.0, false, 64, "", 58.0f);
                 streamer.flush_pending_sync(16, 0.25);
             }
             for (int f = 0; f < 4; ++f) {
                 win.poll_events();
-                render_one_frame(1.0 / 60.0, false, 64, (f == 3) ? (airport_qa_dir + "/" + tag + "_walk.png") : "", 58.0f);
+                capture_frame(1.0 / 60.0, false, 64, (f == 3) ? (airport_qa_dir + "/" + tag + "_walk.png") : "", 58.0f);
             }
             // Also capture cockpit view from the aircraft parked beside the terrain-clear runway!
             frontend.board(ac_hud);
@@ -1272,12 +1276,12 @@ int main(int argc, char **argv) {
             sky_clouds.reset_temporal_history();
             for (int w = 0; w < 10; ++w) {
                 win.poll_events();
-                render_one_frame(1.0 / 60.0, true, 64, "", 50.0f);
+                capture_frame(1.0 / 60.0, true, 64, "", 50.0f);
                 streamer.flush_pending_sync(16, 0.25);
             }
             for (int f = 0; f < 4; ++f) {
                 win.poll_events();
-                render_one_frame(1.0 / 60.0, true, 64, (f == 3) ? (airport_qa_dir + "/" + tag + "_cockpit.png") : "", 50.0f);
+                capture_frame(1.0 / 60.0, true, 64, (f == 3) ? (airport_qa_dir + "/" + tag + "_cockpit.png") : "", 50.0f);
             }
             // Low chase view down the departure runway to inspect surface, markers, fences, buildings, and trees!
             ac_hud.state().view_mode = 1;
@@ -1286,7 +1290,7 @@ int main(int argc, char **argv) {
             sky_clouds.reset_temporal_history();
             for (int f = 0; f < 4; ++f) {
                 win.poll_events();
-                render_one_frame(1.0 / 60.0, false, 64, (f == 3) ? (airport_qa_dir + "/" + tag + "_runway.png") : "", 52.0f);
+                capture_frame(1.0 / 60.0, false, 64, (f == 3) ? (airport_qa_dir + "/" + tag + "_runway.png") : "", 52.0f);
             }
             const auto ts = terrain.last_stats();
             const auto ss = streamer.stats();
@@ -1374,7 +1378,7 @@ int main(int argc, char **argv) {
             for (int w = 0; w < warm_frames; w++) {
                 win.poll_events();
                 step_flight(1.0 / 60.0);
-                render_one_frame(1.0 / 60.0, draw_hud, 128);
+                capture_frame(1.0 / 60.0, draw_hud, 128);
                 if (cockpit_qa) streamer.flush_pending_sync(4, 0.12);
                 else streamer.flush_pending_sync(24, 0.25);
             }
@@ -1382,7 +1386,7 @@ int main(int argc, char **argv) {
             for (int f = 0; f < 10; f++) {
                 win.poll_events();
                 step_flight(1.0 / 60.0);
-                render_one_frame(1.0 / 60.0, draw_hud, 128, (f == 9) ? p : "");
+                capture_frame(1.0 / 60.0, draw_hud, 128, (f == 9) ? p : "");
             }
             StreamStats ss = streamer.stats();
             CdlodDrawStats cd = terrain.last_stats();
@@ -1526,13 +1530,13 @@ int main(int argc, char **argv) {
                 sky_clouds.reset_temporal_history();
                 for (int w = 0; w < 10; w++) {
                     win.poll_events();
-                    render_one_frame(1.0 / 60.0, true, 128);
+                    capture_frame(1.0 / 60.0, true, 128);
                     streamer.flush_pending_sync(20, 0.20);
                 }
                 for (int w = 0; w < 6; w++) {
                     win.poll_events();
                     step_flight(1.0 / 60.0);
-                    render_one_frame(1.0 / 60.0, true, 128);
+                    capture_frame(1.0 / 60.0, true, 128);
                 }
                 streamer.flush_pending_sync(20, 0.20);
                 profiler.set_scene(tag);
@@ -1546,7 +1550,7 @@ int main(int argc, char **argv) {
                 for (int f = 0; f < N; f++) {
                     win.poll_events();
                     step_flight(1.0 / 60.0);
-                    render_one_frame(1.0 / 60.0, true);
+                    capture_frame(1.0 / 60.0, true);
                     double now = PlatformWindow::now_sec();
                     ms.push_back((now - prev) * 1000.0);
                     prev = now;
@@ -1716,7 +1720,6 @@ int main(int argc, char **argv) {
                                                                       sky_clouds.atmo().sun_dir, sim_time, wx_est);
                     frontend.open_airport(*airport, &park_wx);
                     prepare_airfield(*airport);
-                    show_airports = false;
                 }
                 break;
             case GameFrontend::Request::Board: {
@@ -1734,8 +1737,7 @@ int main(int argc, char **argv) {
                         enter_region(*airport);
                         frontend.park(ac_hud, *airport);
                         prepare_airfield(*airport);
-                        show_airports = false;
-                    }
+                        }
                 }
                 break;
             case GameFrontend::Request::Editor:
@@ -1790,7 +1792,8 @@ int main(int argc, char **argv) {
         }
         if (frontend.walking()) {
             if (win.key_pressed(KEY_U)) audio.set_muted(!audio.is_muted());
-            render_one_frame(dt, true);
+            sim_time += dt;
+            render_one_frame(true);
             push_audio_state(dt, false);
             const double spare = frame_period - (PlatformWindow::now_sec() - now);
             if (spare > 0.0005) std::this_thread::sleep_for(std::chrono::duration<double>(spare));
@@ -1863,35 +1866,6 @@ int main(int argc, char **argv) {
             audio.set_muted(!audio.is_muted());
             std::printf("[AUDIO] %s\n", audio.is_muted() ? "Muted" : "Unmuted");
         }
-        if (!frontend.active_flight() && !ac_hud.state().menu_open && win.key_pressed(KEY_TAB)) {
-            show_airports = !show_airports;
-            airport_page = 0;
-        }
-
-        if (show_airports && !ac_hud.state().menu_open && !frontend.active_flight()) {
-            const auto &aps = pack.airports();
-            int npages = std::max(1, (static_cast<int>(aps.size()) + 7) / 8);
-            if (npages > 1 && win.key_pressed(KEY_9)) {
-                airport_page = (airport_page + 1) % npages;
-            }
-            int i0 = airport_page * 8;
-            for (int k = 0; k < 8 && (i0 + k) < static_cast<int>(aps.size()); k++) {
-                if (win.key_pressed(static_cast<KeyCode>(KEY_1 + k))) {
-                    const AirportInfo &target = aps[i0 + k];
-                    double dist_m = nspain::haversine_m(target.lat, target.lon, pack.anchor_lat(), pack.anchor_lon());
-                    streamer.clear_pending_requests();
-                    if (dist_m > 50000.0) {
-                        char title[128];
-                        std::snprintf(title, sizeof(title), "Transferring to %s - %s", target.id.c_str(), target.name.c_str());
-                        transition_world(target.lat, target.lon, title);
-                    }
-                    ac_hud.teleport_to_airport(target, 1400.0, 175.0);
-                    sky_clouds.reset_temporal_history();
-                    show_airports = false;
-                }
-            }
-        }
-
         step_flight(dt);
         frontend.step_flight(ac_hud, dt);
         // Silently shift local terrain anchor on long cross-country legs (>60 km) with NO loading screen in flight.
@@ -1899,7 +1873,8 @@ int main(int argc, char **argv) {
             ac_hud.state().lat_deg, ac_hud.state().lon_deg, pack.anchor_lat(), pack.anchor_lon());
         if (anchor_drift_m > 60000.0 && transition_world(ac_hud.state().lat_deg, ac_hud.state().lon_deg))
             last_t = PlatformWindow::now_sec();
-        render_one_frame(dt, true);
+        sim_time += dt;
+        render_one_frame(true);
         push_audio_state(dt, ac_hud.state().paused || ac_hud.state().menu_open);
         // Pace strictly to display refresh rate (capped <= 60 FPS) so GPU/CPU never boost unnecessarily (<80 C).
         const double spare = frame_period - (PlatformWindow::now_sec() - now);

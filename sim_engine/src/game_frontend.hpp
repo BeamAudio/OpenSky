@@ -1,6 +1,7 @@
 #pragma once
 
 #include "aircraft_hud.hpp"
+#include "aircraft_session.hpp"
 #include "gl_loader.hpp"
 #include "math3d.hpp"
 #include "pack_reader.hpp"
@@ -18,19 +19,9 @@ class SkyAndClouds;
 
 class GameFrontend {
 public:
-    struct Location {
-        double lat = 0, lon = 0, alt = 0, heading = 0, pitch = 0;
-    };
-    struct FlightLogEntry {
-        std::string dep_id, arr_id, grade;
-        double minutes = 0.0, distance_nm = 0.0, fuel_gal = 0.0;
-        double touchdown_fpm = 0.0, crosswind_kt = 0.0;
-    };
-    struct PassportStamp {
-        std::string airport_id;
-        int visits = 0;
-        double best_fpm = 9999.0;
-    };
+    using Location = AircraftLocation;
+    using FlightLogEntry = FleetFlightLogEntry;
+    using PassportStamp = FleetPassportStamp;
     enum class Request { None, Walk, Board, Park, Editor, Quit };
 
     ~GameFrontend();
@@ -59,10 +50,10 @@ public:
     const AirportInfo *parked_airport() const;
     bool can_park(const AircraftAndHud &aircraft) const;
     const Location &walker() const { return walker_; }
-    const Location &parking_spot() const { return parking_spot_; }
+    const Location &parking_spot() const { return session_.profile().parking_spot_; }
     bool walking() const { return walking_; }
     bool inspecting() const { return inspecting_; }
-    bool active_flight() const { return flight_active_; }
+    bool active_flight() const { return session_.flight_active_; }
     Request take_request();
 
 private:
@@ -70,19 +61,17 @@ private:
     bool is_full_service_airport(const std::string &id) const;
     enum class Page { World, Logbook, Settings, Controls };
     enum class WalkStation { Nose = 0, LeftWing, RightWing, Gear, Tail, Door };
-    struct RoutePoint { std::string label; double lat, lon; };
+    using RoutePoint = FleetRoutePoint;
     void draw_world(AircraftAndHud &aircraft, const PlatformWindow &win,
                     RegionalAtmosphere *reg_atmo, const AtmosphereState *atmo, double sim_time_sec);
     void draw_logbook(AircraftAndHud &aircraft);
     void draw_settings(AircraftAndHud &aircraft, int &time_of_day, RegionalAtmosphere *reg_atmo);
     void draw_controls(AircraftAndHud &aircraft);
     void load_profile();
-    std::filesystem::path profile_file_;
     void focus_airport(const AirportInfo &airport, float zoom);
     void add_point(RoutePoint point);
     float distance_to_plane() const;
     WalkStation nearest_walk_station(float &out_dist_m) const;
-    PassportStamp *find_stamp(const std::string &id);
     const PassportStamp *find_stamp(const std::string &id) const;
 
     void read_pointer(const PlatformWindow &win);
@@ -104,38 +93,16 @@ private:
     double globe_lat_ = 42.5, globe_lon_ = 0.48;
     float globe_zoom_ = 1.0f;
     int airport_page_ = 0, route_page_ = 0, passport_page_ = 0;
-    std::string parked_id_, selected_id_;
-    std::vector<RoutePoint> route_;
+    std::string selected_id_;
+    AircraftSession session_;
     int model_history_page_ = 0;
-    size_t active_leg_ = 0;
     bool add_waypoint_ = false;
-    bool walking_ = false, inspecting_ = false, flight_active_ = false;
+    bool walking_ = false, inspecting_ = false;
     WalkStation active_station_ = WalkStation::Door;
     bool walk_checked_[6] = {};
     bool tutorial_open_ = true;
     bool kneeboard_open_ = false;
-    Location walker_{}, parking_spot_{};
-    bool has_custom_park_ = false;
-    AircraftCareSnapshot care_{};
-    double hours_ = 0.0;
-    int64_t last_park_epoch_ = 0;
-    double remote_fuel_added_ = 0.0; // Caps remote-strip jerrycan refills per visit
-    // Flight tracking & touchdown debrief
-    std::string dep_airport_id_;
-    double flight_elapsed_s_ = 0.0, flight_airborne_total_s_ = 0.0;
-    double flight_dist_m_ = 0.0, flight_start_fuel_ = 0.0;
-    double prev_lat_ = 0.0, prev_lon_ = 0.0;
-    double airborne_seconds_ = 0.0;
-    double last_sink_ = 0.0, last_g_ = 1.0, save_elapsed_ = 0.0;
-    bool was_grounded_ = true;
-    bool has_touchdown_ = false;
-    double td_fpm_ = 0.0, td_xwind_kt_ = 0.0, td_g_ = 1.0, td_banner_s_ = 0.0;
-    std::string td_surface_, td_grade_;
-    // Pilot Logbook & Aragon Airfield Passport
-    int total_landings_ = 0;
-    double best_landing_fpm_ = 9999.0;
-    std::vector<PassportStamp> passport_;
-    std::vector<FlightLogEntry> logbook_;
+    Location walker_{};
     std::string status_;
     std::string walk_notice_;
 };

@@ -32,6 +32,8 @@ SRCS := \
 	src/audio_engine.cpp \
 	src/aircraft_hud.cpp \
 	src/game_frontend.cpp \
+	src/aircraft_session.cpp \
+	src/fleet_profile.cpp \
 	src/debug_overlays.cpp \
 	src/main.cpp \
 	../engine/src/c172_systems.cpp \

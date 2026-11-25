@@ -1,5 +1,7 @@
 #pragma once
 
+#include "aircraft_condition.hpp"
+
 #include "../../engine/src/c172_systems.hpp"
 #include "../../engine/src/opentrack_udp.hpp"
 #include "../../engine/src/flight_model_jsb.hpp"
@@ -33,35 +35,6 @@ struct DebugOverlayView {
 
 // C172S EYEPOINT is 25 inches above its CG in the flight model.
 inline constexpr float COCKPIT_EYE_HEIGHT_M = 25.0f * 0.0254f;
-
-struct AircraftCareSnapshot {
-    double left_fuel_gal = 21.0;
-    double right_fuel_gal = 21.0;
-    double oil_quarts = 7.4;
-    double oil_hours = 0.0;
-    double battery_soc = 0.95;
-    double spark_fouling = 0.0;
-    double shock_cooling = 0.0;
-    double cylinder_wear = 0.0;
-    double airframe_damage = 0.0;
-    double tire_wear = 0.0;
-    double brake_wear = 0.0;
-    double gear_alignment = 0.0;
-    double prop_nicks = 0.0;
-    double windshield_dirt = 0.0;
-    double sump_water = 0.0;
-    bool chocks_on = true;
-    bool pitot_cover_on = true;
-    bool tie_downs_on = true;
-    bool master_on = false;
-    bool avionics_on = false;
-    int magnetos = 0;
-    int fuel_selector = 2;
-    double mixture = 0.0;
-    double flaps_deg = 0.0;
-    double carb_heat = 0.0;
-    bool engine_running = false;
-};
 
 struct FlightSimState {
     double lat_deg = 42.53131;
@@ -145,11 +118,10 @@ public:
         const StreamStats &st, const CdlodDrawStats &cd,
         int quality, int total_bldgs,
         double fps, double avg_ms, double p95_ms,
-        bool show_airports,
         const WeatherSnapshot *wx_snap = nullptr,
         const char *regime_name = nullptr,
         const char *wx_provenance = nullptr,
-        int airport_page = 0, bool show_diagnostics = true,
+        bool show_diagnostics = true,
         const DebugOverlayView *debug = nullptr
     );
 
@@ -177,6 +149,7 @@ public:
 
 private:
     friend class GameFrontend;
+    friend class AircraftSession;
     void flush_hud(float width, float height, GLuint font = 0);
     struct HudVert {
         float x, y;

@@ -107,7 +107,6 @@ For OSM roads and baked settlements outside the bundled Spain extracts, provide 
 | Settings | Adjust terrain LOD, online imagery, aircraft and weather detail, super-resolution, AA, and native cockpit resolution |
 | `K` | Toggle cold & dark / running engine |
 | `F` / `V` | Flaps down / up |
-| `9` | Toggle high-speed slew |
 | `F1`–`F4` | Graphics tier: Low (iGPU) → Medium → High → Ultra |
 | `F5` | Live CPU, GPU, memory and frame-time profiler |
 | `F6` | Cycle the four terrain-following weather debug layers |

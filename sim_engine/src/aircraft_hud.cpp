@@ -535,12 +535,6 @@ void AircraftAndHud::step_inputs_and_physics(const PlatformWindow &win, double d
     }
     if (win.key_pressed(KEY_F)) systems_.set_flaps_target_deg(std::min(30.0, systems_.get_flaps_target_deg() + 10.0));
     if (win.key_pressed(KEY_V)) systems_.set_flaps_target_deg(std::max(0.0, systems_.get_flaps_target_deg() - 10.0));
-    if (win.key_pressed(KEY_9)) {
-        st_.slew_fast = !st_.slew_fast;
-        if (!st_.slew_fast)
-            reset_flight(st_.lat_deg, st_.lon_deg, st_.alt_msl_m, st_.heading_deg, 100.0, false);
-    }
-
     // Trackpad Auto-Return Mouse Yoke (zero XWarpPointer -> zero XWayland runaway!):
     // Gliding on the trackpad steers smoothly; lifting your finger returns the stick smoothly to center,
     // where the flight director automatically holds wings-level & 0-fpm cruise (or straight taxi heading).
@@ -1426,11 +1420,10 @@ void AircraftAndHud::render_hud(
     const StreamStats &st, const CdlodDrawStats &cd,
     int quality, int total_bldgs,
     double fps, double avg_ms, double p95_ms,
-    bool show_airports,
     const WeatherSnapshot *wx_snap,
     const char *regime_name,
     const char *wx_provenance,
-    int airport_page, bool show_diagnostics, const DebugOverlayView *debug
+    bool show_diagnostics, const DebugOverlayView *debug
 ) {
     hud_verts_.clear();
     const float wf = static_cast<float>(win_w), hf = static_cast<float>(win_h);
@@ -1533,34 +1526,6 @@ void AircraftAndHud::render_hud(
         hud_text(margin + 12.0f * ui, footer + 6.0f * ui, 19.0f * ui, flight, 0.93f, 0.97f, 1.0f, 1.0f);
         hud_text(wf - 480.0f * ui, footer + 6.0f * ui, 16.0f * ui,
                  "ESC Menu   N Season   F5 Profile   F6 Weather   F7 Physics", 0.94f, 0.97f, 1.0f, 1.0f);
-    }
-
-    // Interactive Tab Airport Quick-Jump Glass Panel (paginated across ALL installed Spain regions!)
-    if (show_airports && !st_.menu_open) {
-        const auto &aps = pack_->airports();
-        int tot = static_cast<int>(aps.size());
-        int npages = std::max(1, (tot + 7) / 8);
-        int pg = std::clamp(airport_page, 0, npages - 1);
-        int i0 = pg * 8;
-        int n = std::min(8, std::max(0, tot - i0));
-        bool has_next = (npages > 1);
-        float ay = margin + (show_diagnostics ? lh + 10.0f * ui : 0.0f);
-        float aw = std::min(wf * 0.48f, 48.0f * adv + pad_x * 2.0f);
-        float ah = pad_y * 2.0f + (n + (has_next ? 2 : 1)) * row_h;
-        hud_rect(margin, ay, aw, ah, 0.035f, 0.060f, 0.095f, 0.90f);
-        hud_border(margin, ay, aw, ah, std::max(1.0f, 1.5f * ui), 0.95f, 0.80f, 0.38f, 0.70f);
-        char hdr[96];
-        std::snprintf(hdr, sizeof(hdr), "AIRFIELD QUICK-JUMP [%d/%d] (%zu total, 1-8):", pg + 1, npages, aps.size());
-        hud_text(margin + pad_x, ay + pad_y, fh, hdr, 1.00f, 0.88f, 0.45f, 1.0f);
-        char line[192];
-        for (int i = 0; i < n; i++) {
-            const auto &ap = aps[i0 + i];
-            std::snprintf(line, sizeof(line), "[%d] %-8s %-26.26s (%s)", i + 1, ap.id.c_str(), ap.name.c_str(), ap.region_id.c_str());
-            hud_text(margin + pad_x, ay + pad_y + (i + 1) * row_h, fh * 0.94f, line, 0.92f, 0.96f, 1.00f, 1.0f);
-        }
-        if (has_next) {
-            hud_text(margin + pad_x, ay + pad_y + (n + 1) * row_h, fh * 0.94f, "[9] Next page of airfields", 0.52f, 0.88f, 0.98f, 1.0f);
-        }
     }
 
     if (debug && !st_.menu_open)

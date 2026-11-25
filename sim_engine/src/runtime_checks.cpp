@@ -3,6 +3,7 @@
 #include "aircraft_hud.hpp"
 #include "aircraft_session.hpp"
 #include "async_streamer.hpp"
+#include "flight_replay.hpp"
 #include "simulation_clock.hpp"
 
 #include <chrono>
@@ -143,6 +144,22 @@ bool replay_check(const PackReader &pack, bool gpu) {
     if (std::abs(time - 2.0) > tol || !std::isfinite(flight.alt_msl_m)) return false;
     std::printf("[REPLAY] %.12f %.12f %.9f %.9f %.9f %.9f\n", flight.lat_deg, flight.lon_deg,
                 flight.alt_msl_m, flight.heading_deg, air.oat_c, air.wind_east_mps);
+
+    // Exercise live AircraftAndHud::resolve_world_collisions -> FlightModel::apply_impact_impulse path (Torre del Agua, 76m tall)
+    const double torre_lat = 41.6693, torre_lon = -0.9073;
+    const double torre_g = pack.sample_elevation(torre_lat, torre_lon);
+    aircraft.reset_flight(torre_lat, torre_lon, torre_g + 45.0, 0.0, 48.0, false);
+    aircraft.step_autonomous_assist(tick, 0.0, 0.0, 0.0, 0.0, sky, weather, time + tick);
+    const auto &post = aircraft.jsb_state();
+    AircraftCareSnapshot dmg{};
+    aircraft.sync_care_snapshot(dmg);
+    const double tot_dmg = dmg.dmg_nose + dmg.dmg_wing_l + dmg.dmg_wing_r + dmg.dmg_tail + dmg.airframe_damage;
+    if (!std::isfinite(post.lat_deg) || !std::isfinite(post.lon_deg) || !std::isfinite(post.alt_msl_m) ||
+        tot_dmg <= 0.05) {
+        std::fprintf(stderr, "[COLL-CHK-FAIL] post=(%.6f,%.6f,%.1f) g=%.1f dmg=%.3f\n",
+                     post.lat_deg, post.lon_deg, post.alt_msl_m, torre_g, tot_dmg);
+        return false;
+    }
     return true;
 }
 
@@ -198,6 +215,27 @@ bool world_check(PackReader &pack, bool gpu, bool full_outlook) {
         }
     }
     if (!overlap.get()) return false;
+    if (gpu) {
+        // Verify async region transition isolates pending pages until commit and lands L0..L2 resident immediately.
+        const uint64_t l0_key = QuadKey{0, 0, 0}.pack();
+        const uint64_t l1_key = QuadKey{1, 1, 0}.pack();
+        auto next_frame = pack.prepare_world_frame(home->lat, home->lon, true);
+        if (!next_frame) return false;
+        stream.begin_async_transition(next_frame, check_sun, home->lat, home->lon, 40.0, 10.0);
+        const auto t_start = std::chrono::steady_clock::now();
+        bool staged = false;
+        while (std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count() < 5.0) {
+            stream.begin_frame(100);
+            stream.pump_gpu_uploads(1.0f, 4, 4.0);
+            const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
+            if (stream.is_async_transition_ready(elapsed)) { staged = true; break; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(4));
+        }
+        if (!staged || stream.find_resident(l0_key, 1.0f, nullptr, false) < 0) return false;
+        pack.commit_world_frame(next_frame);
+        stream.commit_async_transition();
+        if (stream.find_resident(l0_key, 1.0f) < 0 || stream.find_resident(l1_key, 1.0f) < 0) return false;
+    }
     if (!full_outlook) return true;
     const auto region_id = weather.model_history().back().region_id;
     weather.request_outlook();
@@ -224,13 +262,81 @@ bool world_check(PackReader &pack, bool gpu, bool full_outlook) {
     return false;
 }
 
+bool replay_and_assist_checks() {
+    // 1. Route video persistence + wrap-aware heading interpolation.
+    ScopedTempDir tmp("opensky-route-XXXXXX");
+    if (tmp.dir.empty()) return false;
+    RouteVideoRecording rec;
+    rec.title = "ES-0205 -> LESU";
+    rec.frames = {
+        {10.0, 42.50, 0.48, 1200.0, 350.0, 2.0, -5.0, 95.0, 2350.0, 0.0, 0.72, 0.1, 0.05, 0.0},
+        {20.0, 42.55, 0.55, 1300.0, 10.0,  4.0, +5.0, 99.0, 2400.0, 10.0, 0.78, -0.1, -0.02, 0.02},
+    };
+    const auto rpath = tmp.dir / "last_flight.nsroute";
+    if (!save_route_video(rpath, rec)) return false;
+    RouteVideoRecording loaded;
+    if (!load_route_video(rpath, loaded) || loaded.frames.size() != 2 || loaded.title != rec.title) return false;
+    const RouteVideoFrame mid = sample_route_video(loaded, 15.0);
+    if (std::abs(std::remainder(mid.heading_deg - 0.0, 360.0)) > 0.1 ||
+        std::abs(mid.pitch_deg - 3.0) > 0.01 || std::abs(mid.flaps_deg - 5.0) > 0.01) {
+        return false;
+    }
+
+    // 2. Smooth VSI-guided flight assist (zero step jump across neutral pitch center).
+    nspain::FlightState fs{};
+    fs.on_ground = false;
+    fs.ias_kt = 95.0;
+    fs.vsi_mps = 3.0;
+    const auto a0 = compute_flight_and_taxi_assist(0.0, 0.00, 0.0, false, 0.0, fs);
+    const auto a1 = compute_flight_and_taxi_assist(0.0, 0.05, 0.0, false, 0.0, fs);
+    if (std::abs(a1.target_pitch_deg - a0.target_pitch_deg) > 1.0) return false;
+    return true;
+}
+
+bool collision_and_damage_checks(const PackReader &pack) {
+    // 1. Building / landmark collision hits solidly; open sky and runway clear cleanly.
+    const double pilar_g = pack.sample_elevation(41.6569, -0.8787);
+    const auto pilar_hit = pack.query_object_collision(41.6569, -0.8787, pilar_g + 10.0, 0.6);
+    const auto sky_clear = pack.query_object_collision(41.6569, -0.8787, pilar_g + 180.0, 0.6);
+    if (!pilar_hit.hit || pilar_hit.kind > 1 || sky_clear.hit) return false;
+
+    if (const AirportInfo *es = pack.find_airport("ES-0205")) {
+        const double rwy_g = pack.sample_elevation(es->lat, es->lon);
+        if (pack.query_object_collision(es->lat, es->lon, rwy_g + 1.5, 0.5).hit) return false;
+    }
+
+    // 2. Procedural damage & windshield crack persist cleanly across fleet_profile v3 save/load.
+    ScopedTempDir tmp("opensky-dmg-XXXXXX");
+    if (tmp.dir.empty()) return false;
+    const auto pfile = tmp.dir / "fleet.ini";
+    FleetProfile p;
+    p.parked_id_ = "ES-0205";
+    p.care_.airframe_damage = 0.42;
+    p.care_.prop_nicks = 0.35;
+    p.care_.windshield_crack = 0.68;
+    p.care_.dmg_nose = 0.55;
+    p.care_.dmg_wing_l = 0.30;
+    p.care_.dmg_wing_r = 0.15;
+    p.care_.dmg_tail = 0.22;
+    std::string err;
+    FleetProfile loaded;
+    if (!write_fleet_profile(pfile, p, err) || read_fleet_profile(pfile, loaded) != ProfileLoad::Loaded) return false;
+    if (std::abs(loaded.care_.windshield_crack - 0.68) > 1e-6 ||
+        std::abs(loaded.care_.dmg_nose - 0.55) > 1e-6 ||
+        std::abs(loaded.care_.dmg_wing_l - 0.30) > 1e-6 ||
+        std::abs(loaded.care_.dmg_tail - 0.22) > 1e-6) return false;
+    return true;
+}
+
 } // namespace
 
 int run_runtime_checks(PackReader &pack, bool gpu, bool full_outlook) {
     if (!profile_checks(pack)) { std::fprintf(stderr, "[RUNTIME] Fleet profile or parking check failed\n"); return 1; }
+    if (!replay_and_assist_checks()) { std::fprintf(stderr, "[RUNTIME] Route replay or flight assist check failed\n"); return 1; }
+    if (!collision_and_damage_checks(pack)) { std::fprintf(stderr, "[RUNTIME] Object collision or damage check failed\n"); return 1; }
     if (!replay_check(pack, gpu)) { std::fprintf(stderr, "[RUNTIME] Replay failed\n"); return 1; }
     if (!world_check(pack, gpu, full_outlook)) { std::fprintf(stderr, "[RUNTIME] Region concurrency or outlook check failed\n"); return 1; }
-    std::puts("[RUNTIME OK] Save, parking, replay, and world transitions");
+    std::puts("[RUNTIME OK] Save, parking, replay, flight assist, and world transitions");
     return 0;
 }
 } // namespace nsim

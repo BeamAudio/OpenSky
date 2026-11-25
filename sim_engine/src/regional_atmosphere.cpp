@@ -910,22 +910,26 @@ void RegionalAtmosphere::initialize_weather_model() {
             solver_.terrain_slope_n_[i] = dzdy / std::max(1.0f, dy * (yu - yd));
         }
     }
-    // A small terrain-position index separates exposed ridges from sheltered
-    // basins. It is baked once per region, then reused by the weather worker.
+    // Separable 9x9 spatial mean separates exposed ridges from sheltered basins cleanly per region bake.
+    std::vector<float> horiz_mean(cells, 0.0f);
+    for (int y = 0; y < GRID_H; ++y) {
+        const size_t row = static_cast<size_t>(y) * GRID_W;
+        for (int x = 0; x < GRID_W; ++x) {
+            float sum = 0.0f;
+            for (int ox = -4; ox <= 4; ++ox) {
+                sum += solver_.terrain_height_[row + static_cast<size_t>(std::clamp(x + ox, 0, GRID_W - 1))];
+            }
+            horiz_mean[row + x] = sum * (1.0f / 9.0f);
+        }
+    }
     for (int y = 0; y < GRID_H; ++y) {
         for (int x = 0; x < GRID_W; ++x) {
             const size_t i = static_cast<size_t>(y) * GRID_W + x;
             float mean_h = 0.0f;
-            int count = 0;
             for (int oy = -4; oy <= 4; ++oy) {
-                const int ny = std::clamp(y + oy, 0, GRID_H - 1);
-                for (int ox = -4; ox <= 4; ++ox) {
-                    const int nx = std::clamp(x + ox, 0, GRID_W - 1);
-                    mean_h += solver_.terrain_height_[static_cast<size_t>(ny) * GRID_W + nx];
-                    ++count;
-                }
+                mean_h += horiz_mean[static_cast<size_t>(std::clamp(y + oy, 0, GRID_H - 1)) * GRID_W + x];
             }
-            mean_h /= static_cast<float>(count);
+            mean_h *= (1.0f / 9.0f);
             const float slope = std::hypot(solver_.terrain_slope_e_[i], solver_.terrain_slope_n_[i]);
             const float relative_h = solver_.terrain_height_[i] - mean_h;
             solver_.terrain_ridge_exposure_[i] = std::clamp(

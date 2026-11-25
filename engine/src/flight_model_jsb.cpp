@@ -280,6 +280,42 @@ bool FlightModel::advance(double dt) {
     return valid;
 }
 
+void FlightModel::apply_impact_impulse(
+    double push_east_m, double push_up_m, double push_north_m,
+    double vel_east_mps, double vel_up_mps, double vel_north_mps,
+    double p_rps, double q_rps, double r_rps
+) {
+    if (!impl_) return;
+    auto propagate = impl_->exec.GetPropagate();
+    const double lat_rad = state_.lat_deg / rad_to_deg;
+    const double m_lat = 111132.92 - 559.82 * std::cos(2.0 * lat_rad);
+    const double m_lon = std::max(1000.0, 111412.84 * std::cos(lat_rad) - 93.5 * std::cos(3.0 * lat_rad));
+
+    if (!std::isfinite(push_east_m) || !std::isfinite(push_up_m) || !std::isfinite(push_north_m) ||
+        !std::isfinite(vel_east_mps) || !std::isfinite(vel_up_mps) || !std::isfinite(vel_north_mps) ||
+        !std::isfinite(p_rps) || !std::isfinite(q_rps) || !std::isfinite(r_rps)) return;
+
+    // Copy current FGLocation so planet ellipsoid parameters (mEllipseSet) stay intact.
+    const double cur_gc_lat = propagate->GetLatitudeDeg();
+    const double cur_gc_lon = propagate->GetLongitudeDeg();
+    const double cur_asl_m  = propagate->GetAltitudeASLmeters();
+    JSBSim::FGLocation loc = propagate->GetLocation();
+    loc.SetPosition((cur_gc_lon + push_east_m / m_lon) / rad_to_deg,
+                    (cur_gc_lat + push_north_m / m_lat) / rad_to_deg,
+                    loc.GetSeaLevelRadius() + (cur_asl_m + push_up_m) / ft_to_m);
+    propagate->SetLocation(loc);
+
+    const JSBSim::FGColumnVector3 v_ned_fps(vel_north_mps / ft_to_m, vel_east_mps / ft_to_m, -vel_up_mps / ft_to_m);
+    const JSBSim::FGColumnVector3 v_body_fps = propagate->GetTl2b() * v_ned_fps;
+    propagate->SetUVW(1, v_body_fps(1));
+    propagate->SetUVW(2, v_body_fps(2));
+    propagate->SetUVW(3, v_body_fps(3));
+    propagate->SetPQR(1, p_rps);
+    propagate->SetPQR(2, q_rps);
+    propagate->SetPQR(3, r_rps);
+    read_state();
+}
+
 void FlightModel::read_state() {
     auto &exec = impl_->exec;
     const auto propagate = exec.GetPropagate();

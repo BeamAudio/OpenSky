@@ -96,12 +96,10 @@ bool AirfieldVegetation::init(const std::string &assets, const std::string &shad
 
 void AirfieldVegetation::invalidate() {
     generation_.fetch_add(1, std::memory_order_acq_rel);
-    std::unique_lock<std::mutex> lk(mtx_);
+    std::lock_guard<std::mutex> lk(mtx_);
     job_queued_ = false;
     ready_upload_ = false;
     ready_data_.clear();
-    // Wait briefly for any active worker read of PackReader before caller re-anchors PackReader.
-    cv_.wait(lk, [&]() { return !job_running_; });
     prepared_ = false;
     req_pending_coords_ = false;
     count_ = 0;
@@ -110,6 +108,7 @@ void AirfieldVegetation::invalidate() {
 void AirfieldVegetation::worker_loop() {
     while (true) {
         const PackReader *pack = nullptr;
+        std::shared_ptr<const PackReader::WorldFrame> frame;
         double lat = 0.0, lon = 0.0;
         uint64_t gen = 0;
         {
@@ -119,20 +118,21 @@ void AirfieldVegetation::worker_loop() {
             job_queued_ = false;
             job_running_ = true;
             pack = worker_pack_;
+            frame = pack ? pack->world_frame() : nullptr;
             lat = job_lat_;
             lon = job_lon_;
             gen = job_gen_;
         }
         std::vector<TreeVolGpu> upload;
-        if (pack && gen == generation_.load(std::memory_order_acquire)) {
-            prepare_at(*pack, lat, lon, nullptr, &upload, gen);
+        if (pack && frame && gen == generation_.load(std::memory_order_acquire)) {
+            prepare_at(*pack, *frame, lat, lon, nullptr, &upload, gen);
         }
         {
             std::lock_guard<std::mutex> lk(mtx_);
-            if (pack && gen == generation_.load(std::memory_order_acquire)) {
+            if (pack && frame && gen == generation_.load(std::memory_order_acquire)) {
                 ready_centre_ = {
-                    static_cast<float>((lon - pack->anchor_lon()) * pack->anchor_m_lon()),
-                    static_cast<float>((lat - pack->anchor_lat()) * pack->anchor_m_lat())
+                    static_cast<float>((lon - frame->anchor_lon) * frame->metres_lon),
+                    static_cast<float>((lat - frame->anchor_lat) * frame->metres_lat)
                 };
                 ready_data_ = std::move(upload);
                 ready_upload_ = true;
@@ -151,7 +151,8 @@ void AirfieldVegetation::prepare(const PackReader &pack, const AirportInfo &airp
         ready_upload_ = false;
         cv_.wait(lk, [&]() { return !job_running_; });
     }
-    prepare_at(pack, airport.lat, airport.lon, airport.id.c_str(), nullptr, 0);
+    const auto frame = pack.world_frame();
+    if (frame) prepare_at(pack, *frame, airport.lat, airport.lon, airport.id.c_str(), nullptr, 0);
 }
 
 void AirfieldVegetation::update_around(const PackReader &pack, double lat_deg, double lon_deg, float agl) {
@@ -178,7 +179,8 @@ void AirfieldVegetation::update_around(const PackReader &pack, double lat_deg, d
     cv_.notify_one();
 }
 
-void AirfieldVegetation::prepare_at(const PackReader &pack, double center_lat, double center_lon, const char *label,
+void AirfieldVegetation::prepare_at(const PackReader &pack, const PackReader::WorldFrame &frame,
+                                    double center_lat, double center_lon, const char *label,
                                     std::vector<TreeVolGpu> *out_upload, uint64_t expected_gen) {
     struct Candidate {
         TreeVolGpu gpu;
@@ -188,8 +190,8 @@ void AirfieldVegetation::prepare_at(const PackReader &pack, double center_lat, d
     std::vector<Candidate> cands;
     cands.reserve(4096);
 
-    const Vec2 local_centre{static_cast<float>((center_lon - pack.anchor_lon()) * pack.anchor_m_lon()),
-                            static_cast<float>((center_lat - pack.anchor_lat()) * pack.anchor_m_lat())};
+    const Vec2 local_centre{static_cast<float>((center_lon - frame.anchor_lon) * frame.metres_lon),
+                            static_cast<float>((center_lat - frame.anchor_lat) * frame.metres_lat)};
     if (!out_upload) {
         centre_ = local_centre;
         req_centre_ = local_centre;
@@ -220,21 +222,21 @@ void AirfieldVegetation::prepare_at(const PackReader &pack, double center_lat, d
                                            static_cast<uint32_t>(iy) * 0x85ebca6bu);
             const double east = grid_e + (frac01(seed) - 0.5) * spacing * 0.82;
             const double north = grid_n + (frac01(seed >> 11) - 0.5) * spacing * 0.82;
-            const double lat = pack.anchor_lat() + north / pack.anchor_m_lat();
-            const double lon = pack.anchor_lon() + east / pack.anchor_m_lon();
+            const double lat = frame.anchor_lat + north / frame.metres_lat;
+            const double lon = frame.anchor_lon + east / frame.metres_lon;
 
             const float lidar = pack.sample_canopy_height(lat, lon);
             const Vec3 surf = pack.sample_surface(lat, lon);
             const float eff_h = (lidar >= 2.4f) ? lidar : (surf.x > 0.45f ? (4.8f + surf.x * 6.0f) : 0.0f);
             if (eff_h < 2.4f || surf.z > 0.22f ||
-                pack.is_excluded_for_vegetation(lat, lon) ||
-                pack.is_near_building(lat, lon, 2.2) ||
-                pack.is_near_road(lat, lon, 2.4)) continue;
+                pack.is_excluded_for_vegetation(frame, lat, lon) ||
+                pack.is_near_building(frame, lat, lon, 2.2) ||
+                pack.is_near_road(frame, lat, lon, 2.4)) continue;
 
             const float ground = static_cast<float>(pack.sample_elevation(lat, lon));
             // Embed root slightly deeper on steep mountain cliffs so trees never float above coarser LOD triangles.
-            const float g_e = static_cast<float>(pack.sample_elevation(lat, lon + 5.0 / pack.anchor_m_lon()));
-            const float g_n = static_cast<float>(pack.sample_elevation(lat + 5.0 / pack.anchor_m_lat(), lon));
+            const float g_e = static_cast<float>(pack.sample_elevation(lat, lon + 5.0 / frame.metres_lon));
+            const float g_n = static_cast<float>(pack.sample_elevation(lat + 5.0 / frame.metres_lat, lon));
             const float slope_drop = std::min(1.6f, std::hypot(g_e - ground, g_n - ground) * 0.45f);
             const uint32_t s2 = mix_bits(seed ^ 0x517cc1b7u);
             const float height = std::clamp(eff_h * (0.86f + frac01(s2) * 0.28f), 4.5f, 13.5f);
@@ -280,17 +282,17 @@ void AirfieldVegetation::prepare_at(const PackReader &pack, double center_lat, d
                                            static_cast<uint32_t>(iy) * 0x165667b1u);
             const double east = grid_e + (frac01(seed) - 0.5) * sh_spacing * 0.80;
             const double north = grid_n + (frac01(seed >> 11) - 0.5) * sh_spacing * 0.80;
-            const double lat = pack.anchor_lat() + north / pack.anchor_m_lat();
-            const double lon = pack.anchor_lon() + east / pack.anchor_m_lon();
+            const double lat = frame.anchor_lat + north / frame.metres_lat;
+            const double lon = frame.anchor_lon + east / frame.metres_lon;
 
             const float lidar = pack.sample_canopy_height(lat, lon);
             const Vec3 surf = pack.sample_surface(lat, lon);
             const bool is_shrub = (lidar >= 1.0f && lidar < 2.4f) ||
                                   (lidar < 2.4f && surf.y >= 0.22f && surf.y <= 0.46f && ((seed >> 24) & 3u) == 0);
             if (!is_shrub || surf.z > 0.18f ||
-                pack.is_excluded_for_vegetation(lat, lon) ||
-                pack.is_near_building(lat, lon, 2.2) ||
-                pack.is_near_road(lat, lon, 2.4)) continue;
+                pack.is_excluded_for_vegetation(frame, lat, lon) ||
+                pack.is_near_building(frame, lat, lon, 2.2) ||
+                pack.is_near_road(frame, lat, lon, 2.4)) continue;
 
             const float ground = static_cast<float>(pack.sample_elevation(lat, lon));
             const uint32_t s2 = mix_bits(seed ^ 0x7f4a7c15u);

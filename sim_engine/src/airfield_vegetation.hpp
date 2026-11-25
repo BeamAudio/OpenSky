@@ -34,7 +34,8 @@ private:
         float pnoa_r, pnoa_g, pnoa_b, species_seed;
     };
 
-    void prepare_at(const PackReader &pack, double center_lat, double center_lon, const char *label,
+    void prepare_at(const PackReader &pack, const PackReader::WorldFrame &frame,
+                    double center_lat, double center_lon, const char *label,
                     std::vector<TreeVolGpu> *out_upload = nullptr, uint64_t expected_gen = 0);
     void worker_loop();
     GLuint load_tex2d(const std::string &path, bool srgb);

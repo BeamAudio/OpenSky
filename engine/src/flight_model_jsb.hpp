@@ -67,6 +67,9 @@ public:
     void set_engine(const FlightEngineInputs &engine) { engine_ = engine; }
     bool initialize(double lat_deg, double lon_deg, double altitude_m, double heading_deg, double cas_kt, bool on_ground);
     bool advance(double dt);
+    void apply_impact_impulse(double push_east_m, double push_up_m, double push_north_m,
+                              double vel_east_mps, double vel_up_mps, double vel_north_mps,
+                              double p_rps, double q_rps, double r_rps);
     const FlightControls &controls() const { return controls_; }
     const FlightState &state() const { return state_; }
     static const std::string &version();

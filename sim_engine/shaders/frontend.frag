@@ -3,10 +3,14 @@ in vec2 v_uv;
 layout(location = 0) out vec4 frag_color;
 layout(binding = 0) uniform sampler2D u_land;
 layout(binding = 1) uniform sampler2DArray u_relief;
+layout(binding = 2) uniform sampler2DArray u_wx_field;
 layout(std430, binding = 0) readonly buffer InstalledBounds { vec4 bounds[]; };
 uniform vec3 u_globe; // centre latitude, longitude, and radius / viewport height
 uniform float u_aspect;
 uniform int u_region_count;
+uniform vec4 u_wx_geo;     // lon_min, lat_min, inv_lon_span, inv_lat_span
+uniform float u_wx_overlay; // >0.5 draws live weather model cloud/rain/wind radar over map
+uniform float u_wx_time;
 void main() {
     vec2 p = (v_uv - .5) * vec2(u_aspect, 1.0) / u_globe.z;
     float r2 = dot(p, p);
@@ -45,6 +49,30 @@ void main() {
                 vec4 relief = textureGrad(u_relief, vec3(relief_uv.x, 1.0 - relief_uv.y, relief_layer),
                                           geo_dx * texture_scale, geo_dy * texture_scale);
                 color = mix(color, relief.rgb, relief.a * land);
+            }
+            if (u_wx_overlay > 0.5 && u_wx_geo.z > 0.0 && u_wx_geo.w > 0.0) {
+                vec2 wuv = (degrees - u_wx_geo.xy) * u_wx_geo.zw;
+                if (all(greaterThanEqual(wuv, vec2(0.0))) && all(lessThanEqual(wuv, vec2(1.0)))) {
+                    vec4 mf = textureLod(u_wx_field, vec3(wuv, 1.0), 0.0);
+                    float rain = textureLod(u_wx_field, vec3(wuv, 4.0), 0.0).g;
+                    float cloud = clamp(mf.w, 0.0, 1.0);
+                    float wspd = length(mf.xy);
+                    // Animated streamlines flowing along the mesoscale wind vector field
+                    vec2 wdir = (wspd > 0.3) ? (mf.xy / wspd) : vec2(1.0, 0.0);
+                    vec2 wperp = vec2(-wdir.y, wdir.x);
+                    float along = dot(degrees, wdir) * 26.0 - u_wx_time * clamp(wspd * 0.14, 0.2, 2.2);
+                    float across = dot(degrees, wperp) * 42.0;
+                    float stream = smoothstep(0.65, 0.98, 0.5 + 0.5 * sin(across) * cos(along));
+                    color += vec3(0.32, 0.58, 0.78) * (stream * smoothstep(2.0, 16.0, wspd) * 0.22);
+                    // Translucent solved cloud veil + hillside updraft highlight
+                    color = mix(color, vec3(0.84, 0.90, 0.96), smoothstep(0.18, 0.92, cloud) * 0.36);
+                    // Meteorological precipitation radar palette (cyan/green -> amber -> crimson)
+                    if (rain > 0.25) {
+                        vec3 rad = mix(vec3(0.14, 0.78, 0.42), vec3(0.95, 0.76, 0.15), smoothstep(0.4, 6.0, rain));
+                        rad = mix(rad, vec3(0.92, 0.18, 0.28), smoothstep(8.0, 22.0, rain));
+                        color = mix(color, rad, smoothstep(0.25, 3.5, rain) * 0.65);
+                    }
+                }
             }
         }
         vec2 grid = degrees / (u_globe.z < 4.0 ? 15.0 : 1.0);

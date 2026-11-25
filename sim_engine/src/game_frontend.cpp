@@ -5,6 +5,7 @@
 #include "../third_party/stb_image.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -19,6 +20,35 @@ constexpr PixelRect map_area{64, 225, 1200, 750};
 constexpr int w = GAME_OUTPUT_W, h = GAME_OUTPUT_H;
 constexpr double nm_m = 1852.0;
 constexpr float globe_radius = 0.46f;
+
+struct WorldPlace {
+    const char *id;
+    const char *name;
+    const char *kind;
+    const char *note;
+    double lat, lon;
+    bool scenic;
+};
+
+constexpr WorldPlace kWorldPlaces[] = {
+    {"zaragoza_pilar", "Basílica del Pilar", "Landmark", "Zaragoza basilica beside the Ebro riverfront.", 41.6569, -0.8787, false},
+    {"zaragoza_bridge", "Puente de Piedra", "Landmark", "Historic stone bridge across the Ebro.", 41.6578, -0.8755, false},
+    {"zaragoza_tower", "Torre del Agua", "Landmark", "Tall landmark on Zaragoza's Expo riverfront.", 41.6693, -0.9073, false},
+    {"huesca_cathedral", "Catedral de Huesca", "Landmark", "Cathedral tower above Huesca's old town.", 42.1404, -0.4086, false},
+    {"loarre_castle", "Castillo de Loarre", "Landmark", "Romanesque hilltop castle north of Huesca.", 42.3257, -0.6119, false},
+    {"mediano_tower", "Torre de Mediano", "Scenic landmark", "The old bell tower rises from Embalse de Mediano.", 42.3175, 0.2037, true},
+    {"barcelona_sagrada_familia", "Sagrada Família", "Landmark", "Gaudí's soaring basilica in central Barcelona.", 41.40369, 2.17433, false},
+    {"montserrat_abbey", "Abbey of Montserrat", "Scenic landmark", "Mountain monastery set among Montserrat's distinctive peaks.", 41.59361, 1.83777, true},
+    {"girona_cathedral", "Girona Cathedral", "Landmark", "Cathedral above Girona's medieval old town.", 41.98737, 2.826259, false},
+    {"tarragona_amphitheatre", "Roman Amphitheatre", "Landmark", "Roman arena beside the Mediterranean in Tarragona.", 41.1145413, 1.2587789, false},
+    {"lleida_seu_vella", "La Seu Vella", "Landmark", "Old cathedral overlooking Lleida from the hilltop.", 41.618143, 0.626891, false},
+    {"ebro_delta", "Ebro Delta", "Scenic landmark", "Broad wetlands and rice fields at the Ebro's Mediterranean mouth.", 40.7167, 0.7333, true},
+};
+
+const WorldPlace *find_world_place(const std::string &id) {
+    for (const auto &place : kWorldPlaces) if (id == place.id) return &place;
+    return nullptr;
+}
 
 bool inside(PixelRect box, Vec2 p) {
     return p.x >= box.x && p.x < box.x + box.w && p.y >= box.y && p.y < box.y + box.h;
@@ -85,6 +115,9 @@ bool GameFrontend::init(const PackReader &pack, const std::string &shader_root, 
     globe_uniform_ = glGetUniformLocation(backdrop_, "u_globe");
     region_count_uniform_ = glGetUniformLocation(backdrop_, "u_region_count");
     aspect_uniform_ = glGetUniformLocation(backdrop_, "u_aspect");
+    wx_geo_uniform_ = glGetUniformLocation(backdrop_, "u_wx_geo");
+    wx_overlay_uniform_ = glGetUniformLocation(backdrop_, "u_wx_overlay");
+    wx_time_uniform_ = glGetUniformLocation(backdrop_, "u_wx_time");
     int tw, th, channels;
     unsigned char *pixels = stbi_load((asset_root + "/ui/globe_land.png").c_str(), &tw, &th, &channels, 1);
     if (!pixels) {
@@ -185,6 +218,7 @@ GameFrontend::Request GameFrontend::take_request() {
 
 void GameFrontend::focus_airport(const AirportInfo &airport, float zoom) {
     selected_id_ = airport.id;
+    selected_place_id_.clear();
     globe_lat_ = airport.lat;
     globe_lon_ = airport.lon;
     globe_zoom_ = zoom;
@@ -370,7 +404,7 @@ bool GameFrontend::button(AircraftAndHud &ui, PixelRect a, const char *value, bo
     return true;
 }
 
-void GameFrontend::draw_globe() {
+void GameFrontend::draw_globe(const RegionalAtmosphere *reg_atmo, double sim_time_sec) {
     const PixelRect a = map_area;
     glViewport(a.x, h - a.y - a.h, a.w, a.h);
     glDisable(GL_DEPTH_TEST);
@@ -382,6 +416,22 @@ void GameFrontend::draw_globe() {
     glUniform3f(globe_uniform_, float(globe_lat_ * DEG2RAD_D), float(globe_lon_ * DEG2RAD_D), globe_radius * globe_zoom_);
     glBindTextureUnit(0, land_);
     glBindTextureUnit(1, relief_);
+    Vec4 wx_geo{0.0f, 0.0f, 0.0f, 0.0f};
+    const bool has_wx = weather_overlay_ && reg_atmo && reg_atmo->has_model() && reg_atmo->field_tex() != 0 && pack_;
+    if (has_wx) {
+        const Vec4 db = reg_atmo->domain_bounds();
+        const double span_e = 1.0 / std::max(1e-6f, db.z);
+        const double span_n = 1.0 / std::max(1e-6f, db.w);
+        const double lon_min = pack_->anchor_lon() + db.x / pack_->anchor_m_lon();
+        const double lat_min = pack_->anchor_lat() + db.y / pack_->anchor_m_lat();
+        wx_geo = {static_cast<float>(lon_min), static_cast<float>(lat_min),
+                  static_cast<float>(pack_->anchor_m_lon() / std::max(1.0, span_e)),
+                  static_cast<float>(pack_->anchor_m_lat() / std::max(1.0, span_n))};
+        glBindTextureUnit(2, reg_atmo->field_tex());
+    }
+    if (wx_geo_uniform_ >= 0) glUniform4f(wx_geo_uniform_, wx_geo.x, wx_geo.y, wx_geo.z, wx_geo.w);
+    if (wx_overlay_uniform_ >= 0) glUniform1f(wx_overlay_uniform_, has_wx ? 1.0f : 0.0f);
+    if (wx_time_uniform_ >= 0) glUniform1f(wx_time_uniform_, static_cast<float>(sim_time_sec));
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, bounds_);
     glBindVertexArray(vao_);
     glDrawArrays(GL_TRIANGLES, 0, 3);
@@ -438,7 +488,7 @@ bool GameFrontend::capture_world(AircraftAndHud &aircraft, SkyAndClouds &sky, co
 void GameFrontend::draw_world(AircraftAndHud &ui, const PlatformWindow &win,
                               RegionalAtmosphere *reg_atmo, const AtmosphereState *atmo, double sim_time_sec) {
     label(ui, 64, 111, 44, "World");
-    label(ui, 66, 166, 21, "Explore airfields, local weather, and routes across the region.", true);
+    label(ui, 66, 166, 21, "Explore airfields, landmarks, local weather, and routes across the region.", true);
     char line[192];
     std::snprintf(line, sizeof(line), "%zu installed region%s  |  Passport %zu / %zu airfields",
                   pack_->regions().size(), pack_->regions().size() == 1 ? "" : "s",
@@ -446,6 +496,26 @@ void GameFrontend::draw_world(AircraftAndHud &ui, const PlatformWindow &win,
     label(ui, 790, 168, 18, line, true);
 
     const auto *parked = parked_airport();
+    constexpr size_t kWorldPlaceCount = sizeof(kWorldPlaces) / sizeof(kWorldPlaces[0]);
+    std::array<const WorldPlace *, kWorldPlaceCount> installed_places{};
+    int installed_place_count = 0;
+    for (const auto &place : kWorldPlaces) {
+        if (pack_->find_region_at(place.lat, place.lon))
+            installed_places[installed_place_count++] = &place;
+    }
+    auto focus_place = [&](const WorldPlace &place) {
+        selected_place_id_ = place.id;
+        selected_id_.clear();
+        for (int i = 0; i < installed_place_count; ++i) {
+            if (selected_place_id_ == installed_places[i]->id) {
+                place_page_ = i / 4;
+                break;
+            }
+        }
+        globe_lat_ = place.lat;
+        globe_lon_ = place.lon;
+        globe_zoom_ = 36.0f;
+    };
     if (button(ui, {64, 986, 149, 47}, "Globe view")) {
         globe_zoom_ = 1.0f;
     }
@@ -473,8 +543,33 @@ void GameFrontend::draw_world(AircraftAndHud &ui, const PlatformWindow &win,
     }
 
     GlobeProjection projection(globe_lat_, globe_lon_, globe_zoom_);
-    draw_globe();
+    draw_globe(reg_atmo, sim_time_sec);
     ui.hud_border(map_area.x, map_area.y, map_area.w, map_area.h, 1, .29f, .42f, .50f, .8f);
+
+    if (weather_overlay_ && reg_atmo && reg_atmo->has_model() && atmo) {
+        const float wx_est = std::clamp((atmo->cloud_cov - 0.16f) / 0.78f, 0.0f, 1.0f);
+        for (int gy = 0; gy < 5; ++gy) {
+            for (int gx = 0; gx < 8; ++gx) {
+                const Vec2 sp{map_area.x + 95.0f + gx * 145.0f, map_area.y + 85.0f + gy * 145.0f};
+                auto up = projection.unproject(sp);
+                if (!up) continue;
+                const auto [glat, glon] = globe_geo(*up);
+                if (!reg_atmo->covers(glat, glon)) continue;
+                const LocalAirSample sw = reg_atmo->sample_at(glat, glon, pack_->sample_elevation(glat, glon) + 450.0,
+                                                              atmo->sun_dir, sim_time_sec, wx_est);
+                const float spd = static_cast<float>(std::hypot(sw.wind_east_mps, sw.wind_north_mps));
+                if (spd < 0.8f) continue;
+                const Vec2 dir{static_cast<float>(sw.wind_east_mps / spd), static_cast<float>(-sw.wind_north_mps / spd)};
+                const float alen = std::clamp(8.0f + spd * 1.15f, 10.0f, 26.0f);
+                const Vec2 tip{sp.x + dir.x * alen, sp.y + dir.y * alen};
+                const Vec2 tail{sp.x - dir.x * alen * 0.4f, sp.y - dir.y * alen * 0.4f};
+                ui.hud_arrow(tail, tip, 1.8f, {.65f, .90f, 1.0f});
+            }
+        }
+    }
+    if (button(ui, {1052, 238, 198, 34}, weather_overlay_ ? "Weather Map: ON" : "Weather Map: OFF", reg_atmo != nullptr, weather_overlay_)) {
+        weather_overlay_ = !weather_overlay_;
+    }
 
     if (parked) {
         Vec3 from = globe_xyz(parked->lat, parked->lon);
@@ -523,9 +618,48 @@ void GameFrontend::draw_world(AircraftAndHud &ui, const PlatformWindow &win,
         const float distance = std::hypot(p->x - pointer_.x, p->y - pointer_.y);
         if (distance < closest) { closest = distance; hit = &ap; }
     }
-    if (click_ && contains(map_area) && !inside({82, 916, 690, 42}, pointer_)) {
+    const WorldPlace *place_hit = nullptr;
+    float closest_place = 17.0f;
+    for (int place_idx = 0; place_idx < installed_place_count; ++place_idx) {
+        const auto &place = *installed_places[place_idx];
+        const bool selected = place.id == selected_place_id_;
+        auto p = projection.project(globe_xyz(place.lat, place.lon));
+        if (!p || !inside({map_area.x + 10, map_area.y + 10, map_area.w - 20, map_area.h - 20}, *p)) continue;
+        const float distance = std::hypot(p->x - pointer_.x, p->y - pointer_.y);
+        const bool hovered = distance < closest_place;
+        if (hovered) { closest_place = distance; place_hit = &place; }
+        if (globe_zoom_ < 6.0f && !selected && !hovered) continue;
+
+        const float radius = selected ? 7.0f : 5.0f;
+        ui.hud_rect(p->x - radius - 2, p->y - radius - 2, (radius + 2) * 2, (radius + 2) * 2,
+                    .025f, .055f, .070f, .98f);
+        const Vec3 color = selected ? Vec3{1.0f, .95f, .70f}
+            : (place.scenic ? Vec3{.28f, .88f, .78f} : Vec3{1.0f, .70f, .30f});
+        const Vec2 top{p->x, p->y - radius}, right{p->x + radius, p->y};
+        const Vec2 bottom{p->x, p->y + radius}, left{p->x - radius, p->y};
+        ui.hud_line(top, right, 2.2f, color);
+        ui.hud_line(right, bottom, 2.2f, color);
+        ui.hud_line(bottom, left, 2.2f, color);
+        ui.hud_line(left, top, 2.2f, color);
+
+        if (selected || hovered || (show_places_ && globe_zoom_ >= 24.0f)) {
+            const float label_w = static_cast<float>(std::min<size_t>(230, std::char_traits<char>::length(place.name) * 9 + 18));
+            const float raw_lx = (p->x + label_w + 16 < map_area.x + map_area.w) ? p->x + 10 : p->x - label_w - 10;
+            const float lx = std::clamp(raw_lx, map_area.x + 4, map_area.x + map_area.w - label_w - 4);
+            const float ly = std::clamp(p->y - 12, map_area.y + 8, map_area.y + map_area.h - 30);
+            ui.hud_rect(lx, ly, label_w, 24, .025f, .055f, .070f, .96f);
+            ui.hud_border(lx, ly, label_w, 24, 1, color.x, color.y, color.z, .9f);
+            label(ui, lx + 7, ly + 4, 14, place.name);
+        }
+    }
+    if (click_ && contains(map_area) && !inside({82, 916, 870, 42}, pointer_) && !inside({1052, 238, 198, 34}, pointer_)) {
         if (add_waypoint_ && !session_.flight_active_) {
-            if (auto p = projection.unproject(pointer_)) {
+            if (place_hit && closest_place < closest) {
+                focus_place(*place_hit);
+                add_point({place_hit->name, place_hit->lat, place_hit->lon});
+                add_waypoint_ = false;
+                show_places_ = true;
+            } else if (auto p = projection.unproject(pointer_)) {
                 const auto [lat,lon] = globe_geo(*p);
                 if (pack_->find_region_at(lat, lon)) {
                     std::snprintf(line, sizeof(line), "Point %zu", session_.profile().route_.size() + 1);
@@ -533,16 +667,19 @@ void GameFrontend::draw_world(AircraftAndHud &ui, const PlatformWindow &win,
                     add_waypoint_ = false;
                 } else status_ = "This point is outside the installed scenery.";
             }
+        } else if (place_hit && closest_place < closest) {
+            focus_place(*place_hit);
+            show_places_ = true;
         } else if (hit) {
-            selected_id_ = hit->id;
-            if (globe_zoom_ < 8) focus_airport(*hit, 75.0f);
+            show_places_ = false;
+            focus_airport(*hit, globe_zoom_ < 8.0f ? 75.0f : globe_zoom_);
         } else map_dragging_ = true;
         click_ = false;
     }
 
     // Map key: make the aircraft, visited airfields, open airfields, and route easy to distinguish.
-    ui.hud_rect(82, 916, 690, 42, .025f, .048f, .068f, .91f);
-    ui.hud_border(82, 916, 690, 42, 1, .20f, .31f, .38f, .80f);
+    ui.hud_rect(82, 916, 870, 42, .025f, .048f, .068f, .91f);
+    ui.hud_border(82, 916, 870, 42, 1, .20f, .31f, .38f, .80f);
     const auto legend_item = [&](float x, float r, float g, float b, const char *text) {
         ui.hud_rect(x, 930, 12, 12, r, g, b, 1.0f);
         label(ui, x + 20, 930, 14, text, true);
@@ -551,6 +688,7 @@ void GameFrontend::draw_world(AircraftAndHud &ui, const PlatformWindow &win,
     legend_item(260, .32f, .92f, .42f, "VISITED");
     legend_item(383, .40f, .82f, .57f, "AIRFIELD");
     legend_item(525, .98f, .70f, .33f, "PLANNED ROUTE");
+    legend_item(700, 1.0f, .70f, .30f, "LANDMARK");
 
     // Top-right: Parked Aircraft Ownership Card
     panel(ui, {1292,225,564,218});
@@ -576,23 +714,54 @@ void GameFrontend::draw_world(AircraftAndHud &ui, const PlatformWindow &win,
     if (button(ui, {1318, 389, 512, 42}, "Enter airport on foot (Walkaround)", parked && !session_.flight_active_, true))
         request_ = Request::Walk;
 
-    // Middle-right: Installed Airfields + Live Local Weather Briefing
+    // Middle-right: Airfields or landmarks, with a live local weather briefing for selected airfields.
     panel(ui, {1292,455,564,296});
-    label(ui, 1318, 471, 21, "Installed airfields");
-    const auto &airports = pack_->airports();
-    const int pages = std::max(1, (int(airports.size()) + 3) / 4);
-    if (button(ui, {1738,462,40,30}, "<", airport_page_ > 0)) --airport_page_;
-    if (button(ui, {1790,462,40,30}, ">", airport_page_+1 < pages)) ++airport_page_;
-    for (int i=0; i<4 && size_t(airport_page_*4+i)<airports.size(); ++i) {
-        const auto &ap = airports[airport_page_*4+i];
-        const bool stamped = find_stamp(ap.id) != nullptr;
-        std::snprintf(line, sizeof(line), "%s %-7s %.28s  (%.0fm)",
-                      stamped ? "*" : " ", ap.id.c_str(), ap.name.c_str(), ap.elev_m);
-        if (button(ui, {1318, 504+i*36, 512, 31}, line, true, ap.id == selected_id_))
-            focus_airport(ap, std::max(48.0f, globe_zoom_));
+    label(ui, 1318, 471, 21, show_places_ ? "Places to explore" : "Installed airfields");
+    if (button(ui, {1532,462,92,30}, "Airfields", true, !show_places_)) {
+        show_places_ = false;
+        airport_page_ = 0;
+        selected_place_id_.clear();
     }
-    const auto *selected = pack_->find_airport(selected_id_);
-    if (selected) {
+    if (button(ui, {1630,462,96,30}, "Landmarks", true, show_places_)) {
+        show_places_ = true;
+        place_page_ = 0;
+        selected_id_.clear();
+    }
+    const auto &airports = pack_->airports();
+    const int place_count = installed_place_count;
+    int &page_index = show_places_ ? place_page_ : airport_page_;
+    const int item_count = show_places_ ? place_count : static_cast<int>(airports.size());
+    const int pages = std::max(1, (item_count + 3) / 4);
+    page_index = std::clamp(page_index, 0, pages - 1);
+    if (button(ui, {1738,462,40,30}, "<", page_index > 0)) --page_index;
+    if (button(ui, {1790,462,40,30}, ">", page_index + 1 < pages)) ++page_index;
+    for (int i = 0; i < 4 && page_index * 4 + i < item_count; ++i) {
+        if (show_places_) {
+            const auto &place = *installed_places[page_index * 4 + i];
+            std::snprintf(line, sizeof(line), "%s  %s", place.kind, place.name);
+            if (button(ui, {1318, 504 + i * 36, 512, 31}, line, true, place.id == selected_place_id_))
+                focus_place(place);
+        } else {
+            const auto &ap = airports[page_index * 4 + i];
+            const bool stamped = find_stamp(ap.id) != nullptr;
+            std::snprintf(line, sizeof(line), "%s %-7s %.28s  (%.0fm)",
+                          stamped ? "*" : " ", ap.id.c_str(), ap.name.c_str(), ap.elev_m);
+            if (button(ui, {1318, 504 + i * 36, 512, 31}, line, true, ap.id == selected_id_))
+                focus_airport(ap, std::max(48.0f, globe_zoom_));
+        }
+    }
+    const auto *selected = show_places_ ? nullptr : pack_->find_airport(selected_id_);
+    const WorldPlace *selected_place = show_places_ ? find_world_place(selected_place_id_) : nullptr;
+    if (show_places_) {
+        if (selected_place) {
+            label(ui, 1318, 648, 13, selected_place->kind, true);
+            label(ui, 1318, 670, 15, selected_place->note, true);
+        } else if (installed_place_count == 0) {
+            label(ui, 1318, 670, 15, "No landmarks in the installed scenery.", true);
+        } else {
+            label(ui, 1318, 670, 15, "Select a landmark to focus it on the map.", true);
+        }
+    } else if (selected) {
         label(ui, 1318, 648, 13, "IN-GAME MODEL NOW - " , true);
         label(ui, 1495, 648, 13, selected->id.c_str(), true);
         const double len_m = std::max(100.0, nspain::haversine_m(selected->rwy_lat_a, selected->rwy_lon_a,
@@ -618,9 +787,14 @@ void GameFrontend::draw_world(AircraftAndHud &ui, const PlatformWindow &win,
         }
         label(ui, 1318, 670, 15, line, true);
     }
-    if (button(ui, {1318, 704, 512, 38}, "Add selected airfield to route",
-               parked && selected && !session_.flight_active_ && (selected != parked || !session_.profile().route_.empty())))
+    if (show_places_) {
+        if (button(ui, {1318, 704, 512, 38}, "Add selected landmark to route",
+                   parked && selected_place && !session_.flight_active_))
+            add_point({selected_place->name, selected_place->lat, selected_place->lon});
+    } else if (button(ui, {1318, 704, 512, 38}, "Add selected airfield to route",
+                      parked && selected && !session_.flight_active_ && (selected != parked || !session_.profile().route_.empty()))) {
         add_point({selected->id, selected->lat, selected->lon});
+    }
 
     // Bottom-right: actual regional model history and an editable route.
     panel(ui, {1292,763,564,270});
@@ -687,11 +861,30 @@ void GameFrontend::draw_world(AircraftAndHud &ui, const PlatformWindow &win,
     }
     ui.hud_rect(1318, 895, 512, 1, .20f, .31f, .38f, .78f);
     double total = 0;
+    double route_wind_kt = 0.0, route_rain_max = 0.0;
+    int route_wind_dir = 0, route_wx_pts = 0;
     if (parked) {
         double a = parked->lat, b = parked->lon;
-        for (const auto &p : session_.profile().route_) { total += nspain::haversine_m(a,b,p.lat,p.lon); a=p.lat; b=p.lon; }
+        const float wx_est = atmo ? std::clamp((atmo->cloud_cov - 0.16f) / 0.78f, 0.0f, 1.0f) : 0.25f;
+        for (const auto &p : session_.profile().route_) {
+            total += nspain::haversine_m(a,b,p.lat,p.lon);
+            if (reg_atmo && atmo && reg_atmo->covers(p.lat, p.lon)) {
+                const LocalAirSample rw = reg_atmo->sample_at(p.lat, p.lon, pack_->sample_elevation(p.lat, p.lon) + 600.0,
+                                                              atmo->sun_dir, sim_time_sec, wx_est);
+                route_wind_kt += std::hypot(rw.wind_east_mps, rw.wind_north_mps) * 1.94384;
+                route_rain_max = std::max(route_rain_max, rw.precipitation_mm_hr);
+                route_wind_dir = int(std::lround(std::fmod(std::atan2(-rw.wind_east_mps, -rw.wind_north_mps) * RAD2DEG_D + 360.0, 360.0))) % 360;
+                ++route_wx_pts;
+            }
+            a=p.lat; b=p.lon;
+        }
     }
-    std::snprintf(line, sizeof(line), "ROUTE  %.1f NM", total / nm_m);
+    if (route_wx_pts > 0) {
+        std::snprintf(line, sizeof(line), "ROUTE %.1f NM | W %03d/%.0fkt R %.1fmm/h",
+                      total / nm_m, route_wind_dir, route_wind_kt / route_wx_pts, route_rain_max);
+    } else {
+        std::snprintf(line, sizeof(line), "ROUTE  %.1f NM", total / nm_m);
+    }
     label(ui, 1318, 901, 18, line);
     if (button(ui, {1738,898,40,28}, "<", route_page_ > 0)) --route_page_;
     if (button(ui, {1790,898,40,28}, ">", (route_page_+1)*2 < int(session_.profile().route_.size()))) ++route_page_;
@@ -710,6 +903,9 @@ void GameFrontend::draw_world(AircraftAndHud &ui, const PlatformWindow &win,
     if (button(ui, {1318, 985, 150, 36}, "Clear route", !session_.profile().route_.empty() && !session_.flight_active_)) {
         session_.clear_route();
         route_page_ = 0;
+    }
+    if (button(ui, {1480, 985, 200, 36}, "Watch replay", replay_available_)) {
+        request_ = Request::WatchReplay;
     }
     const auto &save_error = session_.profile_error();
     if (!save_error.empty()) label(ui, 67, 200, 16, save_error.c_str());
@@ -768,6 +964,9 @@ void GameFrontend::draw_logbook(AircraftAndHud &ui) {
 
     ui.hud_rect(92, 514, 874, 1, .21f, .32f, .39f, .85f);
     label(ui, 92, 534, 24, "Recent Flights");
+    if (button(ui, {742, 526, 224, 34}, "Watch route video", replay_available_)) {
+        request_ = Request::WatchReplay;
+    }
     if (session_.profile().logbook_.empty()) {
         label(ui, 92, 584, 18, "No completed flights logged yet.", true);
         label(ui, 92, 618, 17, "Take off, land at any Aragon strip, taxi clear of the runway, and park to log a leg.", true);
@@ -1231,21 +1430,28 @@ void GameFrontend::draw_walk(AircraftAndHud &ui, const PlatformWindow &win,
                 break;
             }
             case WalkStation::Door: {
-                std::snprintf(line, sizeof(line), "24V Battery: %.0f%%   |   Windshield Clarity: %.0f%%",
-                              session_.profile().care_.battery_soc * 100.0, (1.0 - session_.profile().care_.windshield_dirt) * 100.0);
+                std::snprintf(line, sizeof(line), "24V Battery: %.0f%%   |   Windshield: %.0f%% clean, %.0f%% intact",
+                              session_.profile().care_.battery_soc * 100.0,
+                              (1.0 - session_.profile().care_.windshield_dirt) * 100.0,
+                              (1.0 - session_.profile().care_.windshield_crack) * 100.0);
                 label(ui, 1188, 344, 18, line);
                 std::snprintf(line, sizeof(line), "Cockpit left as: %s  |  Master %s  |  Mags %s",
                               session_.profile().care_.engine_running ? "Running" : "Cold & Dark",
                               session_.profile().care_.master_on ? "ON" : "OFF",
                               session_.profile().care_.magnetos == 0 ? "OFF" : (session_.profile().care_.magnetos == 3 ? "BOTH" : "L/R"));
                 label(ui, 1188, 378, 16, line, true);
-                if (button(ui, {1188, 418, 322, 44},
-                           full_svc ? "Charge 24V battery (GPU)" : "Field jump-charge (55%)",
+                if (button(ui, {1188, 418, 212, 44},
+                           full_svc ? "Charge battery" : "Jump battery",
                            session_.profile().care_.battery_soc < (full_svc ? 0.96 : 0.54))) {
                     session_.service(AircraftService::ChargeBattery);
                 }
-                if (button(ui, {1530, 418, 322, 44}, "Clean windshield glass", session_.profile().care_.windshield_dirt > 0.02)) {
+                if (button(ui, {1414, 418, 212, 44}, "Clean windshield", session_.profile().care_.windshield_dirt > 0.02)) {
                     session_.service(AircraftService::CleanWindshield);
+                }
+                if (button(ui, {1640, 418, 212, 44},
+                           full_svc ? "Replace glass" : "Patch crack",
+                           session_.profile().care_.windshield_crack > 0.02)) {
+                    session_.service(AircraftService::ReplaceWindshield);
                 }
                 const bool secured = session_.profile().care_.chocks_on || session_.profile().care_.pitot_cover_on || session_.profile().care_.tie_downs_on;
                 if (button(ui, {1188, 476, 664, 44},
@@ -1301,8 +1507,8 @@ void GameFrontend::draw_navigation(AircraftAndHud &ui, const PlatformWindow &win
             ? "TAXI ASSIST ON | Trackpad/A-D: steer  W/S: gas/brake  Click/R: straight  Y: yoke"
             : "TAXI ASSIST ON | A/D: steer  W/S: gas/brake  Y: trackpad yoke  R: straight")
         : (show_yoke
-            ? "FLIGHT ASSIST ON | Trackpad/A-D: bank/pitch hold  Click/R: level  Y: yoke"
-            : "FLIGHT ASSIST ON | A/D: bank  Up/Dn: pitch  Y: trackpad yoke  R: level"), true);
+            ? "FLIGHT ASSIST ON | Cursor-yoke: drag around anchor  Click/R: level  Y: toggle"
+            : "FLIGHT ASSIST ON | A/D: bank  Up/Dn: VSI pitch  Y: cursor yoke  R: level"), true);
     if (ui.state().runway_tracking)
         label(ui, 48, 108, 17, "Runway centreline assist ON   /   A-D, Q-E or trackpad: manual steer", true);
     if (show_yoke) {
@@ -1579,6 +1785,54 @@ void GameFrontend::draw_navigation(AircraftAndHud &ui, const PlatformWindow &win
     } else std::snprintf(line, sizeof(line), "VFR route complete");
     label(ui, 49, 974, 19, line);
     ui.flush_hud(w, h, font_);
+}
+
+GameFrontend::ReplayAction GameFrontend::draw_replay_bar(
+    AircraftAndHud &ui, const PlatformWindow &win,
+    const std::string &title, double cur_t, double total_t,
+    bool playing, float speed_mult, int view_mode, double *out_seek_t
+) {
+    read_pointer(win);
+    ui.hud_verts_.clear();
+    const float w = GAME_OUTPUT_W, h = GAME_OUTPUT_H;
+    panel(ui, {28, 932, 1864, 118});
+
+    const double dur = std::max(0.1, total_t);
+    const double clamped_t = std::clamp(cur_t, 0.0, dur);
+    const float prog = static_cast<float>(clamped_t / dur);
+
+    const PixelRect track{48, 948, 1824, 14};
+    ui.hud_rect(track.x, track.y + 3, track.w, 8, 0.12f, 0.18f, 0.24f, 0.95f);
+    ui.hud_rect(track.x, track.y + 3, std::max(6.0f, track.w * prog), 8, 0.28f, 0.72f, 0.88f, 0.98f);
+    if (out_seek_t && click_ && contains({track.x, track.y - 8, track.w, track.h + 16})) {
+        *out_seek_t = std::clamp(static_cast<double>(pointer_.x - track.x) / track.w, 0.0, 1.0) * total_t;
+    }
+
+    auto fmt_time = [](double s, char *buf, size_t n) {
+        int ts = std::max(0, static_cast<int>(std::floor(s)));
+        std::snprintf(buf, n, "%02d:%02d", ts / 60, ts % 60);
+    };
+    char t0[24], t1[24], info[192];
+    fmt_time(clamped_t, t0, sizeof(t0));
+    fmt_time(total_t, t1, sizeof(t1));
+    const char *vname = (view_mode == 0) ? "Cockpit" : (view_mode == 1 ? "Chase" : "Orbit");
+    std::snprintf(info, sizeof(info), "ROUTE REPLAY  |  %s  |  %s / %s  |  View: %s (C)  RMB: Orbit  Left/Right: Seek",
+                  title.empty() ? "Last Flown Route" : title.c_str(), t0, t1, vname);
+    label(ui, 48, 974, 17, info);
+
+    ReplayAction act = ReplayAction::None;
+    if (button(ui, {48, 1002, 130, 36}, playing ? "Pause" : "Play", true, playing)) act = ReplayAction::TogglePlay;
+    if (button(ui, {188, 1002, 92, 36}, "-10s")) act = ReplayAction::Back10;
+    if (button(ui, {290, 1002, 92, 36}, "+10s")) act = ReplayAction::Fwd10;
+    if (button(ui, {398, 1002, 74, 36}, "0.5x", true, std::abs(speed_mult - 0.5f) < 0.05f)) act = ReplayAction::Speed05;
+    if (button(ui, {480, 1002, 68, 36}, "1x", true, std::abs(speed_mult - 1.0f) < 0.05f)) act = ReplayAction::Speed1;
+    if (button(ui, {556, 1002, 68, 36}, "2x", true, std::abs(speed_mult - 2.0f) < 0.05f)) act = ReplayAction::Speed2;
+    if (button(ui, {632, 1002, 68, 36}, "4x", true, std::abs(speed_mult - 4.0f) < 0.05f)) act = ReplayAction::Speed4;
+    if (button(ui, {1540, 1002, 160, 36}, "View (C)")) act = ReplayAction::SwitchView;
+    if (button(ui, {1712, 1002, 160, 36}, "Exit (Esc)")) act = ReplayAction::Exit;
+
+    ui.flush_hud(w, h, font_);
+    return act;
 }
 
 } // namespace nsim

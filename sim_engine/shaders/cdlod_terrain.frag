@@ -338,11 +338,9 @@ void main() {
     vec3 view_dir = normalize(v_world_pos);
     vec3 pmrf_em = vec3(0.0);
 
-    // Native-resolution iGPU path. Keep the real orthophoto and baked LiDAR/DSM
-    // lighting as the primary signal, then add only one material-detail lookup,
-    // one weather shadow LUT, and a close-range synthesized detail sample.
-    // This avoids the full per-pixel multi-layer PBR/IBL cascade used by Ultra.
-    if (u_quality == 2) {
+    // Native-resolution iGPU path (Low/Med/High): real orthophoto + baked LiDAR/DSM lighting,
+    // compact material detail, and slope-anchored rock/micro-normal relief in uninhabited terrain.
+    if (u_quality <= 2) {
         // Keep urban park & roadside LiDAR trees intact (only suppress over water).
         float forest_fast = smoothstep(0.05, 0.18, surf.r) *
                             (1.0 - smoothstep(0.18, 0.42, surf.b));
@@ -380,12 +378,31 @@ void main() {
 
         float near_w_fast = 1.0 - smoothstep(60.0, 1400.0, v_dist);
         if (near_w_fast > 0.01 && water_mask_fast < 0.15) {
+            vec2 micro_uv = v_world_en * 0.28;
             vec3 close_tex = (veg_fast > 0.38)
-                ? texture(u_grass_albedo, v_world_en * 0.28).rgb
-                : texture(u_gravel_albedo, v_world_en * 0.28).rgb;
+                ? texture(u_grass_albedo, micro_uv).rgb
+                : texture(u_gravel_albedo, micro_uv).rgb;
             float close_luma = dot(close_tex, vec3(0.2126, 0.7152, 0.0722));
-            float close_grain = clamp(1.0 + (close_luma - 0.48) * 0.26, 0.88, 1.12);
+            float close_grain = clamp(1.0 + (close_luma - 0.48) * 0.24, 0.88, 1.12);
             fast_albedo *= mix(1.0, close_grain, near_w_fast * 0.76);
+            if (u_quality >= 2 && near_w_fast > 0.04) {
+                vec3 mn = (veg_fast > 0.38)
+                    ? texture(u_grass_normal, micro_uv).rgb * 2.0 - 1.0
+                    : texture(u_gravel_normal, micro_uv).rgb * 2.0 - 1.0;
+                normal_fast = normalize(normal_fast + vec3(mn.x, 0.0, mn.y) * (near_w_fast * 0.32 * (1.0 - forest_fast * 0.65)));
+            }
+        }
+        // Slope-anchored rock normal + subtle zero-mean grain for sharp uninhabited ridges/cliffs aloft.
+        if (u_quality >= 1 && water_mask_fast < 0.20 && v_dist < 4200.0) {
+            float cliff_w = smoothstep(0.16, 0.36, slope_fast) * (1.0 - smoothstep(2200.0, 4200.0, v_dist));
+            if (cliff_w > 0.02) {
+                vec2 r_uv = rot27(v_world_en) * 0.055;
+                vec3 rn = texture(u_rock_normal, r_uv).rgb * 2.0 - 1.0;
+                vec3 ra = texture(u_rock_albedo, r_uv).rgb;
+                float r_luma = dot(ra, vec3(0.2126, 0.7152, 0.0722));
+                fast_albedo *= mix(1.0, clamp(1.0 + (r_luma - 0.36) * 0.32, 0.88, 1.12), cliff_w * 0.82);
+                normal_fast = normalize(normal_fast + vec3(rn.x, 0.0, rn.y) * (cliff_w * 0.56));
+            }
         }
 
         ground_relief(fast_albedo, normal_fast, green_fast * (1.0 - forest_fast), water_mask_fast, view_dir);
@@ -856,11 +873,10 @@ void main() {
     float sun_vis = clamp((sdir.y + 0.08) / 0.24, 0.0, 1.0);
     float day_t = clamp((sdir.y + 0.035) / 0.14, 0.0, 1.0);
     float mtn_shadow = 1.0 - (1.0 - surf.g) * 0.74 * clamp(1.15 - u_cloud_cov * 0.48, 0.42, 1.0);
-    // Moving cloud-shadow LUT: one lookup from the same procedural weather field
-    // used by the volumetric cloud pass, advected by the local wind.
+    // Match clouds_qres.frag wind_base & MACRO_FREQ so terrain shadows track overhead clouds coherently.
     vec2 shadow_light_en = vec2(sdir.x, -sdir.z) * (1350.0 / max(sdir.y, 0.22));
-    vec2 cloud_flow_en = vec2(u_time * 22.0, u_time * 8.0) - u_wind_en * (u_time * 1.45);
-    vec2 shadow_uv = (v_world_en + shadow_light_en + cloud_flow_en) * 0.000112 + vec2(0.21, 0.47);
+    vec2 cloud_flow_en = vec2(u_time * 9.5, u_time * 4.2);
+    vec2 shadow_uv = (v_world_en + shadow_light_en + cloud_flow_en) * 0.000112;
     float shadow_cloud_noise = textureLod(u_cloud_noise, shadow_uv, 0.0).r;
     float shadow_threshold = mix(0.71, 0.27, clamp(u_cloud_cov, 0.06, 0.96));
     float cloud_umbra = smoothstep(shadow_threshold - 0.02, shadow_threshold + 0.15, shadow_cloud_noise);

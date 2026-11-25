@@ -72,6 +72,8 @@ struct FlightSimState {
     float seat_lat_m = 0.0f;
     float chase_dist_m = 10.6f;
     Vec3 free_cam_off_m{0.0f, 3.0f, 12.0f};
+    double visual_rpm_override = -1.0;
+    double visual_flaps_deg = 0.0;
 };
 
 struct FlightAssistOut {
@@ -137,6 +139,7 @@ public:
     void start_owned_flight(double lat, double lon, double alt, double heading,
                             const AircraftCareSnapshot &care, double ambient_temp_c, bool on_runway);
     void sync_care_snapshot(AircraftCareSnapshot &care) const;
+    void sync_walkaround_damage(const AircraftCareSnapshot &care);
     void quick_start_or_shutdown();
     bool is_chocked_or_tied() const { return chocks_on_ || tie_downs_on_; }
     const nspain::C172Systems &systems() const { return systems_; }
@@ -150,8 +153,11 @@ public:
 
 private:
     friend class GameFrontend;
+    void apply_autopilot(const nspain::FlightState &fs, double &roll_cmd, double &pitch_cmd);
     void advance_aircraft(double dt, const AtmosphereState &atmo, const RegionalAtmosphere &reg_atmo,
                           double sim_time_sec, double rudder, double brake_left, double brake_right);
+    void resolve_world_collisions(double dt);
+    void apply_damage_rig(std::vector<Mat4> &anim, float flaps_rad, float ail, float elv, float trm, float rud) const;
     friend class AircraftSession;
     void flush_hud(float width, float height, GLuint font = 0);
     struct HudVert {
@@ -187,9 +193,9 @@ private:
     float ai_gyro_spool_ = 0.0f;
     float prev_render_t_ = -1.0f;
     double mouse_yoke_roll_ = 0.0, mouse_yoke_pitch_ = 0.0;
-    double prev_mouse_x_ = 0.0, prev_mouse_y_ = 0.0;
-    bool prev_mouse_valid_ = false;
-    double yoke_idle_s_ = 0.0;
+    double anchor_mx_ = 0.0, anchor_my_ = 0.0;
+    double raw_yoke_x_ = 0.0, raw_yoke_y_ = 0.0;
+    bool yoke_anchor_valid_ = false;
     bool was_rmb_down_ = false;
     double kb_bank_cmd_ = 0.0, kb_pitch_cmd_ = 0.0;
     double taxi_hold_hdg_deg_ = 0.0;
@@ -197,7 +203,14 @@ private:
     double ground_wetness_ = 0.0;
     double damage_ = 0.0;
     double tire_wear_ = 0.0, brake_wear_ = 0.0, gear_alignment_ = 0.0, prop_nicks_ = 0.0;
-    double windshield_dirt_ = 0.0;
+    double windshield_dirt_ = 0.0, windshield_crack_ = 0.0;
+    double dmg_nose_ = 0.0, dmg_wing_l_ = 0.0, dmg_wing_r_ = 0.0, dmg_tail_ = 0.0;
+    float impact_fx_s_ = 0.0f;
+    double impact_cooldown_s_ = 0.0;
+    bool prev_ground_coll_ = true;
+    double prev_vsi_coll_ = 0.0;
+    std::string collision_msg_;
+    double collision_msg_s_ = 0.0;
     float windscreen_frost_ = 0.0f, cabin_mist_ = 0.0f, airframe_ice01_ = 0.0f;
     Vec3 cockpit_shake_pos_{0.0f, 0.0f, 0.0f};
     Vec3 cockpit_head_vel_{0.0f, 0.0f, 0.0f};
@@ -217,10 +230,10 @@ private:
     GLint u_pr_vp_ = -1, u_pr_cam_ = -1, u_pr_vel_ = -1, u_pr_right_ = -1, u_pr_up_ = -1;
     GLint u_pr_time_ = -1, u_pr_snow_ = -1, u_pr_int_ = -1, u_pr_col_ = -1;
     GLuint white_tex_ = 0;
-    GLint u_ac_mvp_ = -1, u_ac_model_ = -1, u_ac_sun_ = -1, u_ac_cool_ = -1, u_ac_warm_ = -1;
+    GLint u_ac_mvp_ = -1, u_ac_model_ = -1, u_ac_node_ = -1, u_ac_sun_ = -1, u_ac_cool_ = -1, u_ac_warm_ = -1;
     GLint u_ac_tint_ = -1, u_ac_pbr_ = -1, u_ac_em_ = -1, u_ac_int_ = -1, u_ac_alpha_ = -1, u_ac_livery_ = -1;
     GLint u_ac_unlit_ = -1, u_ac_cabin_glass_ = -1, u_ac_glass_weather_ = -1;
-    GLint u_ac_glass_fx_ = -1, u_ac_plane_wx_ = -1;
+    GLint u_ac_glass_fx_ = -1, u_ac_plane_wx_ = -1, u_ac_dmg_zones_ = -1, u_ac_dmg_extra_ = -1;
     GLint u_ac_baked_reflection_ = -1, u_ac_detail_ = -1;
     GLint u_ac_native_output_ = -1, u_ac_output_exposure_ = -1, u_ac_output_lut_ = -1;
     GlbMeshData ext_mesh_{};

@@ -658,13 +658,14 @@ void C172Systems::update(const C172EnvStep &in) {
         const double egt_target_f = 1060.0 + 380.0 * in.throttle01 - 1650.0 * (mix_delta * mix_delta);
         egt_f_ += (std::max(amb_f, egt_target_f) - egt_f_) * std::min(1.0, dt * 0.65);
 
-        // CHT rises with power and leaned mixture, cooled by airspeed airflow
+        // CHT rises with power and leaned mixture, cooled by airspeed airflow (+ full-rich fuel cooling)
         const double lean_heat = std::max(0.0, (0.82 - in.mixture01) * 140.0);
+        const double rich_cool = std::max(0.0, (in.mixture01 - 0.85) / 0.15) * 28.0;
         // The propeller also supplies cooling air during the ground roll. A
         // stationary running engine is not equivalent to zero airflow.
-        const double propwash = 0.55 + 0.30 * std::clamp(in.rpm / 2400.0, 0.0, 1.0);
-        const double air_cool = std::clamp(std::max(in.ias_kt / 95.0, propwash), 0.35, 1.35);
-        const double cht_target_f = amb_f + (265.0 + 135.0 * in.throttle01 + lean_heat) / std::sqrt(air_cool);
+        const double propwash = 0.62 + 0.28 * std::clamp(in.rpm / 2400.0, 0.0, 1.0);
+        const double air_cool = std::clamp(std::max(in.ias_kt / 88.0, propwash), 0.35, 1.38);
+        const double cht_target_f = amb_f + (255.0 + 115.0 * in.throttle01 - rich_cool + lean_heat) / std::sqrt(air_cool);
         const double prev_cht_f = cht_f_;
         // Cylinder temperature changes over minutes, not a few seconds of
         // takeoff power on the ground.

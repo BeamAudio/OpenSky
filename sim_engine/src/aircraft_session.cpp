@@ -102,6 +102,7 @@ void AircraftSession::service(AircraftService action) {
         case AircraftService::CleanPlugs: c.spark_fouling = 0; break;
         case AircraftService::RepairProp:
             c.prop_nicks = hangar ? 0 : std::max(0.0, c.prop_nicks - 0.35);
+            c.dmg_nose = hangar ? 0 : std::max(0.0, c.dmg_nose - 0.35);
             break;
         case AircraftService::Overhaul:
             if (!hangar) return;
@@ -124,6 +125,14 @@ void AircraftSession::service(AircraftService action) {
             break;
         case AircraftService::RepairAirframe:
             c.airframe_damage = hangar ? 0 : std::min(c.airframe_damage, 0.25);
+            c.dmg_nose = hangar ? 0 : c.dmg_nose * 0.4;
+            c.dmg_wing_l = hangar ? 0 : c.dmg_wing_l * 0.4;
+            c.dmg_wing_r = hangar ? 0 : c.dmg_wing_r * 0.4;
+            c.dmg_tail = hangar ? 0 : c.dmg_tail * 0.4;
+            if (hangar) c.windshield_crack = 0;
+            break;
+        case AircraftService::ReplaceWindshield:
+            c.windshield_crack = hangar ? 0 : std::min(c.windshield_crack, 0.22);
             break;
         case AircraftService::ChargeBattery:
             c.battery_soc = hangar ? 0.98 : std::max(c.battery_soc, 0.55);
@@ -363,8 +372,10 @@ void AircraftSession::step_flight(AircraftAndHud &aircraft, double dt) {
             const double pull_dir = (flight.roll_deg >= 0.0) ? 1.0 : -1.0;
             profile_.care_.gear_alignment = std::clamp(profile_.care_.gear_alignment + pull_dir * excess * 0.14, -1.0, 1.0);
         }
-        if (sink_mps > 3.0) {
+    if (sink_mps > 3.0) {
             profile_.care_.airframe_damage = std::min(1.0, profile_.care_.airframe_damage + (sink_mps - 3.0) * 0.10);
+            if (sink_mps > 4.2)
+                profile_.care_.windshield_crack = std::min(1.0, profile_.care_.windshield_crack + (sink_mps - 4.2) * 0.12);
         }
     }
 
@@ -372,12 +383,19 @@ void AircraftSession::step_flight(AircraftAndHud &aircraft, double dt) {
     if (aircraft.systems_.has_overtemp_failure() || aircraft.systems_.has_oil_starvation_failure())
         profile_.care_.airframe_damage = std::max(profile_.care_.airframe_damage, 0.85);
 
+    // Merge collision or other runtime damage before restoring the saved condition snapshot.
+    aircraft.sync_care_snapshot(profile_.care_);
     aircraft.damage_ = profile_.care_.airframe_damage;
     aircraft.tire_wear_ = profile_.care_.tire_wear;
     aircraft.brake_wear_ = profile_.care_.brake_wear;
     aircraft.gear_alignment_ = profile_.care_.gear_alignment;
     aircraft.prop_nicks_ = profile_.care_.prop_nicks;
     aircraft.windshield_dirt_ = profile_.care_.windshield_dirt;
+    aircraft.windshield_crack_ = profile_.care_.windshield_crack;
+    aircraft.dmg_nose_ = profile_.care_.dmg_nose;
+    aircraft.dmg_wing_l_ = profile_.care_.dmg_wing_l;
+    aircraft.dmg_wing_r_ = profile_.care_.dmg_wing_r;
+    aircraft.dmg_tail_ = profile_.care_.dmg_tail;
 
     was_grounded_ = flight.on_ground;
     last_sink_ = flight.vsi_mps;

@@ -13,7 +13,7 @@ struct LocalAirSample;
 enum class AircraftService {
     TopOil, ChangeOil, CleanPlugs, RepairProp, Overhaul, FillLeft, FillBoth,
     DrainSumps, TogglePitot, ToggleTieDowns, ToggleChocks, RepairGear,
-    RepairAirframe, ChargeBattery, CleanWindshield, ToggleSecuring
+    RepairAirframe, ReplaceWindshield, ChargeBattery, CleanWindshield, ToggleSecuring
 };
 
 class AircraftSession {
@@ -33,6 +33,7 @@ public:
     void remove_route_point(size_t index);
     void clear_route();
     const FleetProfile &profile() const { return profile_; }
+    size_t active_leg() const { return active_leg_; }
     const std::string &profile_error() const { return profile_error_; }
 
 private:

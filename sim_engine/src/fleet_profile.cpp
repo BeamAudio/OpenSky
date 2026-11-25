@@ -17,7 +17,7 @@ bool read_profile(std::istream &in, FleetProfile &profile) {
     int version = 0;
     auto &care = profile.care_;
     size_t route_count = 0;
-    if (!(in >> version) || (version != 1 && version != 2) ||
+    if (!(in >> version) || (version < 1 || version > 3) ||
         !(in >> std::quoted(profile.parked_id_) >> care.left_fuel_gal >> care.right_fuel_gal >>
           care.airframe_damage >> profile.hours_ >> route_count) ||
         route_count > max_route_points || profile.parked_id_.size() > 64) return false;
@@ -28,7 +28,7 @@ bool read_profile(std::istream &in, FleetProfile &profile) {
         profile.route_.push_back(std::move(point));
     }
 
-    if (version == 2) {
+    if (version >= 2) {
         bool chocks, pitot, tied, master, avionics, running, custom_park;
         auto &pos = profile.parking_spot_;
         if (!(in >> care.oil_quarts >> care.oil_hours >> care.battery_soc >>
@@ -67,6 +67,10 @@ bool read_profile(std::istream &in, FleetProfile &profile) {
                 if (!std::isfinite(value) || value < 0) return false;
             profile.logbook_.push_back(std::move(entry));
         }
+        if (version >= 3) {
+            if (!(in >> care.windshield_crack >> care.dmg_nose >> care.dmg_wing_l >>
+                  care.dmg_wing_r >> care.dmg_tail)) return false;
+        }
     }
 
     for (double value : {care.left_fuel_gal, care.right_fuel_gal, care.oil_quarts, care.oil_hours,
@@ -75,7 +79,8 @@ bool read_profile(std::istream &in, FleetProfile &profile) {
         if (!std::isfinite(value)) return false;
     for (double *value : {&care.battery_soc, &care.spark_fouling, &care.shock_cooling,
                           &care.cylinder_wear, &care.tire_wear, &care.brake_wear, &care.prop_nicks,
-                          &care.windshield_dirt, &care.sump_water, &care.carb_heat}) {
+                          &care.windshield_dirt, &care.windshield_crack, &care.dmg_nose,
+                          &care.dmg_wing_l, &care.dmg_wing_r, &care.dmg_tail, &care.sump_water, &care.carb_heat}) {
         if (!std::isfinite(*value)) return false;
         *value = std::clamp(*value, 0.0, 1.0);
     }
@@ -125,7 +130,7 @@ bool write_fleet_profile(const std::filesystem::path &path, const FleetProfile &
     std::ofstream out(pattern, std::ios::trunc);
     const auto &c = profile.care_;
     const auto &pos = profile.parking_spot_;
-    out << std::setprecision(12) << 2 << '\n' << std::quoted(profile.parked_id_) << '\n'
+    out << std::setprecision(12) << 3 << '\n' << std::quoted(profile.parked_id_) << '\n'
         << c.left_fuel_gal << ' ' << c.right_fuel_gal << ' ' << c.airframe_damage << ' ' << profile.hours_ << '\n'
         << profile.route_.size() << '\n';
     for (const auto &p : profile.route_) out << std::quoted(p.label) << ' ' << p.lat << ' ' << p.lon << '\n';
@@ -144,6 +149,7 @@ bool write_fleet_profile(const std::filesystem::path &path, const FleetProfile &
     for (const auto &e : profile.logbook_)
         out << std::quoted(e.dep_id) << ' ' << std::quoted(e.arr_id) << ' ' << std::quoted(e.grade) << ' '
             << e.minutes << ' ' << e.distance_nm << ' ' << e.fuel_gal << ' ' << e.touchdown_fpm << ' ' << e.crosswind_kt << '\n';
+    out << c.windshield_crack << ' ' << c.dmg_nose << ' ' << c.dmg_wing_l << ' ' << c.dmg_wing_r << ' ' << c.dmg_tail << '\n';
     out.close();
     if (out) std::filesystem::rename(pattern, path, ec);
     if (!out || ec) {

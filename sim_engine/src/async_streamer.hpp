@@ -9,8 +9,10 @@
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
+#include <queue>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace nsim {
@@ -62,8 +64,8 @@ class AsyncTerrainStreamer {
 public:
     static constexpr double WORLD_SPAN_M = 163840.0; // 163.84 km corridor
     static constexpr int MAX_LOD = 9;                // L0=163.84km .. L9=320m (0.625m/px @ 512 ortho!)
-    // 256 resident pages (~128 MB GPU) fits comfortably alongside desktop apps on 512 MB iGPUs while covering 21 coarse + 235 active pages.
-    static constexpr int MAX_PAGES = 256;
+    // 512 resident pages (~240 MB GPU) prevents L6-L9 thrash in full valleys while reserving plenty of VRAM headroom.
+    static constexpr int MAX_PAGES = 512;
     static constexpr int HEIGHT_N = 67;              // 65x65 patch verts + 1-texel seamless gutter (4x terrain mesh detail!)
     static constexpr int ORTHO_RES = 512;            // 512x512 ortho per page (4x sharper IGN PNOA!)
     static constexpr int ORTHO_MIPS = 6;             // 512, 256, 128, 64, 32, 16 (pre-built off-thread!)
@@ -81,20 +83,30 @@ public:
     void flush_pending_sync(int max_pages_to_drain = 160, double timeout_sec = 2.5);
     // Re-queue currently active resident pages in-place when user jumps time of day (zero blank flash!)
     void invalidate_shadows();
-    // Re-queue active L5..L9 pages when new distance-tiered PNOA ortho tiles arrive!
+    // Re-queue active pages that missed higher-tier PNOA imagery in-place (never downgrades completed PNOA).
     void invalidate_close_pages(bool evict_inactive = false);
     // Drop queued pages left behind after a QA teleport; resident pages remain available.
     void clear_pending_requests();
-    void set_thermal_sleep_ms(int ms) { thermal_sleep_ms_.store(std::clamp(ms, 0, 120), std::memory_order_relaxed); }
+    void set_thermal_sleep_ms(int ms) { thermal_sleep_ms_.store(std::clamp(ms, 0, 140), std::memory_order_relaxed); }
     // Clear all resident pages and prewarm coarse root pages cleanly when jumping across regions!
     void invalidate_all_and_prewarm(const Vec3 &sun_dir);
+    void begin_async_transition(std::shared_ptr<const PackReader::WorldFrame> next_frame,
+                                const Vec3 &sun_dir,
+                                double lat_deg, double lon_deg,
+                                double vel_e_mps, double vel_n_mps);
+    bool has_async_transition() const { return pending_gen_.load(std::memory_order_acquire) != 0; }
+    bool is_async_transition_ready(double elapsed_sec = 0.0) const;
+    void commit_async_transition();
+    void cancel_async_transition();
     int worker_count() const { return static_cast<int>(workers_.size()); }
 
     void set_sun_direction(const Vec3 &sun_dir);
     void begin_frame(uint64_t frame_idx);
 
-    // Lookup resident GPU array slice (-1 if not yet streamed). Updates LRU touch + returns smooth randomized arrival fade [0..1].
-    int find_resident(uint64_t key, float now_sec, float *out_fade = nullptr);
+    // Lookup resident GPU array slice (-1 if not yet streamed).
+    // Pass touch_lru=false for off-frustum/prefetch lookups so passed tiles are evicted cleanly.
+    int find_resident(uint64_t key, float now_sec, float *out_fade = nullptr,
+                      bool touch_lru = true, float importance = 0.0f);
     // Queue a page with velocity-predictive + deterministic stochastic jitter priority (higher = sooner).
     void request_page(uint64_t key, float priority);
     // Frame-time-budgeted randomized GPU DMA uploader (never saturates low-end iGPUs!).
@@ -111,10 +123,13 @@ public:
 private:
     struct CacheSlot {
         uint64_t key = UINT64_MAX;
+        uint64_t generation = 0;
         uint64_t last_used_frame = 0;
         float ready_time_sec = 0.0f;
-        float fade_dur_sec = 0.65f; // Per-page randomized arrival duration (0.50..0.90s) for non-grid organic dissolve!
+        float fade_dur_sec = 0.65f; // Per-page randomized arrival duration (0.18..0.30s) for non-grid organic dissolve!
+        float last_importance = 0.0f;
         bool pinned = false;        // Coarse root pages (lod <= 2) never evicted
+        bool pending_online_refine = false;
     };
 
     enum class StageState : uint8_t { FREE = 0, FILLING = 1, READY = 2, UPLOADING = 3 };
@@ -126,10 +141,23 @@ private:
         uint64_t key = UINT64_MAX;
         uint64_t generation = 0;
         float worker_ms = 0.0f;
+        bool incomplete_online = false;
         std::atomic<StageState> state{StageState::FREE};
     };
 
-    static constexpr int NUM_STAGING = 12;
+    struct RequestOrder {
+        float priority = 0.0f;
+        uint64_t key = UINT64_MAX;
+    };
+    struct RequestOrderLess {
+        bool operator()(const RequestOrder &a, const RequestOrder &b) const {
+            if (a.priority != b.priority) return a.priority < b.priority;
+            return a.key > b.key;
+        }
+    };
+    using RequestHeap = std::priority_queue<RequestOrder, std::vector<RequestOrder>, RequestOrderLess>;
+
+    static constexpr int NUM_STAGING = 24;
     static constexpr size_t SZ_HEIGHT = static_cast<size_t>(HEIGHT_N) * HEIGHT_N * sizeof(float);
     static constexpr size_t SZ_AUX = static_cast<size_t>(AUX_RES) * AUX_RES * 4;
 
@@ -143,8 +171,15 @@ private:
 
     void worker_loop();
     bool coarse_root_ready() const;
+    static void queue_request(std::unordered_map<uint64_t, float> &requests, RequestHeap &heap,
+                              uint64_t key, float priority);
+    static void rebuild_request_heap(const std::unordered_map<uint64_t, float> &requests, RequestHeap &heap);
+    static bool pop_best_request(std::unordered_map<uint64_t, float> &requests, RequestHeap &heap,
+                                 uint64_t &out_key, float &out_priority);
+    void release_cache_slot(int idx);
     void fill_staging_slot(StagingSlot &slot, uint64_t key, const PackReader::WorldFrame &frame);
-    int allocate_cache_slice(uint64_t key, float now_sec);
+    int allocate_cache_slice(uint64_t key, float now_sec, uint64_t target_gen,
+                             std::unordered_map<uint64_t, int> &target_map, bool instant_fade);
     static void downsample_rgba_box2(const uint8_t *src, int sw, int sh, uint8_t *dst);
 
     const PackReader *pack_ = nullptr;
@@ -156,7 +191,10 @@ private:
     GLuint surf_arr_ = 0;
 
     CacheSlot slots_[MAX_PAGES]{};
+    std::vector<int> free_slots_;
     std::unordered_map<uint64_t, int> key_to_slot_;
+    std::unordered_map<uint64_t, int> pending_key_to_slot_;
+    std::vector<uint64_t> pending_required_keys_;
     uint64_t cur_frame_ = 1;
 
     StagingSlot staging_[NUM_STAGING]{};
@@ -164,14 +202,22 @@ private:
     mutable std::mutex req_mtx_;
     std::condition_variable req_cv_;
     std::unordered_map<uint64_t, float> pending_reqs_;
-    std::unordered_map<uint64_t, uint64_t> inflight_keys_;
-    std::atomic<uint64_t> generation_{1};
+    RequestHeap pending_req_heap_;
+    std::unordered_map<uint64_t, uint64_t> pending_req_frame_;
+    std::unordered_map<uint64_t, float> pending_reqs_next_;
+    RequestHeap pending_req_heap_next_;
+    std::unordered_set<uint64_t> inflight_active_;
+    std::unordered_set<uint64_t> inflight_next_;
+    std::atomic<uint64_t> active_gen_{1};
+    std::atomic<uint64_t> pending_gen_{0};
+    std::atomic<uint64_t> gen_seq_{1};
     std::shared_ptr<const PackReader::WorldFrame> world_frame_; // guarded by req_mtx_
+    std::shared_ptr<const PackReader::WorldFrame> pending_frame_; // guarded by req_mtx_
     Vec3 sun_dir_{0.86f, 0.32f, 0.38f};
 
     std::atomic<bool> stop_{false};
     std::atomic<bool> sync_flushing_{false};
-    std::atomic<int> thermal_sleep_ms_{24};
+    std::atomic<int> thermal_sleep_ms_{0};
     std::vector<std::thread> workers_;
 
     int uploads_this_frame_ = 0;

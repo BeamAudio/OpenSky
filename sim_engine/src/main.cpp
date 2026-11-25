@@ -6,6 +6,7 @@
 #include "gl_loader.hpp"
 #include "game_frontend.hpp"
 #include "flight_profiler.hpp"
+#include "flight_replay.hpp"
 #include "living_traffic.hpp"
 #include "pack_reader.hpp"
 #include "platform_window.hpp"
@@ -27,6 +28,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <numeric>
 #include <string>
 #include <vector>
@@ -44,7 +46,8 @@ int run_selftest(const PackReader &pack) {
     if (!(eh > 500.0 && eh < 580.0)) { std::fprintf(stderr, "[FAIL] LEHC elev=%.1f\n", eh); return 1; }
     if (!(ec > 880.0 && ec < 935.0)) { std::fprintf(stderr, "[FAIL] ES-0205 elev=%.1f\n", ec); return 1; }
     const int zoom_checks[][2] = {{100, 20}, {200, 20}, {201, 19}, {500, 19}, {501, 18},
-                                  {2000, 18}, {4000, 17}, {8000, 16}, {12000, 15}, {20000, 14}, {20001, 0}};
+                                  {2000, 18}, {4000, 17}, {8000, 16}, {12000, 15},
+                                  {28000, 14}, {28001, 13}, {48000, 13}, {48001, 0}};
     for (const auto &zc : zoom_checks) {
         if (online_zoom_for_distance_m(static_cast<double>(zc[0])) != zc[1]) {
             std::fprintf(stderr, "[FAIL] online zoom at %dm = %d (expected %d)\n",
@@ -306,6 +309,9 @@ int main(int argc, char **argv) {
     std::string world_qa_png;
     std::string profile_dir;
     std::string region_test_dir;
+    std::string record_crossing_path;
+    std::string replay_flight_path;
+    bool replay_headless = false;
     std::string season_arg = "auto";
     std::string weather_arg = "auto";
     bool quick_profile = false;
@@ -352,6 +358,9 @@ int main(int argc, char **argv) {
         else if (a == "--world-qa" && i + 1 < argc) world_qa_png = argv[++i];
         else if (a == "--airport-qa" && i + 1 < argc) airport_qa_dir = argv[++i];
         else if (a == "--region-flight-test" && i + 1 < argc) region_test_dir = argv[++i];
+        else if (a == "--record-crossing-flight" && i + 1 < argc) record_crossing_path = argv[++i];
+        else if (a == "--replay-flight" && i + 1 < argc) replay_flight_path = argv[++i];
+        else if (a == "--replay-headless") replay_headless = true;
         else if (a == "--online-ortho" && i + 1 < argc) {
             ortho_explicit = true;
             std::string p = argv[++i];
@@ -425,6 +434,12 @@ int main(int argc, char **argv) {
         if (runtime_check_gpu && !win.create("OpenSky runtime check", 960, 540)) return 1;
         return run_runtime_checks(pack, runtime_check_gpu, outlook_check);
     }
+    if (!record_crossing_path.empty()) {
+        return record_castejon_catalonia_flight(pack, record_crossing_path) ? 0 : 1;
+    }
+    if (!replay_flight_path.empty() && replay_headless) {
+        return replay_flight_headless(pack, replay_flight_path) ? 0 : 1;
+    }
     profiler.startup_stage("spawn_anchor");
 
     const int output_w = !topdown_dir.empty() ? 1024 : GAME_OUTPUT_W;
@@ -432,7 +447,7 @@ int main(int argc, char **argv) {
     if (!win.create("OpenSky VFR Simulator", output_w, output_h)) {
         return 1;
     }
-    const bool interactive_run = autotest_dir.empty() && topdown_dir.empty() && !quick_profile && airport_qa_dir.empty() && region_test_dir.empty() && world_qa_png.empty();
+    const bool interactive_run = autotest_dir.empty() && topdown_dir.empty() && !quick_profile && airport_qa_dir.empty() && region_test_dir.empty() && world_qa_png.empty() && replay_flight_path.empty();
     // Cap FPS to monitor refresh rate (<= 60 Hz for iGPU thermal stability <80C) and enable VSync interactively.
     const double fps_cap = std::clamp(win.refresh_hz(), 30.0, 60.0);
     const double frame_period = 1.0 / fps_cap;
@@ -533,7 +548,7 @@ int main(int argc, char **argv) {
         win.poll_events();
     };
     show_loading("OpenSky VFR - Starting Up", "Initializing flight & atmosphere...", 0.25f);
-    if (!autotest_dir.empty() || !topdown_dir.empty() || !airport_qa_dir.empty() || quick_profile) {
+    if (!autotest_dir.empty() || !topdown_dir.empty() || !airport_qa_dir.empty() || quick_profile || !replay_flight_path.empty()) {
         ac_hud.state().menu_open = false;
         ac_hud.state().paused = false;
     }
@@ -574,7 +589,33 @@ int main(int argc, char **argv) {
 
     double sim_time = 0.0;
     uint64_t frame_idx = 1;
+    struct AsyncPrepareResult {
+        std::shared_ptr<const PackReader::WorldFrame> frame;
+        WorldObjects::PreparedReanchor world_objs;
+    };
+    struct AsyncCrossingJob {
+        bool active = false;
+        bool stage2_streaming = false;
+        double start_wall_t = 0.0;
+        std::future<AsyncPrepareResult> cpu_future;
+        AsyncPrepareResult prepared;
+    } async_cross;
+    auto bbox_contains_region = [](const PackReader::LoadedRegion &r, double lat, double lon) {
+        return lat >= r.hdr.lat_min && lat <= r.hdr.lat_max &&
+               lon >= r.hdr.lon_min && lon <= r.hdr.lon_max;
+    };
+    auto cancel_async_crossing = [&]() {
+        if (async_cross.active) {
+            if (async_cross.cpu_future.valid()) async_cross.cpu_future.wait();
+            async_cross.cpu_future = {};
+            async_cross.prepared = {};
+            async_cross.active = false;
+            async_cross.stage2_streaming = false;
+        }
+        streamer.cancel_async_transition();
+    };
     auto transition_world = [&](double lat, double lon, const char *loading_title = nullptr) {
+        cancel_async_crossing();
         if (loading_title) show_loading(loading_title, "Preparing world coordinates...", 0.20f);
         const bool changed = pack.reanchor_to(lat, lon);
         if (changed) {
@@ -589,6 +630,60 @@ int main(int argc, char **argv) {
         reg_atmo.sync_region(lat, lon);
         reg_atmo.update_field(sky_clouds.atmo().sun_dir, sim_time, false, wx_advance);
         return changed;
+    };
+
+    auto step_flight_world_transition = [&](double lat, double lon, double vel_e = 0.0, double vel_n = 0.0) -> bool {
+        if (async_cross.active && async_cross.stage2_streaming) {
+            const double elapsed = PlatformWindow::now_sec() - async_cross.start_wall_t;
+            if (!streamer.is_async_transition_ready(elapsed)) return false;
+            if (async_cross.prepared.frame) {
+                pack.commit_world_frame(async_cross.prepared.frame);
+                streamer.commit_async_transition();
+                vegetation.invalidate();
+                objects.commit_reanchor(std::move(async_cross.prepared.world_objs));
+                living_traffic.on_reanchor();
+                reg_atmo.sync_region(pack.anchor_lat(), pack.anchor_lon());
+                reg_atmo.update_field(sky_clouds.atmo().sun_dir, sim_time, false, wx_advance);
+            } else {
+                streamer.cancel_async_transition();
+            }
+            async_cross.prepared = {};
+            async_cross.stage2_streaming = false;
+            async_cross.active = false;
+            return true;
+        }
+        if (async_cross.active && !async_cross.stage2_streaming) {
+            if (async_cross.cpu_future.valid() &&
+                async_cross.cpu_future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+                async_cross.prepared = async_cross.cpu_future.get();
+                async_cross.cpu_future = {};
+                if (async_cross.prepared.frame) {
+                    async_cross.stage2_streaming = true;
+                    streamer.begin_async_transition(async_cross.prepared.frame, sky_clouds.atmo().sun_dir,
+                                                    lat, lon, vel_e, vel_n);
+                } else {
+                    async_cross.active = false;
+                }
+            }
+            return false;
+        }
+        const double anchor_drift_m = nspain::haversine_m(lat, lon, pack.anchor_lat(), pack.anchor_lon());
+        const auto *flight_region = pack.find_region_at(lat, lon);
+        const auto *anchor_region = pack.find_region_at(pack.anchor_lat(), pack.anchor_lon());
+        const bool out_of_anchor_box = anchor_region && !bbox_contains_region(*anchor_region, lat, lon);
+        const bool region_crossed = flight_region && flight_region != anchor_region && out_of_anchor_box;
+        if (anchor_drift_m > 60000.0 || region_crossed) {
+            async_cross.active = true;
+            async_cross.stage2_streaming = false;
+            async_cross.start_wall_t = PlatformWindow::now_sec();
+            async_cross.cpu_future = std::async(std::launch::async, [&pack, &objects, lat, lon]() {
+                AsyncPrepareResult res;
+                res.frame = pack.prepare_world_frame(lat, lon, true);
+                if (res.frame) res.world_objs = objects.prepare_reanchor_cpu(*res.frame);
+                return res;
+            });
+        }
+        return false;
     };
 
     double last_t = PlatformWindow::now_sec();
@@ -620,7 +715,23 @@ int main(int argc, char **argv) {
     };
     bool first_presented = false;
     int thermal_pixel_cap = 72;
+    double thermal_fps_cap = 60.0;
     double last_thermal_check_t = -10.0;
+    struct RoutePlaybackUiState {
+        bool active = false;
+        bool playing = true;
+        float speed = 1.0f;
+        double cur_t = 0.0;
+        double first_t = 0.0;
+        double dur_t = 0.0;
+        double seek_t = -1.0;
+        bool saved_walking = false;
+        bool saved_menu_open = true;
+        double saved_sim_time = 0.0;
+        FlightSimState saved_state{};
+        RouteVideoRecording active_rec;
+        GameFrontend::ReplayAction last_action = GameFrontend::ReplayAction::None;
+    } route_play;
     const auto update_environment = [&] {
         const double weather_start = profiler.cpu_start();
         const bool walking = frontend.walking();
@@ -643,34 +754,45 @@ int main(int argc, char **argv) {
         profiler.cpu_end(FlightProfiler::Weather, weather_start);
     };
 
-    auto render_one_frame = [&](bool draw_hud, int max_new_tree_cells = 1, const std::string &save_png = "", float fov_deg = 50.0f) {
+    auto render_one_frame = [&](bool draw_hud, int max_new_tree_cells = 1, const std::string &save_png = "", float fov_deg = 50.0f, bool replay_hud = false) {
         frame_idx++;
         profiler.start_frame(frame_idx, quality);
         double prepare_start = profiler.cpu_start();
         const FlightSimState &st = ac_hud.state();
         const GraphicsSettings &render_settings = ac_hud.graphics_settings();
-        // Proactive closed-loop thermal + 60 FPS frame-time guard (<78 C on Renoir iGPU laptops):
-        // smoothly scales internal pixel budget & worker sleep before thermal throttling or frame drops hit.
+        // Proactive closed-loop thermal + 60 FPS frame-time guard (<80 C ceiling on laptop APUs):
+        // smoothly reduces internal resolution, worker burst, cloud rays, and frame ceiling under heat.
         double wall_now = PlatformWindow::now_sec();
-        if (topdown_dir.empty() && airport_qa_dir.empty() && (wall_now - last_thermal_check_t) >= 1.0) {
+        if (topdown_dir.empty() && airport_qa_dir.empty() && (wall_now - last_thermal_check_t) >= 0.5) {
             last_thermal_check_t = wall_now;
             const double temp_c = FlightProfiler::peak_package_temp_c();
             const double avg_ms = profiler.enabled() ? profiler.frame_avg_ms() : cur_avg_ms;
-            if (temp_c >= 74.0 || (avg_ms > 0.1 && avg_ms >= 18.2)) {
-                thermal_pixel_cap = std::max(46, thermal_pixel_cap - 6);
-                streamer.set_thermal_sleep_ms(temp_c >= 74.0 ? 96 : 64);
-            } else if (temp_c >= 67.0 || (avg_ms > 0.1 && avg_ms >= 16.8)) {
-                thermal_pixel_cap = std::max(52, thermal_pixel_cap - 3);
-                streamer.set_thermal_sleep_ms(48);
-            } else if ((temp_c <= 0.0 || temp_c <= 62.0) && (avg_ms <= 0.1 || avg_ms <= 14.5)) {
+            if (temp_c >= 76.5) {
+                thermal_pixel_cap = 40;
+                streamer.set_thermal_sleep_ms(16);
+                sky_clouds.set_thermal_sparse_clouds(true);
+                thermal_fps_cap = 30.0;
+            } else if (temp_c >= 73.5) {
+                thermal_pixel_cap = std::max(44, thermal_pixel_cap - 6);
+                streamer.set_thermal_sleep_ms(6);
+                sky_clouds.set_thermal_sparse_clouds(true);
+                thermal_fps_cap = 40.0;
+            } else if (temp_c >= 69.5 || (avg_ms > 0.1 && avg_ms >= 17.5)) {
+                thermal_pixel_cap = std::max(50, thermal_pixel_cap - 4);
+                streamer.set_thermal_sleep_ms(0);
+                sky_clouds.set_thermal_sparse_clouds(temp_c >= 71.0);
+                thermal_fps_cap = (temp_c >= 71.0) ? 48.0 : 60.0;
+            } else if ((temp_c <= 0.0 || temp_c <= 64.0) && (avg_ms <= 0.1 || avg_ms <= 14.5)) {
                 thermal_pixel_cap = std::min(85, thermal_pixel_cap + 3);
-                streamer.set_thermal_sleep_ms(26);
+                streamer.set_thermal_sleep_ms(0);
+                sky_clouds.set_thermal_sparse_clouds(false);
+                thermal_fps_cap = 60.0;
             }
         }
         const int eff_pixel_pct = (topdown_dir.empty() && airport_qa_dir.empty())
             ? std::min(render_settings.pixel_percent, thermal_pixel_cap)
             : render_settings.pixel_percent;
-        const bool walking = frontend.walking();
+        const bool walking = frontend.walking() && !route_play.active;
         const auto &walker = frontend.walker();
         const double lat = walking ? walker.lat : st.lat_deg;
         const double lon = walking ? walker.lon : st.lon_deg;
@@ -690,9 +812,9 @@ int main(int argc, char **argv) {
             streamer.invalidate_close_pages();
         }
         streamer.begin_frame(frame_idx);
-        // Adaptive frame-time-budgeted upload cap so iGPUs stay smooth and cool at 60 FPS!
-        int max_up = (quality <= 1) ? 1 : 2;
-        double up_budget_ms = (quality == 0) ? 0.25 : (quality == 1 ? 0.35 : 0.45);
+        // Frame-time-budgeted upload cap; drains PBO staging bursts quickly without long frame stalls.
+        const int max_up = streamer.has_async_transition() ? 10 : ((quality <= 1) ? 5 : 6);
+        const double up_budget_ms = streamer.has_async_transition() ? 3.0 : ((quality == 0) ? 1.4 : (quality == 1 ? 1.8 : 2.2));
         profiler.begin(FlightProfiler::Upload);
         streamer.pump_gpu_uploads(static_cast<float>(sim_time), max_up, up_budget_ms);
         profiler.end(FlightProfiler::Upload);
@@ -861,6 +983,7 @@ int main(int argc, char **argv) {
             const auto &p = frontend.parking_spot();
             const Vec3 offset{float((p.lon - lon) * pack.anchor_m_lon()), float(p.alt - cam_alt),
                               float((lat - p.lat) * pack.anchor_m_lat())};
+            ac_hud.sync_walkaround_damage(frontend.care());
             ac_hud.render_parked_aircraft(vp, offset, float(p.heading), sky_clouds.atmo(), sky_clouds.refl_env_tex());
         } else if (!native_cockpit)
             ac_hud.render_aircraft_3d(vp, cam_off, sky_clouds.atmo(), sky_clouds.refl_env_tex(), static_cast<float>(sim_time));
@@ -921,6 +1044,12 @@ int main(int argc, char **argv) {
                 show_diagnostics, debug_active ? &debug : nullptr
             );
             frontend.draw_navigation(ac_hud, win);
+        } else if (replay_hud && route_play.active) {
+            route_play.last_action = frontend.draw_replay_bar(
+                ac_hud, win, route_play.active_rec.title,
+                route_play.cur_t, route_play.dur_t,
+                route_play.playing, route_play.speed, ac_hud.state().view_mode,
+                &route_play.seek_t);
         }
         profiler.end(FlightProfiler::Hud);
         const double t_p6 = PlatformWindow::now_sec();
@@ -1206,6 +1335,184 @@ int main(int argc, char **argv) {
         }
         std::printf("[FLIGHT-DEMO] COMPLETE -> %s\n", region_test_dir.c_str());
         return 0;
+    }
+
+    // Continuous Recorded Crossing Flight Replay (--replay-flight <trace>) with Boundary Profiling & Persistence Check
+    if (!replay_flight_path.empty()) {
+        FlightReplayTrace trace;
+        if (!load_flight_replay(replay_flight_path, trace)) {
+            std::fprintf(stderr, "[REPLAY] Failed to load trace: %s\n", replay_flight_path.c_str());
+            return 1;
+        }
+        const AirportInfo *dep = pack.find_airport(trace.start_airport);
+        if (!dep) {
+            std::fprintf(stderr, "[REPLAY] Missing departure airport %s\n", trace.start_airport.c_str());
+            return 1;
+        }
+        tod_slot = 2;
+        wx_advance = trace.wx_advance;
+        reg_atmo.set_solver_seed(20261125, false);
+        reg_atmo.set_manual_weather_override(true);
+        reg_atmo.set_regime(static_cast<WindRegime>(trace.weather_regime));
+        reg_atmo.set_season(trace.season);
+        transition_world(dep->lat, dep->lon);
+
+        ScopedTempDir replay_tmp("opensky-gpu-replay-XXXXXX");
+        if (replay_tmp.dir.empty()) return 1;
+        const auto profile_path = replay_tmp.dir / "fleet.ini";
+        AircraftSession replay_session;
+        if (!prepare_replay_session(pack, trace, profile_path, replay_session, ac_hud, 15.0)) {
+            std::fprintf(stderr, "[REPLAY] Failed to prepare replay session at %s\n", trace.start_airport.c_str());
+            return 1;
+        }
+        const double start_fuel =
+            replay_session.profile().care_.left_fuel_gal + replay_session.profile().care_.right_fuel_gal;
+        sim_time = 0.0;
+
+        std::ofstream cross_csv;
+        if (!trace_dir.empty()) {
+            cross_csv.open(std::filesystem::path(trace_dir) / "crossing_frames.csv");
+            cross_csv << "frame,sim_t,wall_ms,transition_ms,render_ms,lat_deg,lon_deg,agl_m,region_id,"
+                         "anchor_drift_m,resident,pending,max_active_lod,res_l7,res_l8,res_l9,gpu_storage_mb\n";
+        }
+
+        BoundaryMetrics boundary{};
+        if (const auto *r0 = pack.find_region_at(dep->lat, dep->lon)) boundary.start_region = r0->region_id;
+        else boundary.start_region = "es_aragon_pyrenees";
+
+        const double run_t0 = PlatformWindow::now_sec();
+        std::vector<double> all_wall_ms, win_wall_ms;
+        all_wall_ms.reserve(trace.steps.size());
+        double max_all_trans_ms = 0.0, max_win_trans_ms = 0.0;
+        int gt33_all = 0, gt33_win = 0;
+        bool settled_sharp = false;
+
+        profiler.set_scene("crossing_replay");
+        const double target_frame_s = 1.0 / std::clamp(win.refresh_hz(), 30.0, 60.0);
+
+        for (size_t i = 0; i < trace.steps.size() && !win.should_close(); ++i) {
+            const ReplayStep &rs = trace.steps[i];
+            const double loop_t0 = PlatformWindow::now_sec();
+            win.poll_events();
+
+            sim_time += rs.dt;
+            update_environment();
+            const double phys_t0 = profiler.cpu_start();
+            apply_replay_step(ac_hud, replay_session, rs, sky_clouds.atmo(), reg_atmo, sim_time);
+            profiler.cpu_end(FlightProfiler::InputPhysics, phys_t0);
+
+            const auto &flight = ac_hud.jsb_state();
+            const auto *cur_reg = pack.find_region_at(flight.lat_deg, flight.lon_deg);
+            const std::string reg_name = cur_reg ? cur_reg->region_id : "outside";
+            const int cur_lod_before = terrain.last_stats().max_active_lod;
+            if (!boundary.crossed_region && cur_reg && cur_reg->region_id != boundary.start_region) {
+                boundary.crossed_region = true;
+                boundary.crossed_to_region = cur_reg->region_id;
+                boundary.cross_sim_time_s = sim_time;
+                boundary.cross_wall_ms = (PlatformWindow::now_sec() - run_t0) * 1000.0;
+                boundary.pre_cross_max_lod = std::max(7, cur_lod_before);
+                std::printf("[BOUNDARY-CROSS] step=%zu sim_t=%.2fs -> %s at (%.4f, %.4f) pre_lod=%d\n",
+                            i, sim_time, boundary.crossed_to_region.c_str(),
+                            flight.lat_deg, flight.lon_deg, boundary.pre_cross_max_lod);
+            }
+
+            const double tr_t0 = PlatformWindow::now_sec();
+            const bool did_commit = step_flight_world_transition(
+                flight.lat_deg, flight.lon_deg, flight.vel_east_mps, flight.vel_north_mps);
+            const double tr_ms = (PlatformWindow::now_sec() - tr_t0) * 1000.0;
+            if (did_commit && boundary.crossed_region && boundary.commit_wall_ms < 0.0 &&
+                pack.find_region_at(pack.anchor_lat(), pack.anchor_lon()) == cur_reg) {
+                boundary.commit_wall_ms = (PlatformWindow::now_sec() - run_t0) * 1000.0;
+            }
+
+            const bool pace_realtime =
+                (sim_time < 20.0) || (flight.lon_deg >= 0.610 && flight.lon_deg <= 0.720) ||
+                (trace.route.empty() ? false
+                    : nspain::haversine_m(flight.lat_deg, flight.lon_deg, trace.route.back().lat, trace.route.back().lon) < 3500.0);
+            const uint64_t step_mask = (thermal_fps_cap <= 35.0) ? 15ULL : ((thermal_fps_cap <= 50.0) ? 3ULL : 1ULL);
+            const bool render_step = pace_realtime || (i & step_mask) == 0 || did_commit || async_cross.active;
+
+            double rend_ms = 0.0;
+            double wall_ms = 0.0;
+            if (render_step) {
+                const double r_t0 = PlatformWindow::now_sec();
+                render_one_frame(true, 1);
+                rend_ms = (PlatformWindow::now_sec() - r_t0) * 1000.0;
+                wall_ms = (PlatformWindow::now_sec() - loop_t0) * 1000.0;
+            } else {
+                wall_ms = (PlatformWindow::now_sec() - loop_t0) * 1000.0;
+            }
+
+            const StreamStats ss = streamer.stats();
+            const CdlodDrawStats ts = terrain.last_stats();
+            const double drift_m = nspain::haversine_m(flight.lat_deg, flight.lon_deg, pack.anchor_lat(), pack.anchor_lon());
+
+            if (boundary.crossed_region && !settled_sharp && boundary.commit_wall_ms >= 0.0 &&
+                ts.max_active_lod >= std::min(7, boundary.pre_cross_max_lod) && ss.queued_jobs <= 4) {
+                settled_sharp = true;
+                boundary.sharp_terrain_wall_ms = (PlatformWindow::now_sec() - run_t0) * 1000.0;
+                boundary.time_to_sharp_since_cross_ms = boundary.sharp_terrain_wall_ms - boundary.cross_wall_ms;
+                boundary.time_to_sharp_since_commit_ms = boundary.sharp_terrain_wall_ms - boundary.commit_wall_ms;
+                std::printf("[BOUNDARY-SHARP] since_cross=%.1fms since_commit=%.1fms max_lod=%d res_L7/8/9=%d/%d/%d\n",
+                            boundary.time_to_sharp_since_cross_ms, boundary.time_to_sharp_since_commit_ms,
+                            ts.max_active_lod, ss.resident_by_lod[7], ss.resident_by_lod[8], ss.resident_by_lod[9]);
+            }
+
+            if (render_step) {
+                all_wall_ms.push_back(wall_ms);
+                max_all_trans_ms = std::max(max_all_trans_ms, tr_ms);
+                if (wall_ms > 33.333) ++gt33_all;
+            }
+            const bool in_boundary_win =
+                boundary.crossed_region ? (sim_time >= boundary.cross_sim_time_s - 30.0 && sim_time <= boundary.cross_sim_time_s + 60.0)
+                                        : (flight.lon_deg >= 0.56);
+            if (in_boundary_win && render_step) {
+                win_wall_ms.push_back(wall_ms);
+                max_win_trans_ms = std::max(max_win_trans_ms, tr_ms);
+                if (wall_ms > 33.333) ++gt33_win;
+            }
+
+            if (render_step && cross_csv.is_open()) {
+                cross_csv << frame_idx << ',' << sim_time << ',' << wall_ms << ',' << tr_ms << ',' << rend_ms << ','
+                          << flight.lat_deg << ',' << flight.lon_deg << ',' << flight.agl_m << ',' << reg_name << ','
+                          << drift_m << ',' << ss.resident_pages << ',' << ss.queued_jobs << ','
+                          << ts.max_active_lod << ',' << ss.resident_by_lod[7] << ','
+                          << ss.resident_by_lod[8] << ',' << ss.resident_by_lod[9] << ','
+                          << (static_cast<double>(ss.gpu_page_bytes) / (1024.0 * 1024.0)) << '\n';
+            }
+
+            const double pace_budget = pace_realtime
+                ? std::max(target_frame_s, 1.0 / thermal_fps_cap)
+                : ((render_step && thermal_fps_cap < 55.0) ? std::min(0.016, 1.0 / thermal_fps_cap) : 0.0);
+            const double spare = pace_budget - (PlatformWindow::now_sec() - loop_t0);
+            if (spare > 0.0005) std::this_thread::sleep_for(std::chrono::duration<double>(spare));
+        }
+
+        auto print_pct = [&](const char *label, std::vector<double> vals, double max_tr, int gt33) {
+            if (vals.empty()) return;
+            std::sort(vals.begin(), vals.end());
+            const auto pct = [&](double p) {
+                size_t idx = static_cast<size_t>(std::ceil(p * vals.size())) - 1;
+                return vals[std::min(idx, vals.size() - 1)];
+            };
+            const double sum = std::accumulate(vals.begin(), vals.end(), 0.0);
+            const double mean = sum / vals.size();
+            std::printf("[BOUNDARY-SUMMARY %s] frames=%zu mean=%.2fms (%.1f FPS) p50=%.2f p95=%.2f p99=%.2f max=%.2f max_trans=%.2f >33ms=%d\n",
+                        label, vals.size(), mean, 1000.0 / std::max(0.1, mean),
+                        pct(0.50), pct(0.95), pct(0.99), vals.back(), max_tr, gt33);
+        };
+        print_pct("FULL", all_wall_ms, max_all_trans_ms, gt33_all);
+        print_pct("WINDOW", win_wall_ms, max_win_trans_ms, gt33_win);
+        std::printf("[BOUNDARY-METRICS] crossed=%d sharp_cross_ms=%.1f sharp_commit_ms=%.1f\n",
+                    boundary.crossed_region ? 1 : 0, boundary.time_to_sharp_since_cross_ms,
+                    boundary.time_to_sharp_since_commit_ms);
+
+        cancel_async_crossing();
+        const bool persist_ok = verify_replay_persistence(
+            pack, replay_session, ac_hud, profile_path, trace, start_fuel, boundary.crossed_region);
+        audio.shutdown();
+        profiler.finish();
+        return persist_ok ? 0 : 1;
     }
 
     // Calibrated North-Up Nadir Top-Down Satellite Comparison Mode (--topdown <dir>)
@@ -1731,6 +2038,28 @@ int main(int argc, char **argv) {
         audio.update_state(as);
     };
 
+    const std::filesystem::path route_video_path = profile_file.empty()
+        ? std::filesystem::path{} : (profile_file.parent_path() / "last_flight.nsroute");
+    RouteVideoRecording recorded_route;
+    double last_record_sim_t = -1.0;
+    {
+        RouteVideoRecording probe;
+        if (!route_video_path.empty() && load_route_video(route_video_path, probe) && probe.frames.size() >= 2) {
+            frontend.set_replay_available(true);
+        }
+    }
+    auto exit_route_replay = [&]() {
+        if (!route_play.active) return;
+        route_play.active = false;
+        ac_hud.state() = route_play.saved_state;
+        ac_hud.state().menu_open = route_play.saved_menu_open;
+        sim_time = route_play.saved_sim_time;
+        if (nspain::haversine_m(ac_hud.state().lat_deg, ac_hud.state().lon_deg, pack.anchor_lat(), pack.anchor_lon()) > 35000.0) {
+            transition_world(ac_hud.state().lat_deg, ac_hud.state().lon_deg);
+        }
+        sky_clouds.reset_temporal_history();
+    };
+
     SimulationClock clock;
     while (!win.should_close()) {
         double now = PlatformWindow::now_sec();
@@ -1768,12 +2097,22 @@ int main(int argc, char **argv) {
                 const LocalAirSample park_wx = reg_atmo.sample_at(ps.lat, ps.lon, ps.alt,
                                                                   sky_clouds.atmo().sun_dir, sim_time, wx_est);
                 frontend.board(ac_hud, park_wx.oat_c);
+                recorded_route = {};
+                if (const auto *ap = frontend.parked_airport()) recorded_route.title = ap->id + " Flight";
+                else recorded_route.title = "OpenSky Flight";
+                last_record_sim_t = -1.0;
                 sky_clouds.reset_temporal_history();
                 break;
             }
             case GameFrontend::Request::Park:
                 if (frontend.can_park(ac_hud)) {
                     if (const auto *airport = pack.find_nearest_airport(ac_hud.state().lat_deg, ac_hud.state().lon_deg)) {
+                        if (recorded_route.frames.size() >= 10 && !route_video_path.empty()) {
+                            if (const auto *dep = frontend.parked_airport()) {
+                                recorded_route.title = dep->id + " -> " + airport->id;
+                            }
+                            if (save_route_video(route_video_path, recorded_route)) frontend.set_replay_available(true);
+                        }
                         enter_region(*airport);
                         frontend.park(ac_hud, *airport);
                         prepare_airfield(*airport);
@@ -1783,10 +2122,116 @@ int main(int argc, char **argv) {
             case GameFrontend::Request::Editor:
                 std::system("bash ./run_builder.sh >/dev/null 2>&1 &");
                 break;
+            case GameFrontend::Request::WatchReplay: {
+                RouteVideoRecording loaded;
+                if (recorded_route.frames.size() >= 10) loaded = recorded_route;
+                else if (!route_video_path.empty()) load_route_video(route_video_path, loaded);
+                if (loaded.frames.size() >= 2) {
+                    route_play.saved_state = ac_hud.state();
+                    route_play.saved_sim_time = sim_time;
+                    route_play.saved_walking = frontend.walking();
+                    route_play.saved_menu_open = ac_hud.state().menu_open;
+                    route_play.active_rec = std::move(loaded);
+                    route_play.first_t = route_play.active_rec.frames.front().sim_t;
+                    route_play.dur_t = route_play.active_rec.duration_sec();
+                    route_play.cur_t = 0.0;
+                    route_play.playing = true;
+                    route_play.speed = 1.0f;
+                    route_play.seek_t = -1.0;
+                    route_play.last_action = GameFrontend::ReplayAction::None;
+                    route_play.active = true;
+                    ac_hud.state().menu_open = false;
+                    ac_hud.state().paused = true;
+                    ac_hud.state().view_mode = 1; // Cinematic chase orbit view
+                    ac_hud.state().look_yaw_deg = 22.0f;
+                    ac_hud.state().look_pitch_deg = -10.0f;
+                    transition_world(route_play.active_rec.frames.front().lat_deg,
+                                     route_play.active_rec.frames.front().lon_deg);
+                    sky_clouds.reset_temporal_history();
+                }
+                break;
+            }
             case GameFrontend::Request::Quit: win.request_close(); break;
             case GameFrontend::Request::None: break;
         }
         if (win.should_close()) break;
+
+        if (route_play.active) {
+            if (win.key_pressed(KEY_ESC) || route_play.last_action == GameFrontend::ReplayAction::Exit) {
+                exit_route_replay();
+                continue;
+            }
+            if (win.key_pressed(KEY_SPACE) || route_play.last_action == GameFrontend::ReplayAction::TogglePlay) {
+                if (route_play.cur_t >= route_play.dur_t - 0.05 && !route_play.playing) route_play.cur_t = 0.0;
+                route_play.playing = !route_play.playing;
+            }
+            if (win.key_pressed(KEY_1) || route_play.last_action == GameFrontend::ReplayAction::Speed05) route_play.speed = 0.5f;
+            if (win.key_pressed(KEY_2) || route_play.last_action == GameFrontend::ReplayAction::Speed1) route_play.speed = 1.0f;
+            if (win.key_pressed(KEY_3) || route_play.last_action == GameFrontend::ReplayAction::Speed2) route_play.speed = 2.0f;
+            if (win.key_pressed(KEY_4) || route_play.last_action == GameFrontend::ReplayAction::Speed4) route_play.speed = 4.0f;
+            if (win.key_pressed(KEY_LEFT) || route_play.last_action == GameFrontend::ReplayAction::Back10) {
+                route_play.cur_t = std::max(0.0, route_play.cur_t - 10.0);
+            }
+            if (win.key_pressed(KEY_RIGHT) || route_play.last_action == GameFrontend::ReplayAction::Fwd10) {
+                route_play.cur_t = std::min(route_play.dur_t, route_play.cur_t + 10.0);
+            }
+            if (route_play.seek_t >= 0.0) {
+                route_play.cur_t = std::clamp(route_play.seek_t, 0.0, route_play.dur_t);
+                route_play.seek_t = -1.0;
+            }
+            if (win.key_pressed(KEY_C) || route_play.last_action == GameFrontend::ReplayAction::SwitchView) {
+                ac_hud.state().view_mode = (ac_hud.state().view_mode == 1) ? 0 : 1;
+            }
+            if (win.key_pressed(KEY_R)) {
+                ac_hud.state().look_yaw_deg = 0.0f;
+                ac_hud.state().look_pitch_deg = 0.0f;
+            }
+            if (win.mouse_right_down()) {
+                ac_hud.state().look_yaw_deg = std::clamp(ac_hud.state().look_yaw_deg - win.mouse_dx() * 0.22f, -175.0f, 175.0f);
+                ac_hud.state().look_pitch_deg = std::clamp(ac_hud.state().look_pitch_deg - win.mouse_dy() * 0.18f, -75.0f, 75.0f);
+            }
+            route_play.last_action = GameFrontend::ReplayAction::None;
+            if (route_play.playing) {
+                route_play.cur_t += dt * static_cast<double>(route_play.speed);
+                if (route_play.cur_t >= route_play.dur_t) {
+                    route_play.cur_t = route_play.dur_t;
+                    route_play.playing = false;
+                }
+            }
+            const double sample_t = route_play.first_t + route_play.cur_t;
+            const RouteVideoFrame rf = sample_route_video(route_play.active_rec, sample_t);
+            const RouteVideoFrame rf2 = sample_route_video(route_play.active_rec,
+                                                           std::min(route_play.first_t + route_play.dur_t, sample_t + 0.5));
+            const double vel_dt = std::max(0.05, rf2.sim_t - rf.sim_t);
+            double r_mlat = 111132.0, r_mlon = 82600.0;
+            nspain::meters_per_degree(rf.lat_deg, r_mlat, r_mlon);
+            FlightSimState &rs = ac_hud.state();
+            rs.lat_deg = rf.lat_deg;
+            rs.lon_deg = rf.lon_deg;
+            rs.alt_msl_m = rf.alt_msl_m;
+            rs.ground_m = pack.sample_elevation(rf.lat_deg, rf.lon_deg);
+            rs.heading_deg = rf.heading_deg;
+            rs.pitch_deg = rf.pitch_deg;
+            rs.roll_deg = rf.roll_deg;
+            rs.throttle = rf.throttle;
+            rs.aileron = rf.aileron;
+            rs.elevator = rf.elevator;
+            rs.rudder = rf.rudder;
+            rs.speed_mps = rf.ias_kt * 0.514444;
+            rs.vel_east_mps = (rf2.lon_deg - rf.lon_deg) * r_mlon / vel_dt;
+            rs.vel_north_mps = (rf2.lat_deg - rf.lat_deg) * r_mlat / vel_dt;
+            rs.visual_rpm_override = rf.rpm;
+            rs.visual_flaps_deg = rf.flaps_deg;
+            sim_time = sample_t;
+            update_environment();
+            step_flight_world_transition(rs.lat_deg, rs.lon_deg, rs.vel_east_mps, rs.vel_north_mps);
+            render_one_frame(false, 1, "", 50.0f, true);
+            push_audio_state(dt, true);
+            const double eff_period = std::max(frame_period, 1.0 / thermal_fps_cap);
+            const double spare = eff_period - (PlatformWindow::now_sec() - now);
+            if (spare > 0.0005) std::this_thread::sleep_for(std::chrono::duration<double>(spare));
+            continue;
+        }
 
         if (frontend.walking() && win.key_pressed(KEY_ESC) && !airfield_pages.empty()) airfield_pages.clear();
         if (frontend.walking() && airfield_pages.empty()) frontend.step_walk(win, dt);
@@ -1826,7 +2271,8 @@ int main(int argc, char **argv) {
                 pack.set_online_provider(provider);
                 streamer.invalidate_close_pages(true);
             }
-            const double spare = frame_period - (PlatformWindow::now_sec() - now);
+            const double menu_period = std::max(1.0 / 45.0, 1.0 / thermal_fps_cap);
+            const double spare = menu_period - (PlatformWindow::now_sec() - now);
             push_audio_state(dt, true);
             if (spare > 0.0005) std::this_thread::sleep_for(std::chrono::duration<double>(spare));
             continue;
@@ -1837,7 +2283,8 @@ int main(int argc, char **argv) {
             update_environment();
             render_one_frame(true);
             push_audio_state(dt, false);
-            const double spare = frame_period - (PlatformWindow::now_sec() - now);
+            const double walk_period = std::max(frame_period, 1.0 / thermal_fps_cap);
+            const double spare = walk_period - (PlatformWindow::now_sec() - now);
             if (spare > 0.0005) std::this_thread::sleep_for(std::chrono::duration<double>(spare));
             continue;
         }
@@ -1913,21 +2360,37 @@ int main(int argc, char **argv) {
         update_environment();
         step_flight(simulated);
         frontend.step_flight(ac_hud, simulated);
-        // Silently shift local terrain anchor on long cross-country legs (>60 km) with NO loading screen in flight.
-        const double anchor_drift_m = nspain::haversine_m(
-            ac_hud.state().lat_deg, ac_hud.state().lon_deg, pack.anchor_lat(), pack.anchor_lon());
-        const auto &flight = ac_hud.state();
-        const auto *flight_region = pack.find_region_at(flight.lat_deg, flight.lon_deg);
-        const auto *anchor_region = pack.find_region_at(pack.anchor_lat(), pack.anchor_lon());
-        if ((anchor_drift_m > 60000.0 || (flight_region && flight_region != anchor_region)) &&
-            transition_world(flight.lat_deg, flight.lon_deg)) last_t = PlatformWindow::now_sec();
+        if (!ac_hud.state().menu_open && !ac_hud.state().paused && simulated > 0.0 &&
+            (last_record_sim_t < 0.0 || sim_time - last_record_sim_t >= 0.20) &&
+            recorded_route.frames.size() < 72000) {
+            const auto &fs_rec = ac_hud.jsb_state();
+            const auto &st_rec = ac_hud.state();
+            recorded_route.frames.push_back({
+                sim_time, fs_rec.lat_deg, fs_rec.lon_deg, fs_rec.alt_msl_m,
+                fs_rec.heading_deg, fs_rec.pitch_deg, fs_rec.roll_deg,
+                fs_rec.ias_kt, fs_rec.rpm, ac_hud.systems().get_flaps_actual_deg(),
+                st_rec.throttle, st_rec.aileron, st_rec.elevator, st_rec.rudder
+            });
+            last_record_sim_t = sim_time;
+            if (recorded_route.frames.size() >= 10) frontend.set_replay_available(true);
+        }
+        // Asynchronously stage & swap local terrain anchor on long cross-country legs with NO main-thread freeze.
+        if (step_flight_world_transition(ac_hud.state().lat_deg, ac_hud.state().lon_deg,
+                                         ac_hud.state().vel_east_mps, ac_hud.state().vel_north_mps)) {
+            last_t = PlatformWindow::now_sec();
+        }
         render_one_frame(true);
         push_audio_state(dt, ac_hud.state().paused || ac_hud.state().menu_open);
-        // Pace strictly to display refresh rate (capped <= 60 FPS) so GPU/CPU never boost unnecessarily (<80 C).
-        const double spare = frame_period - (PlatformWindow::now_sec() - now);
+        // Closed-loop frame pacing caps GPU/CPU load so long flights remain cool (<80 C).
+        const double eff_period = std::max(frame_period, 1.0 / thermal_fps_cap);
+        const double spare = eff_period - (PlatformWindow::now_sec() - now);
         if (spare > 0.0005) std::this_thread::sleep_for(std::chrono::duration<double>(spare));
     }
 
+    cancel_async_crossing();
+    if (recorded_route.frames.size() >= 10 && !route_video_path.empty()) {
+        save_route_video(route_video_path, recorded_route);
+    }
     audio.shutdown();
     frontend.save_profile();
     profiler.finish();

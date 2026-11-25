@@ -55,7 +55,20 @@ public:
     WorldObjects() = default;
     ~WorldObjects();
 
+    struct BldgGpu {
+        float pos_yaw[4];
+        float scale_arch[4];
+        float roof_ao[4];
+    };
+    struct PreparedReanchor {
+        std::vector<BldgGpu> gpu_b;
+        std::vector<float> rv;
+        std::vector<float> lv;
+    };
+
     bool init(const PackReader *pack, const std::string &asset_root, const std::string &shader_root, const std::string &pack_dir = "packs");
+    PreparedReanchor prepare_reanchor_cpu(const PackReader::WorldFrame &frame) const;
+    void commit_reanchor(PreparedReanchor &&prep);
     void on_reanchor();
     void shutdown();
 
@@ -73,11 +86,6 @@ public:
     int active_cars() const { return active_cars_; }
 
 private:
-    struct BldgGpu {
-        float pos_yaw[4];
-        float scale_arch[4];
-        float roof_ao[4];
-    };
     struct DrawCmd {
         uint32_t count;
         uint32_t instanceCount;
@@ -163,9 +171,12 @@ private:
     void update_city_region_transforms();
     void ensure_city_regions_for_camera(double cam_east_m, double cam_north_m);
     bool is_dense_urban_en(double e, double n) const;
-    void build_instanced_buildings();
-    void build_runways();
-    void build_landmarks();
+    std::vector<BldgGpu> build_buildings_cpu(const PackReader::WorldFrame &frame) const;
+    std::vector<float> build_runways_cpu(const PackReader::WorldFrame &frame) const;
+    std::vector<float> build_landmarks_cpu(const PackReader::WorldFrame &frame) const;
+    void upload_buildings_gpu(const std::vector<BldgGpu> &gpu_b);
+    void upload_runways_gpu(const std::vector<float> &rv);
+    void upload_landmarks_gpu(const std::vector<float> &lv);
     void build_car_mesh();
     void rebuild_local_roads_and_traffic(double cam_e, double cam_n, int quality);
     void plan_vehicle_route(TrafficAgent &ag, bool random_progress);

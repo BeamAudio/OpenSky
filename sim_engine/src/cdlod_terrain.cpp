@@ -411,20 +411,38 @@ void CdlodTerrain::select_node(
     double pn = std::max(0.0, std::abs(cn - pred_n) - hs);
     double pred_d = std::hypot(pe, pn);
 
+    const double vx = pred_e - cam_e;
+    const double vn = pred_n - cam_n;
+    const double v_len = std::hypot(vx, vn);
+    const double tx_len = std::hypot(ce - cam_e, cn - cam_n);
+    const bool behind_cam = (v_len > 15.0 && tx_len > 1.0) &&
+                            (((ce - cam_e) * vx + (cn - cam_n) * vn) < -0.15 * v_len * tx_len);
+
     if (!in_frustum && !is_prefetch_only) {
-        // Still allow velocity-predictive prefetch slightly outside current frustum along flight track!
-        if (pred_d > lod_ranges_[k.lod] * 1.15) return;
+        // Outside visible frustum: prefetch only coarse L0..L5 horizon tiles along/ahead of flight track,
+        // reserving high-LOD L6..L9 cache budget strictly for in-sight terrain.
+        if (k.lod > 5 || (behind_cam && horiz_d > size) || pred_d > lod_ranges_[k.lod]) return;
         is_prefetch_only = true;
     }
 
+    const bool visible_here = in_frustum && !is_prefetch_only;
+    float importance = static_cast<float>(size / std::max(40.0, horiz_d + std::max(0.0, cam_agl) * 0.35));
+    if (horiz_d < 2500.0) importance += static_cast<float>(5000.0 / (1.0 + horiz_d * 0.004));
+
     float fade = 1.0f;
-    int my_slice = streamer.find_resident(k.pack(), now_sec, &fade);
+    int my_slice = streamer.find_resident(k.pack(), now_sec, &fade, visible_here, importance);
     if (my_slice < 0) {
-        // Velocity-predictive priority: coarse root pages first + strong close-range proximity boost for L7..L9!
-        float coarse_bonus = (k.lod <= 4) ? (6500.0f / (k.lod + 1.0f)) : 0.0f;
-        float near_bonus = (!is_prefetch_only && horiz_d < 1800.0) ? static_cast<float>(4200.0 / (1.0 + horiz_d * 0.006)) : 0.0f;
-        if (cam_agl < 250.0 && k.lod >= 8) near_bonus *= 2.5f;
-        float prio = coarse_bonus + near_bonus + static_cast<float>(size / std::max(60.0, pred_d + horiz_d * 0.35));
+        float prio = 0.0f;
+        if (k.lod <= 2) {
+            prio = 20000.0f / static_cast<float>(k.lod + 1);
+        } else if (visible_here) {
+            prio = 1800.0f +
+                   static_cast<float>(8000.0 / (1.0 + horiz_d * 0.002 + std::max(0.0, pred_d - horiz_d) * 0.0005)) +
+                   static_cast<float>(10 - k.lod) * 35.0f;
+            if (cam_agl < 250.0 && k.lod >= 8) prio += 1200.0f;
+        } else {
+            prio = 140.0f + static_cast<float>(size / std::max(100.0, pred_d * 1.2 + horiz_d * 0.5));
+        }
         streamer.request_page(k.pack(), prio);
         stats_.prefetch_requests++;
         return; // Parent will gracefully render this quadrant with ZERO cracks or blank holes!
@@ -432,8 +450,9 @@ void CdlodTerrain::select_node(
 
     // Distance metric for splitting (uses actual camera AGL, not MSL, so high Pyrenees valleys get sharp L8/L9!)
     double dist_cam = std::hypot(horiz_d, std::max(0.0, cam_agl) * 0.45);
-    bool want_split_render = (!is_prefetch_only) && (k.lod < max_desired_lod) && (dist_cam < lod_ranges_[k.lod + 1]);
-    bool want_split_prefetch = (k.lod < max_desired_lod) && (pred_d < lod_ranges_[k.lod + 1] * 1.35);
+    const int max_prefetch_lod = visible_here ? max_desired_lod : std::min(max_desired_lod, 5);
+    bool want_split_render = visible_here && (k.lod < max_desired_lod) && (dist_cam < lod_ranges_[k.lod + 1]);
+    bool want_split_prefetch = (k.lod < max_prefetch_lod) && (pred_d < lod_ranges_[k.lod + 1] * 1.10);
 
     if (want_split_render || want_split_prefetch) {
         // Check if all 4 children are resident before splitting visually (atomic quad split = ZERO T-junction gaps!)
@@ -443,12 +462,12 @@ void CdlodTerrain::select_node(
             uint16_t cx = static_cast<uint16_t>(k.qx * 2 + (ci & 1));
             uint16_t cy = static_cast<uint16_t>(k.qy * 2 + (ci >> 1));
             QuadKey ck{static_cast<uint8_t>(k.lod + 1), cx, cy};
-            child_slices[ci] = streamer.find_resident(ck.pack(), now_sec, nullptr);
+            child_slices[ci] = streamer.find_resident(ck.pack(), now_sec, nullptr, want_split_render, importance * 1.05f);
             if (child_slices[ci] >= 0) ++ready_count;
         }
         bool all_children_ready = (ready_count == 4);
         if (!all_children_ready) {
-            float sibling_boost = (want_split_render && ready_count > 0) ? 2600.0f : 0.0f;
+            float sibling_boost = (want_split_render && ready_count > 0) ? 1600.0f : 0.0f;
             for (int ci = 0; ci < 4; ci++) {
                 if (child_slices[ci] >= 0) continue;
                 uint16_t cx = static_cast<uint16_t>(k.qx * 2 + (ci & 1));
@@ -458,10 +477,17 @@ void CdlodTerrain::select_node(
                 AsyncTerrainStreamer::quad_bounds_en(ck, cce, ccn, chs);
                 double cd_pred = std::hypot(std::max(0.0, std::abs(cce - pred_e) - chs), std::max(0.0, std::abs(ccn - pred_n) - chs));
                 double cd_cam = std::hypot(std::max(0.0, std::abs(cce - cam_e) - chs), std::max(0.0, std::abs(ccn - cam_n) - chs));
-                float coarse_b = (ck.lod <= 4) ? (6500.0f / (ck.lod + 1.0f)) : 0.0f;
-                float near_b = (want_split_render && cd_cam < 1800.0) ? static_cast<float>(4200.0 / (1.0 + cd_cam * 0.006)) : 0.0f;
-                if (cam_agl < 250.0 && ck.lod >= 8) near_b *= 2.5f;
-                float prio = coarse_b + near_b + sibling_boost + static_cast<float>((chs * 2.0) / std::max(50.0, cd_pred * 0.65 + cd_cam * 0.35));
+                float prio = 0.0f;
+                if (ck.lod <= 2) {
+                    prio = 20000.0f / static_cast<float>(ck.lod + 1);
+                } else if (want_split_render) {
+                    prio = 1800.0f + sibling_boost +
+                           static_cast<float>(8000.0 / (1.0 + cd_cam * 0.002 + std::max(0.0, cd_pred - cd_cam) * 0.0005)) +
+                           static_cast<float>(10 - ck.lod) * 35.0f;
+                    if (cam_agl < 250.0 && ck.lod >= 8) prio += 1200.0f;
+                } else {
+                    prio = 140.0f + static_cast<float>((chs * 2.0) / std::max(80.0, cd_pred * 1.2 + cd_cam * 0.5));
+                }
                 streamer.request_page(ck.pack(), prio);
                 stats_.prefetch_requests++;
             }

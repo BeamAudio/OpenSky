@@ -115,6 +115,25 @@ bool extract_json_num(const std::string &obj, const char *key, double &out) {
     return true;
 }
 
+inline double online_tile_dist_m(uint64_t okey, double cam_lat, double cam_lon) {
+    const int z = static_cast<int>((okey >> 48) & 0xFFu);
+    const int x = static_cast<int>((okey >> 24) & 0xFFFFFFu);
+    const int y = static_cast<int>(okey & 0xFFFFFFu);
+    const double nt = static_cast<double>(1u << z);
+    const double tlon = ((x + 0.5) / nt) * 360.0 - 180.0;
+    const double my = PI_D * (1.0 - 2.0 * ((y + 0.5) / nt));
+    const double tlat = std::atan(std::sinh(my)) * (180.0 / PI_D);
+    return nspain::haversine_m(cam_lat, cam_lon, tlat, tlon);
+}
+
+inline double online_tile_priority_score(uint64_t okey, double dist_m) {
+    const int z = static_cast<int>((okey >> 48) & 0xFFu);
+    // Prioritize Z13..Z15 carrier tiles within 24 km ahead of Z17..Z20 hyper-detail so fast/accelerated
+    // flight always displays real PNOA photography rather than lapsing into coarse baked fallback.
+    const double mult = (z <= 15 && dist_m < 24000.0) ? 0.20 : (1.0 + std::max(0, z - 16) * 0.12);
+    return std::max(120.0, dist_m) * mult;
+}
+
 } // namespace
 
 PackReader::~PackReader() {
@@ -144,6 +163,7 @@ void PackReader::clear_regions() {
     surf_zooms_desc_.clear();
     vegetation_zooms_desc_.clear();
     world_frame_ = std::make_shared<const WorldFrame>();
+    world_frame_atomic_.store(world_frame_, std::memory_order_release);
 }
 
 void PackReader::set_online_provider(OnlineOrthoProvider p) {
@@ -154,7 +174,7 @@ void PackReader::set_online_provider(OnlineOrthoProvider p) {
         std::lock_guard<std::mutex> lk(online_mtx_);
         if (online_workers_.empty()) {
             online_stop_.store(false, std::memory_order_release);
-            for (int i = 0; i < 2; i++) {
+            for (int i = 0; i < 6; i++) {
                 online_workers_.emplace_back(&PackReader::online_dl_worker, this);
             }
         }
@@ -211,7 +231,34 @@ void PackReader::online_dl_worker() const {
             });
             if (online_stop_.load(std::memory_order_acquire)) break;
             if (online_dl_queue_.empty()) continue;
-            okey = online_dl_queue_.back();
+            const double cam_lat = bits_double(online_cam_lat_bits_.load(std::memory_order_relaxed));
+            const double cam_lon = bits_double(online_cam_lon_bits_.load(std::memory_order_relaxed));
+            const bool have_cam = (std::abs(cam_lat) > 0.1 || std::abs(cam_lon) > 0.1);
+            size_t best_idx = online_dl_queue_.size() - 1;
+            if (have_cam) {
+                double best_score = 1e18;
+                for (size_t qi = online_dl_queue_.size(); qi > 0;) {
+                    --qi;
+                    const uint64_t kq = online_dl_queue_[qi];
+                    const double d = online_tile_dist_m(kq, cam_lat, cam_lon);
+                    // Evict stale downloads >55 km away so old regions never stall current tiles.
+                    if (d > 55000.0) {
+                        online_dl_seen_.erase(kq);
+                        online_dl_queue_[qi] = online_dl_queue_.back();
+                        online_dl_queue_.pop_back();
+                        continue;
+                    }
+                    const double sc = online_tile_priority_score(kq, d);
+                    if (sc < best_score) {
+                        best_score = sc;
+                        best_idx = qi;
+                    }
+                }
+            }
+            if (online_dl_queue_.empty()) continue;
+            best_idx = std::min(best_idx, online_dl_queue_.size() - 1);
+            okey = online_dl_queue_[best_idx];
+            online_dl_queue_[best_idx] = online_dl_queue_.back();
             online_dl_queue_.pop_back();
         }
         int prov_id = static_cast<int>((okey >> 56) & 0xFFu) - 10;
@@ -223,20 +270,30 @@ void PackReader::online_dl_worker() const {
         char cpath[256];
         std::snprintf(cpath, sizeof(cpath), "cache/online_tiles/pnoa_z%d_%d_%d.jpg", z, x, y);
         struct stat st{};
-        if (::stat(cpath, &st) != 0 || st.st_size <= 512) {
-            download_online_tile_to_disk(prov, z, x, y, cpath);
+        bool ok = (::stat(cpath, &st) == 0 && st.st_size > 512);
+        if (!ok) {
+            ok = download_online_tile_to_disk(prov, z, x, y, cpath);
         }
-        if (::stat(cpath, &st) == 0 && st.st_size > 512) {
+        {
             std::lock_guard<std::mutex> lk(online_mtx_);
             online_dl_seen_.erase(okey);
-            online_arrived_.store(true, std::memory_order_release);
+            if (ok) {
+                online_failed_until_.erase(okey);
+                online_arrived_.store(true, std::memory_order_release);
+            } else {
+                const double now_s = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+                if (online_failed_until_.size() > 8192) online_failed_until_.clear();
+                online_failed_until_[okey] = now_s + 30.0;
+            }
         }
     }
 }
 
 std::shared_ptr<DecodedRgbTile> PackReader::get_online_rgb_tile(
-    OnlineOrthoProvider prov, int z, int x, int y
+    OnlineOrthoProvider prov, int z, int x, int y,
+    bool queue_download, bool *out_queued_or_pending
 ) const {
+    if (out_queued_or_pending) *out_queued_or_pending = false;
     if (prov != OnlineOrthoProvider::PNOA) return nullptr;
     uint8_t layer_id = static_cast<uint8_t>(10 + static_cast<int>(prov));
     uint64_t okey = nspain::make_tile_key(layer_id, static_cast<uint8_t>(z), static_cast<uint32_t>(x), static_cast<uint32_t>(y));
@@ -249,16 +306,38 @@ std::shared_ptr<DecodedRgbTile> PackReader::get_online_rgb_tile(
     std::snprintf(cpath, sizeof(cpath), "cache/online_tiles/pnoa_z%d_%d_%d.jpg", z, x, y);
     struct stat st{};
     if (::stat(cpath, &st) != 0 || st.st_size <= 512) {
+        if (!queue_download) return nullptr;
+        bool should_notify = false;
         {
             std::lock_guard<std::mutex> lk(online_mtx_);
+            const double now_s = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            auto fit = online_failed_until_.find(okey);
+            if (fit != online_failed_until_.end() && now_s < fit->second) return nullptr;
             if (online_dl_seen_.size() > 4096) online_dl_seen_.clear();
             if (online_dl_seen_.find(okey) == online_dl_seen_.end()) {
+                if (online_dl_queue_.size() >= 256) {
+                    const double cam_lat = bits_double(online_cam_lat_bits_.load(std::memory_order_relaxed));
+                    const double cam_lon = bits_double(online_cam_lon_bits_.load(std::memory_order_relaxed));
+                    size_t worst_idx = 0;
+                    double worst_dist = -1.0;
+                    for (size_t qi = 0; qi < online_dl_queue_.size(); ++qi) {
+                        double d = online_tile_dist_m(online_dl_queue_[qi], cam_lat, cam_lon);
+                        if (d > worst_dist) {
+                            worst_dist = d;
+                            worst_idx = qi;
+                        }
+                    }
+                    online_dl_seen_.erase(online_dl_queue_[worst_idx]);
+                    online_dl_queue_[worst_idx] = online_dl_queue_.back();
+                    online_dl_queue_.pop_back();
+                }
                 online_dl_seen_.insert(okey);
-                if (online_dl_queue_.size() > 96) online_dl_queue_.erase(online_dl_queue_.begin());
                 online_dl_queue_.push_back(okey);
+                should_notify = true;
             }
+            if (out_queued_or_pending) *out_queued_or_pending = true;
         }
-        online_cv_.notify_one();
+        if (should_notify) online_cv_.notify_one();
         return nullptr;
     }
 
@@ -626,24 +705,43 @@ std::string PackReader::active_weather_path(double lat_deg, double lon_deg) cons
     return {};
 }
 
-bool PackReader::reanchor_to(double lat_deg, double lon_deg) {
+std::shared_ptr<const PackReader::WorldFrame> PackReader::prepare_world_frame(
+    double lat_deg, double lon_deg, bool snap_to_region
+) const {
     // Only snap to a region's default center when within 45 km of it; larger regions
     // (e.g. 250 km Catalonia Coast) exceed the +-81.92 km CDLOD quadtree if snapped far from target.
-    if (const LoadedRegion *r = find_region_at(lat_deg, lon_deg)) {
-        if (nspain::haversine_m(lat_deg, lon_deg, r->anchor_lat, r->anchor_lon) <= 45000.0) {
-            lat_deg = r->anchor_lat;
-            lon_deg = r->anchor_lon;
+    if (snap_to_region) {
+        if (const LoadedRegion *r = find_region_at(lat_deg, lon_deg)) {
+            if (nspain::haversine_m(lat_deg, lon_deg, r->anchor_lat, r->anchor_lon) <= 45000.0) {
+                lat_deg = r->anchor_lat;
+                lon_deg = r->anchor_lon;
+            }
         }
     }
-    if (!world_frame_->dem.empty() &&
-        nspain::haversine_m(lat_deg, lon_deg, anchor_lat(), anchor_lon()) < 500.0) return false;
+    const auto cur = world_frame();
+    if (cur && !cur->dem.empty() &&
+        nspain::haversine_m(lat_deg, lon_deg, cur->anchor_lat, cur->anchor_lon) < 500.0) {
+        return nullptr;
+    }
     auto next = std::make_shared<WorldFrame>();
     next->anchor_lat = lat_deg;
     next->anchor_lon = lon_deg;
     nspain::meters_per_degree(lat_deg, next->metres_lat, next->metres_lon);
     bake_corridor_dem(*next);
-    world_frame_ = std::move(next);
-    set_online_camera(lat_deg, lon_deg);
+    return next;
+}
+
+void PackReader::commit_world_frame(std::shared_ptr<const WorldFrame> frame) {
+    if (!frame) return;
+    world_frame_ = std::move(frame);
+    world_frame_atomic_.store(world_frame_, std::memory_order_release);
+    set_online_camera(world_frame_->anchor_lat, world_frame_->anchor_lon);
+}
+
+bool PackReader::reanchor_to(double lat_deg, double lon_deg) {
+    auto next = prepare_world_frame(lat_deg, lon_deg, true);
+    if (!next) return false;
+    commit_world_frame(std::move(next));
     return true;
 }
 
@@ -1252,18 +1350,23 @@ std::vector<ParkingStand> PackReader::compute_parking_stands(const AirportInfo &
 }
 
 bool PackReader::is_excluded_for_vegetation(double lat_deg, double lon_deg) const {
+    const auto frame = world_frame();
+    return frame && is_excluded_for_vegetation(*frame, lat_deg, lon_deg);
+}
+
+bool PackReader::is_excluded_for_vegetation(const WorldFrame &frame, double lat_deg, double lon_deg) const {
     // Oriented runway corridor clearance (keeps runway & approach clear while allowing trees right beside strip borders!)
     for (const auto &a : airports_) {
         auto excluded_by = [&](double lat_a, double lon_a, double lat_b, double lon_b, double width) {
-            double ax = (lon_a - lon_deg) * world_frame_->metres_lon;
-            double ay = (lat_a - lat_deg) * world_frame_->metres_lat;
-            double bx = (lon_b - lon_deg) * world_frame_->metres_lon;
-            double by = (lat_b - lat_deg) * world_frame_->metres_lat;
+            double ax = (lon_a - lon_deg) * frame.metres_lon;
+            double ay = (lat_a - lat_deg) * frame.metres_lat;
+            double bx = (lon_b - lon_deg) * frame.metres_lon;
+            double by = (lat_b - lat_deg) * frame.metres_lat;
             double dx = bx - ax, dy = by - ay;
             double len2 = dx * dx + dy * dy;
             if (len2 < 100.0) {
-                double dn = (lat_deg - a.lat) * world_frame_->metres_lat;
-                double de = (lon_deg - a.lon) * world_frame_->metres_lon;
+                double dn = (lat_deg - a.lat) * frame.metres_lat;
+                double de = (lon_deg - a.lon) * frame.metres_lon;
                 return dn * dn + de * de < 95.0 * 95.0;
             }
             double len = std::sqrt(len2);
@@ -1280,11 +1383,45 @@ bool PackReader::is_excluded_for_vegetation(double lat_deg, double lon_deg) cons
             for (const AirportRunway &rw : a.runways)
                 if (excluded_by(rw.lat_a, rw.lon_a, rw.lat_b, rw.lon_b, rw.width_m)) return true;
         }
+        if (std::abs(lat_deg - a.lat) < 0.025 && std::abs(lon_deg - a.lon) < 0.035) {
+            for (const AirportGroundFeature &gf : a.ground_features) {
+                if (gf.points_lat_lon.size() < 2) continue;
+                const double pad = (gf.kind == AirportGroundFeature::Kind::AccessRoad)
+                    ? 22.0
+                    : std::max(26.0, gf.width_m * 0.75 + 14.0);
+                bool inside = false;
+                const size_t n = gf.points_lat_lon.size();
+                for (size_t i = 0; i < n; ++i) {
+                    const size_t j = (i + 1) % n;
+                    if (gf.kind != AirportGroundFeature::Kind::Apron && i + 1 == n) break;
+                    const double ax = (gf.points_lat_lon[i].second - lon_deg) * frame.metres_lon;
+                    const double ay = (gf.points_lat_lon[i].first - lat_deg) * frame.metres_lat;
+                    const double bx = (gf.points_lat_lon[j].second - lon_deg) * frame.metres_lon;
+                    const double by = (gf.points_lat_lon[j].first - lat_deg) * frame.metres_lat;
+                    const double dx = bx - ax, dy = by - ay, l2 = dx * dx + dy * dy;
+                    if (l2 > 1e-4) {
+                        const double tc = std::clamp((-ax * dx - ay * dy) / l2, 0.0, 1.0);
+                        if (std::hypot(ax + tc * dx, ay + tc * dy) < pad) return true;
+                    }
+                    if (gf.kind == AirportGroundFeature::Kind::Apron &&
+                        ((ay > 0.0) != (by > 0.0)) &&
+                        (0.0 < (bx - ax) * (-ay) / (by - ay) + ax)) {
+                        inside = !inside;
+                    }
+                }
+                if (inside) return true;
+            }
+        }
     }
     return false;
 }
 
 bool PackReader::is_near_building(double lat_deg, double lon_deg, double pad_m) const {
+    const auto frame = world_frame();
+    return frame && is_near_building(*frame, lat_deg, lon_deg, pad_m);
+}
+
+bool PackReader::is_near_building(const WorldFrame &frame, double lat_deg, double lon_deg, double pad_m) const {
     if (bldg_grid_.empty()) return false;
     int32_t cx0 = static_cast<int32_t>(std::floor(lon_deg / BLDG_CELL_DEG));
     int32_t cy0 = static_cast<int32_t>(std::floor(lat_deg / BLDG_CELL_DEG));
@@ -1294,8 +1431,8 @@ bool PackReader::is_near_building(double lat_deg, double lon_deg, double pad_m) 
             if (it == bldg_grid_.end()) continue;
             for (uint32_t idx : it->second) {
                 const BuildingRec &b = buildings_[idx];
-                double de = (lon_deg - b.lon) * world_frame_->metres_lon;
-                double dn = (lat_deg - b.lat) * world_frame_->metres_lat;
+                double de = (lon_deg - b.lon) * frame.metres_lon;
+                double dn = (lat_deg - b.lat) * frame.metres_lat;
                 double r = 0.52 * std::max(b.width_m, b.depth_m) + pad_m;
                 if (de * de + dn * dn < r * r) return true;
             }
@@ -1305,6 +1442,11 @@ bool PackReader::is_near_building(double lat_deg, double lon_deg, double pad_m) 
 }
 
 bool PackReader::is_near_road(double lat_deg, double lon_deg, double pad_m) const {
+    const auto frame = world_frame();
+    return frame && is_near_road(*frame, lat_deg, lon_deg, pad_m);
+}
+
+bool PackReader::is_near_road(const WorldFrame &frame, double lat_deg, double lon_deg, double pad_m) const {
     if (road_grid_.empty()) return false;
     int32_t cx0 = static_cast<int32_t>(std::floor(lon_deg / BLDG_CELL_DEG));
     int32_t cy0 = static_cast<int32_t>(std::floor(lat_deg / BLDG_CELL_DEG));
@@ -1321,10 +1463,10 @@ bool PackReader::is_near_road(double lat_deg, double lon_deg, double pad_m) cons
                 for (uint16_t pi = 0; pi + 1 < rr.count; pi++) {
                     const RoadPt &p0 = road_pts_[rr.offset + pi];
                     const RoadPt &p1 = road_pts_[rr.offset + pi + 1];
-                    double ax = (p0.lon_e6 * 1e-6 - lon_deg) * world_frame_->metres_lon;
-                    double ay = (p0.lat_e6 * 1e-6 - lat_deg) * world_frame_->metres_lat;
-                    double bx = (p1.lon_e6 * 1e-6 - lon_deg) * world_frame_->metres_lon;
-                    double by = (p1.lat_e6 * 1e-6 - lat_deg) * world_frame_->metres_lat;
+                    double ax = (p0.lon_e6 * 1e-6 - lon_deg) * frame.metres_lon;
+                    double ay = (p0.lat_e6 * 1e-6 - lat_deg) * frame.metres_lat;
+                    double bx = (p1.lon_e6 * 1e-6 - lon_deg) * frame.metres_lon;
+                    double by = (p1.lat_e6 * 1e-6 - lat_deg) * frame.metres_lat;
                     double sx = bx - ax, sy = by - ay;
                     double l2 = sx * sx + sy * sy;
                     double t = (l2 > 1e-4) ? std::clamp((-ax * sx - ay * sy) / l2, 0.0, 1.0) : 0.0;
@@ -1647,11 +1789,17 @@ Vec3 PackReader::sample_imagery_rgb(double lat_deg, double lon_deg) const {
 }
 
 void PackReader::bake_corridor_dem(WorldFrame &frame) const {
-    double b_lon0 = header_.lon_min, b_lat0 = header_.lat_min;
-    double b_lon1 = header_.lon_max, b_lat1 = header_.lat_max;
+    const double cd_dlat = 82000.0 / frame.metres_lat;
+    const double cd_dlon = 82000.0 / frame.metres_lon;
+    double b_lon0 = std::clamp(frame.anchor_lon - cd_dlon, header_.lon_min, header_.lon_max);
+    double b_lon1 = std::clamp(frame.anchor_lon + cd_dlon, header_.lon_min, header_.lon_max);
+    double b_lat0 = std::clamp(frame.anchor_lat - cd_dlat, header_.lat_min, header_.lat_max);
+    double b_lat1 = std::clamp(frame.anchor_lat + cd_dlat, header_.lat_min, header_.lat_max);
     if (const LoadedRegion *ar = find_region_at(frame.anchor_lat, frame.anchor_lon)) {
-        b_lon0 = ar->hdr.lon_min; b_lat0 = ar->hdr.lat_min;
-        b_lon1 = ar->hdr.lon_max; b_lat1 = ar->hdr.lat_max;
+        b_lon0 = std::min(b_lon0, ar->hdr.lon_min);
+        b_lat0 = std::min(b_lat0, ar->hdr.lat_min);
+        b_lon1 = std::max(b_lon1, ar->hdr.lon_max);
+        b_lat1 = std::max(b_lat1, ar->hdr.lat_max);
     }
     frame.min_e = (b_lon0 - frame.anchor_lon) * frame.metres_lon;
     frame.min_n = (b_lat0 - frame.anchor_lat) * frame.metres_lat;
@@ -1919,8 +2067,10 @@ void PackReader::fill_page_data(
     std::vector<float> &out_height,
     std::vector<uint8_t> &out_ortho_rgba,
     std::vector<uint8_t> &out_norm_ao_rgba,
-    std::vector<uint8_t> &out_surf_rgba
+    std::vector<uint8_t> &out_surf_rgba,
+    bool *out_incomplete_online
 ) const {
+    if (out_incomplete_online) *out_incomplete_online = false;
     const double center_lat = frame.anchor_lat + center_north_m / frame.metres_lat;
     const double center_lon = frame.anchor_lon + center_east_m / frame.metres_lon;
     const double span_m = half_span_m * 2.0;
@@ -1995,10 +2145,11 @@ void PackReader::fill_page_data(
             tier_z = online_zoom_for_distance_m(dist_m);
             // Never request tiles far finer than the page's own texel size (prevents 144-tile Z20 bursts overflowing the download queue).
             double cos_lat = std::max(0.2, std::cos(center_lat * DEG2RAD_D));
-            while (tier_z > 14 && (156543.03 * cos_lat) / static_cast<double>(1u << tier_z) < texel_m * 0.45) {
+            while (tier_z > 13 && (156543.03 * cos_lat) / static_cast<double>(1u << tier_z) < texel_m * 0.45) {
                 --tier_z;
             }
-            for (int z = tier_z; z > 0 && z >= tier_z - 1 && n_az < 16; z--) active_z[n_az++] = z;
+            // Include already-cached online zooms (tier_z down to 13) so a higher tier step never drops back to baked Z12.
+            for (int z = tier_z; z >= 13 && n_az < 16; z--) active_z[n_az++] = z;
         }
         for (int z : zooms) {
             if (z > cap_z || n_az >= 16) continue;
@@ -2057,8 +2208,15 @@ void PackReader::fill_page_data(
                     // not cached yet, queue its download and keep the installed
                     // pack tile as a seamless offline fallback for this page.
                     std::shared_ptr<DecodedRgbTile> tile;
-                    if (oprov == OnlineOrthoProvider::PNOA && tier_z > 0 && (z == tier_z || z == tier_z - 1))
-                        tile = get_online_rgb_tile(oprov, z, tx, ty);
+                    if (oprov == OnlineOrthoProvider::PNOA && tier_z > 0 && z <= tier_z && z >= 13) {
+                        const int carrier_z = (tier_z >= 16) ? 15 : ((tier_z == 15) ? 14 : tier_z);
+                        const bool queue_dl = (z >= std::max(14, tier_z - 1)) || (z == carrier_z);
+                        bool pending_dl = false;
+                        tile = get_online_rgb_tile(oprov, z, tx, ty, queue_dl, &pending_dl);
+                        if (!tile && (z == tier_z || z == carrier_z) && pending_dl && out_incomplete_online) {
+                            *out_incomplete_online = true;
+                        }
+                    }
                     if (!tile) tile = get_rgb_tile(layer, z, tx, ty);
                     if (tile) any = true;
                     g.tiles[static_cast<size_t>(ty - ty0) * nx + (tx - tx0)] = std::move(tile);
@@ -2280,6 +2438,203 @@ void PackReader::fill_page_data(
             out_surf_rgba[di + 3] = bldg_alpha[static_cast<size_t>(j) * aux_res + i];
         }
     }
+}
+
+PackReader::ObjectCollisionHit PackReader::query_object_collision(
+    double lat_deg, double lon_deg, double alt_msl_m, double probe_r_m
+) const {
+    ObjectCollisionHit best{};
+    const auto wf = world_frame();
+    if (!wf) return best;
+    const double r = std::max(0.25, probe_r_m);
+    auto consider_obb = [&](double obj_lat, double obj_lon, float ground_m, float height_m,
+                            float width_m, float depth_m, float yaw_rad, uint8_t kind) {
+        const double de = (lon_deg - obj_lon) * wf->metres_lon;
+        const double dn = (lat_deg - obj_lat) * wf->metres_lat;
+        const double dx = de;
+        const double dz = -dn;
+        const double c = std::cos(yaw_rad), s = std::sin(yaw_rad);
+        const double lx = dx * c - dz * s;
+        const double lz = dx * s + dz * c;
+        const double hx = width_m * 0.5 + r;
+        const double hz = depth_m * 0.5 + r;
+        const double top_m = static_cast<double>(ground_m) + height_m + r;
+        const double bot_m = static_cast<double>(ground_m) - 1.5;
+        if (std::abs(lx) >= hx || std::abs(lz) >= hz || alt_msl_m >= top_m || alt_msl_m <= bot_m) return;
+
+        const double pen_x = hx - std::abs(lx);
+        const double pen_z = hz - std::abs(lz);
+        const double pen_y = top_m - alt_msl_m;
+        float ne = 0.0f, nup = 0.0f, nn = 0.0f;
+        double pen = 0.0;
+        if (pen_y < std::min(pen_x, pen_z) && alt_msl_m >= static_cast<double>(ground_m) + height_m * 0.65) {
+            pen = pen_y;
+            nup = 1.0f;
+        } else if (pen_x <= pen_z) {
+            pen = pen_x;
+            const double sx = (lx >= 0.0) ? 1.0 : -1.0;
+            ne = static_cast<float>(sx * c);
+            nn = static_cast<float>(sx * s);
+        } else {
+            pen = pen_z;
+            const double sz = (lz >= 0.0) ? 1.0 : -1.0;
+            ne = static_cast<float>(sz * s);
+            nn = static_cast<float>(-sz * c);
+        }
+        if (!best.hit || pen > best.penetration_m) {
+            best.hit = true;
+            best.kind = kind;
+            best.normal_e = ne;
+            best.normal_up = nup;
+            best.normal_n = nn;
+            best.penetration_m = static_cast<float>(pen);
+        }
+    };
+
+    // 1. OSM Buildings, Hangars, Control Towers & Terminals in spatial hash
+    if (!bldg_grid_.empty()) {
+        const int32_t cx0 = static_cast<int32_t>(std::floor(lon_deg / BLDG_CELL_DEG));
+        const int32_t cy0 = static_cast<int32_t>(std::floor(lat_deg / BLDG_CELL_DEG));
+        for (int32_t dy = -1; dy <= 1; ++dy) {
+            for (int32_t dx = -1; dx <= 1; ++dx) {
+                auto it = bldg_grid_.find(pack_cell(cx0 + dx, cy0 + dy));
+                if (it == bldg_grid_.end()) continue;
+                for (uint32_t idx : it->second) {
+                    const BuildingRec &b = buildings_[idx];
+                    consider_obb(b.lat, b.lon, b.ground_m, b.height_m, b.width_m, b.depth_m, b.yaw_rad, 0);
+                }
+            }
+        }
+    }
+
+    // 2. Iconic Landmarks (Basílica del Pilar, Puente de Piedra, Torre del Agua, Huesca, Loarre, Mediano)
+    struct StaticLandmark { double lat, lon; float yaw_deg, w, d, y0, h; };
+    static constexpr StaticLandmark kLandmarks[] = {
+        {41.6569, -0.8787, -27.0f, 136.0f, 70.0f, -4.0f, 36.0f},  // Basilica del Pilar nave+domes
+        {41.6569, -0.8787, -27.0f, 128.0f, 66.0f, -4.0f, 92.0f},  // Pilar 4 corner towers silhouette? Wait check center!
+        {41.6578, -0.8755,  62.0f, 224.0f, 14.5f, -6.0f, 17.5f},  // Puente de Piedra
+        {41.6693, -0.9073,  12.0f,  24.0f, 24.0f, -3.0f, 76.0f},  // Torre del Agua
+        {42.1404, -0.4086, -12.0f,  56.0f, 40.0f, -4.0f, 51.0f},  // Catedral de Huesca + tower
+        {42.3257, -0.6119,  15.0f,  62.0f, 44.0f, -6.0f, 28.0f},  // Castillo de Loarre
+        {42.3175,  0.2037,   8.0f,   8.4f,  8.4f, -12.0f, 28.5f}, // Torre de Mediano
+    };
+    for (int li = 0; li < static_cast<int>(sizeof(kLandmarks) / sizeof(kLandmarks[0])); ++li) {
+        if (li == 1) continue; // Pilar corner towers would wrap courtyard in 128x66x92 box; test 4 corners explicitly below.
+        const auto &lm = kLandmarks[li];
+        if (std::abs(lat_deg - lm.lat) > 0.004 || std::abs(lon_deg - lm.lon) > 0.005) continue;
+        const float g = static_cast<float>(sample_elevation(lm.lat, lm.lon));
+        consider_obb(lm.lat, lm.lon, g + lm.y0, lm.h - lm.y0, lm.w, lm.d, lm.yaw_deg * DEG2RAD_F, 1);
+    }
+    if (std::abs(lat_deg - 41.6569) < 0.003 && std::abs(lon_deg - (-0.8787)) < 0.004) {
+        const float pg = static_cast<float>(sample_elevation(41.6569, -0.8787));
+        const float yr = -27.0f * DEG2RAD_F, cy = std::cos(yr), sy = std::sin(yr);
+        for (float lx : {-57.0f, 57.0f}) {
+            for (float lz : {-27.0f, 27.0f}) {
+                const double tlon = -0.8787 + (lx * cy + lz * sy) / wf->metres_lon;
+                const double tlat = 41.6569 + (lx * sy - lz * cy) / wf->metres_lat;
+                consider_obb(tlat, tlon, pg, 93.0f, 12.8f, 12.8f, yr, 1);
+            }
+        }
+    }
+
+    // 3. Airport perimeter stone walls, fences & hedges
+    for (const auto &a : airports_) {
+        if (std::abs(lat_deg - a.lat) > 0.03 || std::abs(lon_deg - a.lon) > 0.04) continue;
+        for (const auto &fn : a.fences) {
+            const float fh = (fn.kind == "wall") ? 2.1f : 1.7f;
+            for (size_t pi = 1; pi < fn.points_lat_lon.size(); ++pi) {
+                const auto [lat0, lon0] = fn.points_lat_lon[pi - 1];
+                const auto [lat1, lon1] = fn.points_lat_lon[pi];
+                const double mlat = 0.5 * (lat0 + lat1), mlon = 0.5 * (lon0 + lon1);
+                if (std::abs(lat_deg - mlat) > 0.003 || std::abs(lon_deg - mlon) > 0.004) continue;
+                const double de = (lon1 - lon0) * wf->metres_lon;
+                const double dn = (lat1 - lat0) * wf->metres_lat;
+                const double len = std::hypot(de, dn);
+                if (len < 1.5 || len > 1500.0) continue;
+                const float g = static_cast<float>(sample_elevation(mlat, mlon));
+                const float yaw = static_cast<float>(std::atan2(-dn, de));
+                consider_obb(mlat, mlon, g, fh, static_cast<float>(len), 0.7f, yaw, 1);
+            }
+        }
+    }
+
+    // 4. Discrete Forest & Airfield Trees matching AirfieldVegetation's 10m world-locked grid
+    if (!best.hit) {
+        auto mix_bits = [](uint32_t x) {
+            x ^= x >> 16; x *= 0x7feb352du;
+            x ^= x >> 15; x *= 0x846ca68bu;
+            return x ^ (x >> 16);
+        };
+        auto frac01 = [](uint32_t x) { return static_cast<float>(x & 0xFFFFu) * (1.0f / 65536.0f); };
+        const double pe = (lon_deg - wf->anchor_lon) * wf->metres_lon;
+        const double pn = (lat_deg - wf->anchor_lat) * wf->metres_lat;
+        const int32_t ix0 = static_cast<int32_t>(std::floor(pe / 10.0));
+        const int32_t iy0 = static_cast<int32_t>(std::floor(pn / 10.0));
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                const int32_t ix = ix0 + dx;
+                const int32_t iy = iy0 + dy;
+                const uint32_t seed = mix_bits(static_cast<uint32_t>(ix) * 0x9e3779b9u ^
+                                               static_cast<uint32_t>(iy) * 0x85ebca6bu);
+                const double east = ix * 10.0 + (frac01(seed) - 0.5) * 8.2;
+                const double north = iy * 10.0 + (frac01(seed >> 11) - 0.5) * 8.2;
+                const double de = pe - east, dn = pn - north;
+                const double dist = std::hypot(de, dn);
+                if (dist > 4.6 + r) continue;
+
+                const double tlat = wf->anchor_lat + north / wf->metres_lat;
+                const double tlon = wf->anchor_lon + east / wf->metres_lon;
+                double re = 0, mu = 0, rg = 0;
+                std::string rid;
+                if (query_runway(tlat, tlon, re, mu, rg, rid) ||
+                    is_excluded_for_vegetation(*wf, tlat, tlon) ||
+                    is_near_building(*wf, tlat, tlon, 2.2) ||
+                    is_near_road(*wf, tlat, tlon, 2.4)) continue;
+
+                const float lidar = sample_canopy_height(tlat, tlon);
+                const Vec3 surf = sample_surface(tlat, tlon);
+                const float eff_h = (lidar >= 2.4f) ? lidar : (surf.x > 0.45f ? (4.8f + surf.x * 6.0f) : 0.0f);
+                if (eff_h < 2.4f || surf.z > 0.22f) continue;
+
+                const uint32_t s2 = mix_bits(seed ^ 0x517cc1b7u);
+                const double h = std::clamp(eff_h * (0.86 + frac01(s2) * 0.28), 4.5, 13.5);
+                const double g = sample_elevation(tlat, tlon);
+                if (alt_msl_m <= g - 0.5 || alt_msl_m >= g + h + r) continue;
+
+                const double inv_d = (dist > 1e-4) ? (1.0 / dist) : 1.0;
+                const double crown_base = g + h * 0.42;
+                if (alt_msl_m < crown_base) {
+                    const double trunk_r = 0.45 + r;
+                    if (dist < trunk_r) {
+                        const double pen = trunk_r - dist;
+                        if (!best.hit || best.kind > 2 || pen > best.penetration_m) {
+                            best.hit = true;
+                            best.kind = 2;
+                            best.normal_e = static_cast<float>(dist > 1e-4 ? de * inv_d : 1.0);
+                            best.normal_up = 0.0f;
+                            best.normal_n = static_cast<float>(dist > 1e-4 ? dn * inv_d : 0.0);
+                            best.penetration_m = static_cast<float>(pen);
+                        }
+                    }
+                } else {
+                    const double hfrac = std::clamp((alt_msl_m - crown_base) / std::max(1.0, h * 0.58), 0.0, 1.0);
+                    const double crown_r = h * 0.28 * (1.12 - 0.65 * hfrac) + r;
+                    if (dist < crown_r) {
+                        const double pen = std::min(crown_r - dist, g + h + r - alt_msl_m);
+                        if (!best.hit || (best.kind == 3 && pen > best.penetration_m)) {
+                            best.hit = true;
+                            best.kind = 3;
+                            best.normal_e = static_cast<float>(dist > 1e-4 ? de * inv_d * 0.55 : 0.0);
+                            best.normal_up = 0.85f;
+                            best.normal_n = static_cast<float>(dist > 1e-4 ? dn * inv_d * 0.55 : 0.0);
+                            best.penetration_m = static_cast<float>(pen);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return best;
 }
 
 } // namespace nsim

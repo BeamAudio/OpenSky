@@ -23,6 +23,8 @@ uniform float u_baked_reflection;
 uniform vec3 u_glass_weather; // x=local rain mm/h, y=simulation seconds, z=aircraft speed m/s
 uniform vec4 u_glass_fx;      // x=frost_ice01, y=cabin_mist01, z=grime01, w=snow_factor01
 uniform vec4 u_plane_wx;      // x=airframe_ice01, y=lightning_flash01, z=defrost_clear01, w=wet_sheen01
+uniform vec4 u_dmg_zones;     // x=nose, y=wing_l, z=wing_r, w=tail
+uniform vec4 u_dmg_extra;     // x=airframe, y=windshield_crack, z=scorch, w=is_interior
 uniform int u_native_output;
 uniform int u_aircraft_detail;
 uniform float u_output_exposure;
@@ -32,6 +34,7 @@ in vec3 v_nrm;
 in vec4 v_col;
 in vec2 v_uv;
 in vec3 v_obj_pos;
+in vec3 v_ac_pos;
 
 layout(location = 0) out vec4 frag_color;
 
@@ -108,6 +111,27 @@ float cabin_grain(vec3 p) {
     float n0 = mix(cabin_hash3(i), cabin_hash3(i + vec3(1.0, 0.0, 0.0)), f.x);
     float n1 = mix(cabin_hash3(i + vec3(0.0, 1.0, 0.0)), cabin_hash3(i + vec3(1.0, 1.0, 0.0)), f.x);
     return mix(n0, n1, f.y);
+}
+
+// Procedural glass spiderweb shatter + crazing field anchored at impact focal point.
+float glass_crack_mask(vec2 uv, float crack, bool front_glass) {
+    if (crack < 0.02) return 0.0;
+    vec2 orig = front_glass ? vec2(0.42, 0.44) : vec2(0.48, 0.46);
+    vec2 d = (uv - orig) * (front_glass ? vec2(1.15, 1.35) : vec2(1.0, 1.25));
+    float rad = length(d);
+    float reach = mix(0.08, 0.85, sqrt(crack));
+    if (rad > reach) return 0.0;
+    float env = 1.0 - smoothstep(reach * 0.45, reach, rad);
+    float ang = atan(d.y, d.x);
+    float n1 = cabin_grain(vec3(d * 19.0, 3.1));
+    float n2 = cabin_grain(vec3(d * 48.0, 8.7));
+    float rays = abs(fract((ang / 6.2831853) * 13.0 + (n1 - 0.5) * 0.48 + rad * 1.4) - 0.5) * 2.0;
+    float ray_line = 1.0 - smoothstep(0.0, mix(0.045, 0.12, crack) / max(0.08, rad * 3.2), rays);
+    float ring_pos = rad * (14.0 + crack * 8.0) + (n2 - 0.5) * 1.35;
+    float rings = abs(fract(ring_pos) - 0.5) * 2.0;
+    float ring_line = (1.0 - smoothstep(0.0, 0.085, rings)) * smoothstep(0.04, 0.14, rad);
+    float core = (1.0 - smoothstep(0.02, 0.095, rad)) * smoothstep(0.20, 0.90, crack);
+    return clamp(max(max(ray_line, ring_line * 0.85), core) * env, 0.0, 1.0);
 }
 
 void main() {
@@ -196,9 +220,10 @@ void main() {
         float grime_raw = clamp(u_glass_fx.z, 0.0, 1.0);
         float snow_fac  = clamp(u_glass_fx.w, 0.0, 1.0);
         float flash     = clamp(u_plane_wx.y, 0.0, 1.0);
+        float crack_raw = clamp(u_dmg_extra.y, 0.0, 1.0);
 
-        // Dry, clean, ice-free fast path: skip full AgX/LUT for faint <=5.5% glass sky reflection.
-        if (wet < 0.005 && frost_raw < 0.005 && mist_raw < 0.005 && grime_raw < 0.025) {
+        // Dry, clean, ice-free, uncracked fast path: skip full AgX/LUT for faint <=5.5% glass sky reflection.
+        if (wet < 0.005 && frost_raw < 0.005 && mist_raw < 0.005 && grime_raw < 0.025 && crack_raw < 0.02) {
             float omv = 1.0 - max(0.0, dot(N, V));
             float omv2 = omv * omv;
             float fresnel = omv2 * omv2;
@@ -277,10 +302,11 @@ void main() {
             float g_speck = cabin_grain(vec3(v_uv * 72.0, 11.4)) * cabin_grain(vec3(v_uv * 22.0, 2.8));
             grime_mask = (smoothstep(0.48, 0.84, g_speck) * 0.20 + 0.03 * frame_edge) * grime_raw;
         }
+        float crack_mask = glass_crack_mask(v_uv, crack_raw, front_glass);
 
         float fresnel = pow(1.0 - max(0.0, dot(N, V)), 4.5);
         float drop_alpha = smoothstep(0.04, 0.42, drop_mask);
-        float non_drop_alpha = fresnel * 0.055 + frost_mask * 0.80 + mist_mask + grime_mask;
+        float non_drop_alpha = fresnel * 0.055 + frost_mask * 0.80 + mist_mask + grime_mask + crack_mask * 0.72;
         float glass_alpha = clamp(max(drop_alpha, non_drop_alpha), 0.0, 0.96);
         if (glass_alpha < 0.012) { frag_color = vec4(0.0); return; }
 
@@ -321,20 +347,23 @@ void main() {
             glass_color = mix(water_hdr, frost_col, frost_mask * 0.85);
             glass_color = mix(glass_color, mist_col, mist_mask);
             glass_color = mix(glass_color, grime_col, grime_mask);
+            vec3 crack_col = mix(vec3(0.68, 0.76, 0.84), vec3(1.18, 1.22, 1.26), fresnel) * (0.28 + 0.82 * daylight);
+            glass_color = mix(glass_color, crack_col, crack_mask * 0.88);
             frag_color = vec4(native_display_color(glass_color), clamp(max(out_drop_a, non_drop_alpha), 0.0, 0.96));
             return;
         }
 
-        // Frost / mist / grime / non-native fallback
+        // Frost / mist / grime / cracks non-native fallback
         vec3 base_glass = mix(vec3(0.45, 0.56, 0.68), u_haze_cool, 0.65);
         vec3 frost_col = mix(vec3(0.80, 0.89, 0.98), vec3(1.12, 1.16, 1.20), crystal_sparkle) * (0.25 + 0.88 * daylight)
                        + vec3(0.55, 0.70, 0.95) * (flash * 0.30);
         vec3 mist_col  = mix(vec3(0.64, 0.72, 0.80), u_haze_cool * 0.95, 0.45) * (0.20 + 0.78 * daylight);
         vec3 grime_col = vec3(0.32, 0.30, 0.24) * (0.20 + 0.75 * daylight);
-        float w_sum = max(0.001, fresnel * 0.055 + frost_mask * 0.80 + mist_mask + grime_mask);
+        vec3 crack_col = mix(vec3(0.68, 0.76, 0.84), vec3(1.15, 1.20, 1.25), fresnel) * (0.28 + 0.82 * daylight);
+        float w_sum = max(0.001, fresnel * 0.055 + frost_mask * 0.80 + mist_mask + grime_mask + crack_mask * 0.72);
         glass_color = (base_glass * (fresnel * 0.055) + frost_col * (frost_mask * 0.80) +
-                       mist_col * mist_mask + grime_col * grime_mask) / w_sum;
-        frag_color = vec4(native_display_color(glass_color), clamp(non_drop_alpha, 0.0, 0.86));
+                       mist_col * mist_mask + grime_col * grime_mask + crack_col * (crack_mask * 0.72)) / w_sum;
+        frag_color = vec4(native_display_color(glass_color), clamp(non_drop_alpha, 0.0, 0.90));
         return;
     }
 
@@ -369,6 +398,34 @@ void main() {
             base = mix(base, vec3(0.88, 0.93, 0.98), rime * 0.88);
             rough = mix(rough, 0.82, rime * 0.88);
             metal *= (1.0 - rime * 0.88);
+        }
+        // Procedural exterior structural scratches, torn paint to bare aluminum, and engine scorch/oil soot
+        float z_nose = smoothstep(-0.55, -1.55, v_ac_pos.z) * u_dmg_zones.x;
+        float z_wl   = smoothstep(-0.65, -3.00, v_ac_pos.x) * u_dmg_zones.y;
+        float z_wr   = smoothstep( 0.65,  3.00, v_ac_pos.x) * u_dmg_zones.z;
+        float z_tail = smoothstep( 1.65,  3.90, v_ac_pos.z) * u_dmg_zones.w;
+        float z_bel  = smoothstep(-0.15, -0.75, v_ac_pos.y) * u_dmg_extra.x * 0.55;
+        float zone_d = clamp(z_nose + z_wl + z_wr + z_tail + z_bel, 0.0, 1.0);
+        if (zone_d > 0.02) {
+            float streak = cabin_grain(vec3(v_ac_pos.xy * 18.0, v_ac_pos.z * 2.2)) * 0.65 +
+                           cabin_grain(vec3(v_ac_pos.xy * 44.0, v_ac_pos.z * 5.0)) * 0.35;
+            float gouge = smoothstep(0.54 - zone_d * 0.36, 0.76 - zone_d * 0.25, streak);
+            float primer_rim = smoothstep(0.46 - zone_d * 0.36, 0.55 - zone_d * 0.34, streak) * (1.0 - gouge);
+            vec3 bare_alu = vec3(0.52, 0.54, 0.57) * (0.85 + 0.30 * streak);
+            base = mix(base, vec3(0.11, 0.13, 0.10), primer_rim * zone_d * 0.85);
+            base = mix(base, bare_alu, gouge * zone_d);
+            metal = mix(metal, 0.88, gouge * zone_d);
+            rough = mix(rough, 0.32, gouge * zone_d);
+        }
+        float scorch_amt = clamp(u_dmg_extra.z, 0.0, 1.0);
+        if (scorch_amt > 0.02) {
+            float cowl_aft = smoothstep(-2.1, -1.2, v_ac_pos.z) * (1.0 - smoothstep(-0.3, 1.6, v_ac_pos.z));
+            float exhaust = smoothstep(0.32, -0.45, v_ac_pos.y) * (1.0 - smoothstep(0.28, 0.72, abs(v_ac_pos.x)));
+            float soot_n = cabin_grain(vec3(v_ac_pos.xy * 12.0, v_ac_pos.z * 1.5));
+            float soot = clamp(cowl_aft * exhaust * scorch_amt * (0.45 + 0.75 * soot_n), 0.0, 0.92);
+            base = mix(base, vec3(0.035, 0.032, 0.030), soot);
+            rough = mix(rough, 0.92, soot);
+            metal *= (1.0 - soot);
         }
     }
 
@@ -420,13 +477,15 @@ void main() {
     vec3 F_ibl = F0 + (max(vec3(1.0 - rough), F0) - F0) * pow(1.0 - ndv, 4.0);
     float ibl_w = mix(0.95, 0.34, u_is_interior);
 
-    // Extra glossy Fresnel reflection only on exterior cabin glass (never on interior CockpitPropVeil!)
+    // Extra glossy Fresnel reflection + procedural windshield crack on exterior cabin glass (never on interior CockpitPropVeil!)
     float is_glass = (u_is_interior < 0.5 && u_base_tint.a < 0.94 && u_base_tint.a > 0.25) ? 1.0 : 0.0;
     float glass_fres = is_glass * (0.14 + 0.72 * pow(1.0 - ndv, 3.5));
+    float ext_crack = (is_glass > 0.5 && u_dmg_extra.y > 0.02) ? glass_crack_mask(v_uv, u_dmg_extra.y, true) : 0.0;
 
     vec3 lit = kD * base * (amb_c * ao + sun_c * (ndl * ao)) +
                sun_c * (spec * ndl * 0.80) +
                ibl_env * (F_ibl * ibl_w + vec3(glass_fres * 0.95)) +
                base * u_emissive_col;
-    frag_color = vec4(native_display_color(lit), clamp(alpha + glass_fres * 0.35, 0.0, 1.0));
+    lit = mix(lit, vec3(0.85, 0.90, 0.95) * (0.35 + 0.65 * day_t), ext_crack * 0.85);
+    frag_color = vec4(native_display_color(lit), clamp(alpha + glass_fres * 0.35 + ext_crack * 0.75, 0.0, 1.0));
 }

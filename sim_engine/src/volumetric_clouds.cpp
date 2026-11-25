@@ -496,7 +496,7 @@ void SkyAndClouds::render_clouds_and_post(
         camera_forward.z * prev_camera_forward_.z,
         -1.0f, 1.0f);
     const float camera_turn_rad = prev_camera_valid_ ? std::acos(forward_dot) : 0.0f;
-    const int sparse_period = 1;
+    const int sparse_period = (cloud_quality_ == 0 || thermal_sparse_clouds_) ? 2 : 1;
     const float temporal_blend = (!history_valid_ || camera_step_m > 40.0)
         ? 0.0f
         : std::clamp(0.68f - static_cast<float>(camera_step_m) * 0.008f - camera_turn_rad * 2.5f, 0.35f, 0.68f);
@@ -525,8 +525,8 @@ void SkyAndClouds::render_clouds_and_post(
     glUniform1f(u_cld_time_, time_sec);
     glUniform1i(u_cld_frame_, frame_idx);
     glUniform1f(u_cld_tblend_, temporal_blend);
-    static constexpr GLint kCloudSteps[4] = {9, 10, 12, 16};
-    glUniform1i(u_cld_steps_, kCloudSteps[cloud_quality_]);
+    static constexpr GLint kCloudSteps[4] = {8, 10, 12, 16};
+    glUniform1i(u_cld_steps_, kCloudSteps[std::clamp(cloud_quality_, 0, 3)]);
     glUniform1i(u_cld_sparse_, sparse_period);
     glUniform3f(u_cld_lit_, atmo_.cloud_lit.x, atmo_.cloud_lit.y, atmo_.cloud_lit.z);
     glUniform3f(u_cld_sh_, atmo_.cloud_shadow.x, atmo_.cloud_shadow.y, atmo_.cloud_shadow.z);

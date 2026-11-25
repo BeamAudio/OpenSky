@@ -12,8 +12,8 @@ void main() {
     float r2 = dot(d, d);
     float shape = mix(
         (1.0 - smoothstep(0.15, 1.0, abs(d.x))) * (1.0 - smoothstep(0.25, 1.0, abs(d.y))),
-        1.0 - smoothstep(0.15, 0.95, r2),
-        u_snow
+        1.0 - smoothstep(0.12, 0.96, r2),
+        clamp(u_snow, 0.0, 1.0)
     );
     float a = v_alpha * shape;
     if (a < 0.006) discard;

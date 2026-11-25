@@ -27,6 +27,22 @@ void main() {
     v_uv = q * 0.5 + 0.5;
 
     float fid = float(id);
+    if (u_snow > 1.5) {
+        if (id >= 28) {
+            gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+            v_alpha = 0.0;
+            return;
+        }
+        float life = fract(u_time * 0.78 + fid * (1.0 / 28.0));
+        float jit_x = (hash1(fid * 3.17 + 0.4) - 0.5) * 0.55;
+        float jit_z = (hash1(fid * 5.23 + 1.9) - 0.5) * 0.55;
+        vec3 p = u_cam_world + (u_rel_vel + vec3(jit_x, 2.2 + hash1(fid) * 1.4, jit_z)) * (life * 1.55);
+        float sz = mix(0.22, 1.15, life) * (0.65 + 0.55 * u_intensity);
+        vec3 world_pos = p + u_cam_right * (q.x * sz) + u_cam_up * (q.y * sz);
+        gl_Position = u_vp * vec4(world_pos, 1.0);
+        v_alpha = smoothstep(0.0, 0.14, life) * (1.0 - smoothstep(0.35, 1.0, life)) * clamp(u_intensity, 0.0, 1.0) * 0.62;
+        return;
+    }
     vec3 seed = vec3(hash1(fid * 1.13 + 0.7), hash1(fid * 2.41 + 3.1), hash1(fid * 3.77 + 7.9));
     // Active particle density scales smoothly with rain/snow intensity (zero pop-in!)
     float active_gate = smoothstep(0.0, 0.12, u_intensity - seed.x * 0.78);

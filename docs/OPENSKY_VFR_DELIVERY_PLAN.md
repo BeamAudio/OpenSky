@@ -1,6 +1,6 @@
 # OpenSky VFR Simulator delivery plan
 
-> Historical planning document. For current product rules and engine priorities, see [AGENTS.md](../AGENTS.md) and the [engine handoff](ENGINE_HANDOFF.md).
+> Historical planning document. For product rules, see [AGENTS.md](../AGENTS.md). Dated performance, flight-model, and weather findings are in the [engine audit](2026-11-23_opensky-engine-audit.md) and [flight/weather audit](2026-11-23_flight-weather-audit.md).
 
 ## The launch promise
 

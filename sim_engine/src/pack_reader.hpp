@@ -5,6 +5,7 @@
 #include "math3d.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -32,7 +33,8 @@ inline int online_zoom_for_distance_m(double dist_m) {
     if (dist_m <= 4000.0) return 17;
     if (dist_m <= 8000.0) return 16;
     if (dist_m <= 12000.0) return 15;
-    if (dist_m <= 20000.0) return 14;
+    if (dist_m <= 28000.0) return 14;
+    if (dist_m <= 48000.0) return 13;
     return 0;
 }
 
@@ -155,8 +157,12 @@ public:
         std::vector<uint32_t> lighting;
     };
 
-    // Capture on the runtime thread, then pass the immutable frame to workers.
-    std::shared_ptr<const WorldFrame> world_frame() const { return world_frame_; }
+    // Thread-safe atomic capture for workers + async transition staging.
+    std::shared_ptr<const WorldFrame> world_frame() const {
+        return world_frame_atomic_.load(std::memory_order_acquire);
+    }
+    std::shared_ptr<const WorldFrame> prepare_world_frame(double lat_deg, double lon_deg, bool snap_to_region = true) const;
+    void commit_world_frame(std::shared_ptr<const WorldFrame> frame);
 
     PackReader() = default;
     ~PackReader();
@@ -193,8 +199,11 @@ public:
     const AirportInfo *find_nearest_airport(double lat_deg, double lon_deg, double *out_dist_m = nullptr) const;
     std::vector<ParkingStand> compute_parking_stands(const AirportInfo &ap, int max_stands = 6) const;
     bool is_excluded_for_vegetation(double lat_deg, double lon_deg) const;
+    bool is_excluded_for_vegetation(const WorldFrame &frame, double lat_deg, double lon_deg) const;
     bool is_near_building(double lat_deg, double lon_deg, double pad_m = 4.5) const;
+    bool is_near_building(const WorldFrame &frame, double lat_deg, double lon_deg, double pad_m = 4.5) const;
     bool is_near_road(double lat_deg, double lon_deg, double pad_m = 8.5) const;
+    bool is_near_road(const WorldFrame &frame, double lat_deg, double lon_deg, double pad_m = 8.5) const;
     // Fast O(1) cell-local rasterized occupancy mask (bit0=building+pad, bit1=road+pad) for tree placement!
     void fill_cell_occupancy(double min_e, double min_n, double span_m, int res, uint8_t *out_mask,
                              bool include_verges = true) const;
@@ -215,7 +224,8 @@ public:
         std::vector<float> &out_height,
         std::vector<uint8_t> &out_ortho_rgba,
         std::vector<uint8_t> &out_norm_ao_rgba,
-        std::vector<uint8_t> &out_surf_rgba
+        std::vector<uint8_t> &out_surf_rgba,
+        bool *out_incomplete_online = nullptr
     ) const;
 
     // Pre-bake whole-corridor 50km planetary DEM 10-time-of-day horizon shadows + 8-dir Valley Sky AO (uint32 packed!)
@@ -240,6 +250,14 @@ public:
 
     // Check if aircraft wheel is on any OurAirports runway (returns runway elevation + friction mu)
     bool query_runway(double lat_deg, double lon_deg, double &out_elev_m, double &out_mu, double &out_rough, std::string &out_id) const;
+
+    struct ObjectCollisionHit {
+        bool hit = false;
+        uint8_t kind = 0; // 0=building, 1=landmark/bridge/wall, 2=tree_trunk, 3=tree_canopy
+        float normal_e = 0.0f, normal_up = 0.0f, normal_n = 0.0f;
+        float penetration_m = 0.0f;
+    };
+    ObjectCollisionHit query_object_collision(double lat_deg, double lon_deg, double alt_msl_m, double probe_r_m) const;
 
     // Live online PNOA ortho streaming: bounded RAM LRU + async disk-backed downloads, no worker stalls.
     void set_online_provider(OnlineOrthoProvider p);
@@ -268,7 +286,9 @@ private:
     const IndexedTile *find_entry(uint64_t key) const;
     std::shared_ptr<DecodedElevTile> get_elev_tile(int z, int x, int y) const;
     std::shared_ptr<DecodedRgbTile> get_rgb_tile(uint8_t layer, int z, int x, int y) const;
-    std::shared_ptr<DecodedRgbTile> get_online_rgb_tile(OnlineOrthoProvider prov, int z, int x, int y) const;
+    std::shared_ptr<DecodedRgbTile> get_online_rgb_tile(OnlineOrthoProvider prov, int z, int x, int y,
+                                                        bool queue_download = true,
+                                                        bool *out_queued_or_pending = nullptr) const;
     bool download_online_tile_to_disk(OnlineOrthoProvider prov, int z, int x, int y, const std::string &cache_path) const;
     void online_dl_worker() const;
     const LoadedRegion *find_sh_region_at_ll(double lat_deg, double lon_deg) const;
@@ -321,10 +341,11 @@ private:
     std::vector<int> surf_zooms_desc_;
     std::vector<int> vegetation_zooms_desc_;
     std::shared_ptr<const WorldFrame> world_frame_ = std::make_shared<const WorldFrame>();
+    std::atomic<std::shared_ptr<const WorldFrame>> world_frame_atomic_{world_frame_};
 
     mutable SyncLru<DecodedElevTile> elev_cache_{1024};
-    mutable SyncLru<DecodedRgbTile> img_cache_{2048};
-    mutable SyncLru<DecodedRgbTile> online_cache_{768};
+    mutable SyncLru<DecodedRgbTile> img_cache_{1024};
+    mutable SyncLru<DecodedRgbTile> online_cache_{512};
     mutable SyncLru<DecodedRgbTile> surf_cache_{768};
 
     // 50km corridor DEM 10-time-of-day horizon shadow + Valley Sky AO table (uint32 packed!)
@@ -349,6 +370,7 @@ private:
     mutable std::condition_variable online_cv_;
     mutable std::vector<uint64_t> online_dl_queue_;
     mutable std::unordered_set<uint64_t> online_dl_seen_;
+    mutable std::unordered_map<uint64_t, double> online_failed_until_;
     mutable std::vector<std::thread> online_workers_;
     mutable std::atomic<uint64_t> online_cam_lat_bits_{0};
     mutable std::atomic<uint64_t> online_cam_lon_bits_{0};

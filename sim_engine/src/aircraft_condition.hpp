@@ -17,6 +17,11 @@ struct AircraftCareSnapshot {
     double gear_alignment = 0.0;
     double prop_nicks = 0.0;
     double windshield_dirt = 0.0;
+    double windshield_crack = 0.0;
+    double dmg_nose = 0.0;
+    double dmg_wing_l = 0.0;
+    double dmg_wing_r = 0.0;
+    double dmg_tail = 0.0;
     double sump_water = 0.0;
     bool chocks_on = true;
     bool pitot_cover_on = true;

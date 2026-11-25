@@ -27,10 +27,11 @@ struct LmBuilder {
     double ce = 0.0, cn = 0.0, gy = 0.0;
     float c = 1.0f, s = 0.0f;
 
-    LmBuilder(std::vector<float> &v, const PackReader *pack, double lat, double lon, float yaw_deg, double y_offset = 0.0)
+    LmBuilder(std::vector<float> &v, const PackReader *pack, const PackReader::WorldFrame &frame,
+              double lat, double lon, float yaw_deg, double y_offset = 0.0)
         : out(v) {
-        ce = (lon - pack->anchor_lon()) * pack->anchor_m_lon();
-        cn = (lat - pack->anchor_lat()) * pack->anchor_m_lat();
+        ce = (lon - frame.anchor_lon) * frame.metres_lon;
+        cn = (lat - frame.anchor_lat) * frame.metres_lat;
         gy = pack->sample_elevation(lat, lon) + y_offset;
         float yr = yaw_deg * DEG2RAD_F;
         c = std::cos(yr);
@@ -777,7 +778,8 @@ bool WorldObjects::init(const PackReader *pack, const std::string &asset_root, c
     // Load map-wide pre-baked exact-polygon populated zones (ALL cities, towns & villages!)
     load_baked_cities(pack_dir);
 
-    build_instanced_buildings();
+    const auto init_frame = pack_->world_frame();
+    upload_buildings_gpu(build_buildings_cpu(*init_frame));
     glCreateBuffers(1, &bldg_cmd_ssbo_);
     glNamedBufferData(bldg_cmd_ssbo_, sizeof(bldg_base_cmds_), bldg_base_cmds_, GL_DYNAMIC_DRAW);
     glCreateBuffers(1, &bldg_vis_ssbo_);
@@ -861,8 +863,8 @@ bool WorldObjects::init(const PackReader *pack, const std::string &asset_root, c
     glCreateBuffers(1, &car_ssbo_);
     glNamedBufferData(car_ssbo_, static_cast<GLsizeiptr>(MAX_CARS * sizeof(CarGpu)), nullptr, GL_STREAM_DRAW);
 
-    build_runways();
-    build_landmarks();
+    upload_runways_gpu(build_runways_cpu(*init_frame));
+    upload_landmarks_gpu(build_landmarks_cpu(*init_frame));
     build_car_mesh();
     return true;
 }
@@ -888,8 +890,7 @@ void WorldObjects::shutdown() {
     del_t(asph_tex_); del_t(grav_tex_); del_t(asph_nrm_); del_t(grav_nrm_);
 }
 
-void WorldObjects::build_instanced_buildings() {
-    if (bldg_all_ssbo_) { glDeleteBuffers(1, &bldg_all_ssbo_); bldg_all_ssbo_ = 0; }
+std::vector<WorldObjects::BldgGpu> WorldObjects::build_buildings_cpu(const PackReader::WorldFrame &frame) const {
     struct ExclZone { double lat, lon, rad_m; };
     static const ExclZone kHeroExcl[] = {
         {41.6569, -0.8787,  68.0},
@@ -913,13 +914,13 @@ void WorldObjects::build_instanced_buildings() {
             if (covered_by_city && !b.airport_feature) continue;
             bool overlap_hero = false;
             for (const auto &ez : kHeroExcl) {
-                double de = (b.lon - ez.lon) * pack_->anchor_m_lon();
-                double dn = (b.lat - ez.lat) * pack_->anchor_m_lat();
+                double de = (b.lon - ez.lon) * frame.metres_lon;
+                double dn = (b.lat - ez.lat) * frame.metres_lat;
                 if (de * de + dn * dn < ez.rad_m * ez.rad_m) { overlap_hero = true; break; }
             }
             if (overlap_hero) continue;
-            float east_m  = static_cast<float>((b.lon - pack_->anchor_lon()) * pack_->anchor_m_lon());
-            float north_m = static_cast<float>((b.lat - pack_->anchor_lat()) * pack_->anchor_m_lat());
+            float east_m  = static_cast<float>((b.lon - frame.anchor_lon) * frame.metres_lon);
+            float north_m = static_cast<float>((b.lat - frame.anchor_lat) * frame.metres_lat);
             float bw = std::min(b.width_m, b.archetype == 4 ? 72.0f : 56.0f);
             float bd = std::min(b.depth_m, b.archetype == 4 ? 54.0f : 44.0f);
             float bh = (b.archetype == 4) ? std::min(b.height_m, 9.5f) : b.height_m;
@@ -930,30 +931,45 @@ void WorldObjects::build_instanced_buildings() {
             gpu_b.push_back(bg);
         }
     }
+    return gpu_b;
+}
+
+void WorldObjects::upload_buildings_gpu(const std::vector<BldgGpu> &gpu_b) {
+    if (bldg_all_ssbo_) { glDeleteBuffers(1, &bldg_all_ssbo_); bldg_all_ssbo_ = 0; }
     total_bldgs_ = static_cast<int>(gpu_b.size());
     glCreateBuffers(1, &bldg_all_ssbo_);
     glNamedBufferStorage(bldg_all_ssbo_, static_cast<GLsizeiptr>(std::max<size_t>(1, gpu_b.size()) * sizeof(BldgGpu)), gpu_b.empty() ? nullptr : gpu_b.data(), 0);
 }
 
-void WorldObjects::on_reanchor() {
+WorldObjects::PreparedReanchor WorldObjects::prepare_reanchor_cpu(const PackReader::WorldFrame &frame) const {
+    PreparedReanchor out;
+    out.gpu_b = build_buildings_cpu(frame);
+    out.rv = build_runways_cpu(frame);
+    out.lv = build_landmarks_cpu(frame);
+    return out;
+}
+
+void WorldObjects::commit_reanchor(PreparedReanchor &&prep) {
     update_city_region_transforms();
-    build_instanced_buildings();
+    upload_buildings_gpu(prep.gpu_b);
     road_center_e_ = 1e12;
     road_center_n_ = 1e12;
     mtn_gi_phase_ = -10.0f;
-    if (rwy_vao_) { glDeleteVertexArrays(1, &rwy_vao_); rwy_vao_ = 0; }
-    if (rwy_vbo_) { glDeleteBuffers(1, &rwy_vbo_); rwy_vbo_ = 0; }
-    if (lm_vao_)  { glDeleteVertexArrays(1, &lm_vao_); lm_vao_ = 0; }
-    if (lm_vbo_)  { glDeleteBuffers(1, &lm_vbo_); lm_vbo_ = 0; }
-    build_runways();
-    build_landmarks();
+    upload_runways_gpu(prep.rv);
+    upload_landmarks_gpu(prep.lv);
 }
 
-void WorldObjects::build_runways() {
+void WorldObjects::on_reanchor() {
+    const auto frame = pack_->world_frame();
+    if (!frame) return;
+    commit_reanchor(prepare_reanchor_cpu(*frame));
+}
+
+std::vector<float> WorldObjects::build_runways_cpu(const PackReader::WorldFrame &frame) const {
     std::vector<float> rv; // pos(3), nrm(3), uv(2), mat_id(1), feat_id(1) = 10 floats
     auto push_surface_vertex = [&](double e, double n, double u, double v, float mat_id, float feat_id, double y_off) {
-        const double lat = pack_->anchor_lat() + n / pack_->anchor_m_lat();
-        const double lon = pack_->anchor_lon() + e / pack_->anchor_m_lon();
+        const double lat = frame.anchor_lat + n / frame.metres_lat;
+        const double lon = frame.anchor_lon + e / frame.metres_lon;
         const float ground = static_cast<float>(pack_->sample_elevation(lat, lon) + y_off);
         rv.insert(rv.end(), {static_cast<float>(e), ground, static_cast<float>(n),
                              0.0f, 1.0f, 0.0f, static_cast<float>(u), static_cast<float>(v), mat_id, feat_id});
@@ -983,10 +999,10 @@ void WorldObjects::build_runways() {
         return -1;
     };
     auto append_runway = [&](const AirportRunway &rw) {
-        double ea = (rw.lon_a - pack_->anchor_lon()) * pack_->anchor_m_lon();
-        double na = (rw.lat_a - pack_->anchor_lat()) * pack_->anchor_m_lat();
-        double eb = (rw.lon_b - pack_->anchor_lon()) * pack_->anchor_m_lon();
-        double nb = (rw.lat_b - pack_->anchor_lat()) * pack_->anchor_m_lat();
+        double ea = (rw.lon_a - frame.anchor_lon) * frame.metres_lon;
+        double na = (rw.lat_a - frame.anchor_lat) * frame.metres_lat;
+        double eb = (rw.lon_b - frame.anchor_lon) * frame.metres_lon;
+        double nb = (rw.lat_b - frame.anchor_lat) * frame.metres_lat;
         double de = eb - ea, dn = nb - na;
         double len = std::hypot(de, dn);
         if (len < 120.0) return;
@@ -1001,8 +1017,8 @@ void WorldObjects::build_runways() {
         const int segs = std::clamp(static_cast<int>(len / 22.0), 8, 96);
         auto sample_rwy_h = [&](double e, double n) -> float {
             auto se = [&](double ee, double nn) {
-                return pack_->sample_elevation(pack_->anchor_lat() + nn / pack_->anchor_m_lat(),
-                                               pack_->anchor_lon() + ee / pack_->anchor_m_lon());
+                return pack_->sample_elevation(frame.anchor_lat + nn / frame.metres_lat,
+                                               frame.anchor_lon + ee / frame.metres_lon);
             };
             double hc = se(e, n);
             double hl = se(e - rx, n - rn);
@@ -1040,10 +1056,10 @@ void WorldObjects::build_runways() {
         for (size_t i = 1; i < feature.points_lat_lon.size(); ++i) {
             const auto [lat0, lon0] = feature.points_lat_lon[i - 1];
             const auto [lat1, lon1] = feature.points_lat_lon[i];
-            const double e0 = (lon0 - pack_->anchor_lon()) * pack_->anchor_m_lon();
-            const double n0 = (lat0 - pack_->anchor_lat()) * pack_->anchor_m_lat();
-            const double e1 = (lon1 - pack_->anchor_lon()) * pack_->anchor_m_lon();
-            const double n1 = (lat1 - pack_->anchor_lat()) * pack_->anchor_m_lat();
+            const double e0 = (lon0 - frame.anchor_lon) * frame.metres_lon;
+            const double n0 = (lat0 - frame.anchor_lat) * frame.metres_lat;
+            const double e1 = (lon1 - frame.anchor_lon) * frame.metres_lon;
+            const double n1 = (lat1 - frame.anchor_lat) * frame.metres_lat;
             const double de = e1 - e0, dn = n1 - n0, len = std::hypot(de, dn);
             if (len < 0.5) continue;
             const double oe = dn / len * half_width, on = -de / len * half_width;
@@ -1074,8 +1090,8 @@ void WorldObjects::build_runways() {
         const size_t stride = std::max<size_t>(1, (feature.points_lat_lon.size() + 127) / 128);
         for (size_t i = 0; i < feature.points_lat_lon.size(); i += stride) {
             const auto [lat, lon] = feature.points_lat_lon[i];
-            polygon.push_back({static_cast<float>((lon - pack_->anchor_lon()) * pack_->anchor_m_lon()),
-                               static_cast<float>((lat - pack_->anchor_lat()) * pack_->anchor_m_lat())});
+            polygon.push_back({static_cast<float>((lon - frame.anchor_lon) * frame.metres_lon),
+                               static_cast<float>((lat - frame.anchor_lat) * frame.metres_lat)});
         }
         if (polygon.size() < 3) return;
         if (std::hypot(polygon.front().x - polygon.back().x, polygon.front().y - polygon.back().y) < 0.5)
@@ -1166,6 +1182,12 @@ void WorldObjects::build_runways() {
             else append_apron(feature, (a.kind == "large_airport" || a.kind == "medium_airport") ? 3 : ap_default_mat);
         }
     }
+    return rv;
+}
+
+void WorldObjects::upload_runways_gpu(const std::vector<float> &rv) {
+    if (rwy_vao_) { glDeleteVertexArrays(1, &rwy_vao_); rwy_vao_ = 0; }
+    if (rwy_vbo_) { glDeleteBuffers(1, &rwy_vbo_); rwy_vbo_ = 0; }
     rwy_vert_count_ = static_cast<int>(rv.size() / 10);
     glCreateVertexArrays(1, &rwy_vao_);
     glCreateBuffers(1, &rwy_vbo_);
@@ -1178,14 +1200,14 @@ void WorldObjects::build_runways() {
     glEnableVertexArrayAttrib(rwy_vao_, 4); glVertexArrayAttribFormat(rwy_vao_, 4, 1, GL_FLOAT, GL_FALSE, 9 * sizeof(float)); glVertexArrayAttribBinding(rwy_vao_, 4, 0);
 }
 
-void WorldObjects::build_landmarks() {
+std::vector<float> WorldObjects::build_landmarks_cpu(const PackReader::WorldFrame &frame) const {
     std::vector<float> lv;
     lv.reserve(24000 * 12);
 
     // 1. BASILICA DE NUESTRA SENORA DEL PILAR (Zaragoza, 41.6569, -0.8787, exact Bing Aerial alignment yaw=-27 deg!)
     //    True linear PBR reflectances (sRGB^2.2) so stone, Aragonese brick & glazed tiles look photographic, NOT pastel!
     {
-        LmBuilder b(lv, pack_, 41.6569, -0.8787, -27.0f, 0.0);
+        LmBuilder b(lv, pack_, frame, 41.6569, -0.8787, -27.0f, 0.0);
         const Vec3 brick{0.27f, 0.14f, 0.085f};
         const Vec3 stone{0.37f, 0.31f, 0.23f};
         const Vec3 roof{0.20f, 0.095f, 0.055f};
@@ -1249,7 +1271,7 @@ void WorldObjects::build_landmarks() {
 
     // 2. PUENTE DE PIEDRA (Historic 15th-century 7-arch stone bridge spanning Rio Ebro, exact Bing Aerial piers!)
     {
-        LmBuilder b(lv, pack_, 41.6578, -0.8755, 62.0f, 0.0);
+        LmBuilder b(lv, pack_, frame, 41.6578, -0.8755, 62.0f, 0.0);
         const Vec3 lime{0.34f, 0.29f, 0.22f};
         const Vec3 deck_asph{0.075f, 0.075f, 0.080f};
         const Vec3 bronze{0.12f, 0.095f, 0.055f};
@@ -1273,7 +1295,7 @@ void WorldObjects::build_landmarks() {
 
     // 3. TORRE DEL AGUA (Zaragoza Expo 2008 76m glass-and-steel water-drop tower, 41.6693, -0.9073!)
     {
-        LmBuilder b(lv, pack_, 41.6693, -0.9073, 12.0f, 0.0);
+        LmBuilder b(lv, pack_, frame, 41.6693, -0.9073, 12.0f, 0.0);
         const Vec3 granite{0.08f, 0.085f, 0.095f};
         const Vec3 glass{0.12f, 0.25f, 0.34f};
         const Vec3 steel{0.48f, 0.50f, 0.52f};
@@ -1289,7 +1311,7 @@ void WorldObjects::build_landmarks() {
 
     // 4. CATEDRAL DE HUESCA (Gothic sandstone cathedral + octagonal tower, 42.1404, -0.4086!)
     {
-        LmBuilder b(lv, pack_, 42.1404, -0.4086, -12.0f, 0.0);
+        LmBuilder b(lv, pack_, frame, 42.1404, -0.4086, -12.0f, 0.0);
         const Vec3 sand{0.34f, 0.26f, 0.16f};
         const Vec3 tile{0.22f, 0.095f, 0.055f};
         b.add_box(0.0f, -4.0f, 0.0f, 56.0f, 22.0f, 32.0f, sand, 0.78f, 0.0f, 0.55f);
@@ -1301,7 +1323,7 @@ void WorldObjects::build_landmarks() {
 
     // 5. CASTILLO DE LOARRE (Iconic hilltop Romanesque fortress, 42.3257, -0.6119!)
     {
-        LmBuilder b(lv, pack_, 42.3257, -0.6119, 15.0f, 0.0);
+        LmBuilder b(lv, pack_, frame, 42.3257, -0.6119, 15.0f, 0.0);
         const Vec3 rock{0.32f, 0.27f, 0.20f};
         const Vec3 keep{0.28f, 0.23f, 0.17f};
         b.add_box(0.0f, -6.0f, 0.0f, 62.0f, 16.0f, 44.0f, rock, 0.84f, 0.0f, 0.35f);
@@ -1316,7 +1338,7 @@ void WorldObjects::build_landmarks() {
 
     // 6. TORRE SUMERGIDA DE MEDIANO (Iconic 16th-century church bell tower rising out of Embalse de Mediano, 42.3175, 0.2037!)
     {
-        LmBuilder b(lv, pack_, 42.3175, 0.2037, 8.0f, 0.0);
+        LmBuilder b(lv, pack_, frame, 42.3175, 0.2037, 8.0f, 0.0);
         const Vec3 stone{0.28f, 0.24f, 0.18f};
         const Vec3 tile{0.20f, 0.095f, 0.055f};
         b.add_box(0.0f, -12.0f, 0.0f, 7.6f, 34.0f, 7.6f, stone, 0.82f, 0.0f, 0.30f);
@@ -1341,10 +1363,10 @@ void WorldObjects::build_landmarks() {
             for (size_t pi = 1; pi < fn.points_lat_lon.size(); ++pi) {
                 auto [lat0, lon0] = fn.points_lat_lon[pi - 1];
                 auto [lat1, lon1] = fn.points_lat_lon[pi];
-                double e0 = (lon0 - pack_->anchor_lon()) * pack_->anchor_m_lon();
-                double n0 = (lat0 - pack_->anchor_lat()) * pack_->anchor_m_lat();
-                double e1 = (lon1 - pack_->anchor_lon()) * pack_->anchor_m_lon();
-                double n1 = (lat1 - pack_->anchor_lat()) * pack_->anchor_m_lat();
+                double e0 = (lon0 - frame.anchor_lon) * frame.metres_lon;
+                double n0 = (lat0 - frame.anchor_lat) * frame.metres_lat;
+                double e1 = (lon1 - frame.anchor_lon) * frame.metres_lon;
+                double n1 = (lat1 - frame.anchor_lat) * frame.metres_lat;
                 double de = e1 - e0, dn = n1 - n0;
                 double seg_len = std::hypot(de, dn);
                 if (seg_len < 1.5 || seg_len > 1500.0) continue;
@@ -1355,7 +1377,7 @@ void WorldObjects::build_landmarks() {
                     double tm = (s + 0.5) / spans;
                     double mlat = lat0 + (lat1 - lat0) * tm;
                     double mlon = lon0 + (lon1 - lon0) * tm;
-                    LmBuilder fb(lv, pack_, mlat, mlon, yaw_deg, 0.0);
+                    LmBuilder fb(lv, pack_, frame, mlat, mlon, yaw_deg, 0.0);
                     float flen = static_cast<float>(span_len);
                     if (is_wall) {
                         fb.add_box(0.0f, -0.35f, 0.0f, flen, 1.95f, 0.35f, wall_stone, 0.86f, 0.0f, 0.0f);
@@ -1381,10 +1403,10 @@ void WorldObjects::build_landmarks() {
             std::string sl = rw.surface;
             for (char &ch : sl) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
             if (sl.find("grass") == std::string::npos && sl.find("turf") == std::string::npos && sl.find("grs") == std::string::npos) return;
-            double ea = (rw.lon_a - pack_->anchor_lon()) * pack_->anchor_m_lon();
-            double na = (rw.lat_a - pack_->anchor_lat()) * pack_->anchor_m_lat();
-            double eb = (rw.lon_b - pack_->anchor_lon()) * pack_->anchor_m_lon();
-            double nb = (rw.lat_b - pack_->anchor_lat()) * pack_->anchor_m_lat();
+            double ea = (rw.lon_a - frame.anchor_lon) * frame.metres_lon;
+            double na = (rw.lat_a - frame.anchor_lat) * frame.metres_lat;
+            double eb = (rw.lon_b - frame.anchor_lon) * frame.metres_lon;
+            double nb = (rw.lat_b - frame.anchor_lat) * frame.metres_lat;
             double de = eb - ea, dn = nb - na;
             double len = std::hypot(de, dn);
             if (len < 120.0) return;
@@ -1398,9 +1420,9 @@ void WorldObjects::build_landmarks() {
                 const bool is_end = (k == 0 || k == n_side);
                 for (double side : {-1.0, 1.0}) {
                     double me = ce + rx * side, mn = cn + rn * side;
-                    double mlat = pack_->anchor_lat() + mn / pack_->anchor_m_lat();
-                    double mlon = pack_->anchor_lon() + me / pack_->anchor_m_lon();
-                    LmBuilder mb(lv, pack_, mlat, mlon, yaw_deg, 0.0);
+                    double mlat = frame.anchor_lat + mn / frame.metres_lat;
+                    double mlon = frame.anchor_lon + me / frame.metres_lon;
+                    LmBuilder mb(lv, pack_, frame, mlat, mlon, yaw_deg, 0.0);
                     // Low white painted gable board (ICAO grass runway side marker)
                     mb.add_box(0.0f, -0.05f, 0.0f, is_end ? 2.4f : 1.9f, 0.24f, 0.42f, marker_white, 0.68f, 0.0f, 0.0f);
                     if (is_end) {
@@ -1420,22 +1442,22 @@ void WorldObjects::build_landmarks() {
         // 7c. 3D Windsocks (OSM mapped positions, or a sensible abeam-midfield fallback on every airfield)
         std::vector<std::pair<double, double>> ws_pts = a.windsocks;
         if (ws_pts.empty()) {
-            double ea = (a.rwy_lon_a - pack_->anchor_lon()) * pack_->anchor_m_lon();
-            double na = (a.rwy_lat_a - pack_->anchor_lat()) * pack_->anchor_m_lat();
-            double eb = (a.rwy_lon_b - pack_->anchor_lon()) * pack_->anchor_m_lon();
-            double nb = (a.rwy_lat_b - pack_->anchor_lat()) * pack_->anchor_m_lat();
+            double ea = (a.rwy_lon_a - frame.anchor_lon) * frame.metres_lon;
+            double na = (a.rwy_lat_a - frame.anchor_lat) * frame.metres_lat;
+            double eb = (a.rwy_lon_b - frame.anchor_lon) * frame.metres_lon;
+            double nb = (a.rwy_lat_b - frame.anchor_lat) * frame.metres_lat;
             double de = eb - ea, dn = nb - na;
             double len = std::hypot(de, dn);
             if (len > 100.0) {
                 double offset_m = std::max(34.0, a.rwy_width_m * 1.2 + 16.0);
                 double we = (ea + eb) * 0.5 + (dn / len) * offset_m;
                 double wn = (na + nb) * 0.5 - (de / len) * offset_m;
-                ws_pts.emplace_back(pack_->anchor_lat() + wn / pack_->anchor_m_lat(),
-                                    pack_->anchor_lon() + we / pack_->anchor_m_lon());
+                ws_pts.emplace_back(frame.anchor_lat + wn / frame.metres_lat,
+                                    frame.anchor_lon + we / frame.metres_lon);
             }
         }
         for (const auto &[wlat, wlon] : ws_pts) {
-            LmBuilder wb(lv, pack_, wlat, wlon, 25.0f, 0.0);
+            LmBuilder wb(lv, pack_, frame, wlat, wlon, 25.0f, 0.0);
             // Concrete base pad + white/orange steel mast + 5-ring orange/white fabric cone
             wb.add_cyl(0.0f, -0.20f, 0.0f, 0.55f, 0.50f, 0.35f, 8, wall_stone, 0.85f, 0.0f, 0.0f);
             wb.add_cyl(0.0f,  0.10f, 0.0f, 0.09f, 0.06f, 6.20f, 6, sock_white, 0.42f, 0.55f, 0.0f);
@@ -1448,6 +1470,12 @@ void WorldObjects::build_landmarks() {
         }
     }
 
+    return lv;
+}
+
+void WorldObjects::upload_landmarks_gpu(const std::vector<float> &lv) {
+    if (lm_vao_) { glDeleteVertexArrays(1, &lm_vao_); lm_vao_ = 0; }
+    if (lm_vbo_) { glDeleteBuffers(1, &lm_vbo_); lm_vbo_ = 0; }
     lm_vert_count_ = static_cast<int>(lv.size() / 12);
     glCreateVertexArrays(1, &lm_vao_);
     glCreateBuffers(1, &lm_vbo_);

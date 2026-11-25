@@ -35,6 +35,7 @@ SRCS := \
 	src/aircraft_session.cpp \
 	src/fleet_profile.cpp \
 	src/debug_overlays.cpp \
+	src/flight_replay.cpp \
 	src/runtime_checks.cpp \
 	src/main.cpp \
 	../engine/src/c172_systems.cpp \

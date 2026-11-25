@@ -30,6 +30,7 @@ bool AircraftAndHud::init(const PackReader *pack, const std::string &asset_root,
     if (!ac_prog_ || !hud_prog_) return false;
     u_ac_mvp_   = glGetUniformLocation(ac_prog_, "u_mvp");
     u_ac_model_ = glGetUniformLocation(ac_prog_, "u_model");
+    u_ac_node_  = glGetUniformLocation(ac_prog_, "u_ac_node");
     u_ac_sun_   = glGetUniformLocation(ac_prog_, "u_sun_dir");
     u_ac_cool_  = glGetUniformLocation(ac_prog_, "u_haze_cool");
     u_ac_warm_  = glGetUniformLocation(ac_prog_, "u_haze_warm");
@@ -44,6 +45,8 @@ bool AircraftAndHud::init(const PackReader *pack, const std::string &asset_root,
     u_ac_glass_weather_ = glGetUniformLocation(ac_prog_, "u_glass_weather");
     u_ac_glass_fx_ = glGetUniformLocation(ac_prog_, "u_glass_fx");
     u_ac_plane_wx_ = glGetUniformLocation(ac_prog_, "u_plane_wx");
+    u_ac_dmg_zones_ = glGetUniformLocation(ac_prog_, "u_dmg_zones");
+    u_ac_dmg_extra_ = glGetUniformLocation(ac_prog_, "u_dmg_extra");
     u_ac_baked_reflection_ = glGetUniformLocation(ac_prog_, "u_baked_reflection");
     u_ac_detail_ = glGetUniformLocation(ac_prog_, "u_aircraft_detail");
     u_ac_native_output_ = glGetUniformLocation(ac_prog_, "u_native_output");
@@ -221,13 +224,23 @@ void AircraftAndHud::shutdown() {
 void AircraftAndHud::reset_flight(double lat, double lon, double alt_m, double hdg_deg, double ias_kt, bool on_ground) {
     st_.runway_tracking = false;
     mouse_yoke_roll_ = mouse_yoke_pitch_ = 0.0;
-    prev_mouse_valid_ = false;
-    yoke_idle_s_ = 0.0;
+    raw_yoke_x_ = raw_yoke_y_ = 0.0;
+    yoke_anchor_valid_ = false;
     kb_bank_cmd_ = kb_pitch_cmd_ = 0.0;
     st_.ap_master = false;
     st_.ap_hdg_deg = hdg_deg;
     st_.ap_alt_ft = std::round(alt_m * 3.28084 / 100.0) * 100.0;
     ai_gyro_spool_ = systems_.is_engine_running() ? 1.0f : 0.0f;
+    prev_ground_coll_ = on_ground;
+    prev_vsi_coll_ = 0.0;
+    impact_cooldown_s_ = 0.0;
+    impact_fx_s_ = 0.0f;
+    collision_msg_.clear();
+    collision_msg_s_ = 0.0;
+    if (!owned_mode_) {
+        damage_ = prop_nicks_ = gear_alignment_ = windshield_crack_ = 0.0;
+        dmg_nose_ = dmg_wing_l_ = dmg_wing_r_ = dmg_tail_ = 0.0;
+    }
     taxi_hold_hdg_deg_ = hdg_deg;
     taxi_hold_valid_ = true;
     st_.lat_deg = lat;
@@ -359,18 +372,13 @@ FlightAssistOut compute_flight_and_taxi_assist(
         return out;
     }
 
-    // Airborne Envelope-Protected Flight Director (easy & enjoyable for Trackpad + Keyboard):
-    // - Neutral roll -> wings level (0 deg); neutral pitch -> VSI-zero level flight!
-    // - Automatic turn-lift pitch compensation keeps coordinated turns effortlessly level.
-    // - Built-in stall guard at real C172S stall margin (50 kt clean / 44 kt flaps, AoA >13.5 deg)
-    //   so normal 55-60 kt takeoff rotation & landing flare NEVER get pushed nose-down!
     out.target_bank_deg = roll_u * 30.0;
     const double turn_pitch_comp = std::min(2.4, std::abs(fs.roll_deg) * 0.065);
-    if (std::abs(pitch_u) < 0.01) {
-        out.target_pitch_deg = std::clamp(1.6 + turn_pitch_comp - fs.vsi_mps * 1.45, -6.0, 9.5);
-    } else {
-        out.target_pitch_deg = 1.6 + turn_pitch_comp + pitch_u * (pitch_u >= 0.0 ? 11.8 : 11.5);
-    }
+    const double vsi_hold_pitch = std::clamp(1.6 + turn_pitch_comp - fs.vsi_mps * 1.45, -6.0, 9.5);
+    const double direct_pitch = 1.6 + turn_pitch_comp + pitch_u * (pitch_u >= 0.0 ? 11.8 : 11.5);
+    const double blend_t = std::clamp(std::abs(pitch_u) / 0.035, 0.0, 1.0);
+    const double smooth_w = blend_t * blend_t * (3.0 - 2.0 * blend_t);
+    out.target_pitch_deg = std::lerp(vsi_hold_pitch, direct_pitch, smooth_w);
     const double stall_onset_kt = (fs.cl > 1.25) ? 45.0 : 50.0;
     const double stall_guard = std::max(
         std::clamp((stall_onset_kt - fs.ias_kt) / 10.0, 0.0, 1.0),
@@ -392,18 +400,48 @@ FlightAssistOut compute_flight_and_taxi_assist(
     return out;
 }
 
+void AircraftAndHud::apply_autopilot(const nspain::FlightState &fs_cur, double &eff_roll, double &eff_pitch) {
+    const bool ap_bus_ok = systems_.get_master_battery() && systems_.get_avionics_master() &&
+                           !fs_cur.on_ground && !st_.slew_fast;
+    if (!ap_bus_ok || std::abs(eff_roll) > 0.42 || std::abs(eff_pitch) > 0.42) {
+        st_.ap_master = false;
+        return;
+    }
+    if (!st_.ap_master) return;
+    if (st_.ap_nav_hold && st_.ap_nav_valid) {
+        const double err = std::remainder(st_.ap_nav_brg_deg - fs_cur.heading_deg, 360.0);
+        eff_roll = std::clamp(err / 32.0, -0.72, 0.72);
+    } else if (st_.ap_hdg_hold) {
+        const double err = std::remainder(st_.ap_hdg_deg - fs_cur.heading_deg, 360.0);
+        eff_roll = std::clamp(err / 32.0, -0.72, 0.72);
+    } else {
+        eff_roll = 0.0;
+    }
+    if (st_.ap_alt_hold) {
+        const double cur_ft = fs_cur.alt_msl_m * 3.28084;
+        const double tgt_vsi = std::clamp((st_.ap_alt_ft - cur_ft) * 0.011, -2.6, 2.6);
+        const double vsi_err = tgt_vsi - fs_cur.vsi_mps;
+        eff_pitch = std::clamp(vsi_err * 0.22, -0.58, 0.58);
+    } else {
+        eff_pitch = 0.0;
+    }
+}
+
 void AircraftAndHud::step_autonomous_assist(double dt, double roll_cmd, double pitch_cmd, double throttle_tgt, double brake_cmd,
                                             const AtmosphereState &atmo, const RegionalAtmosphere &reg_atmo, double sim_time_sec) {
     const nspain::FlightState &fs = fdm_.state();
     if (!taxi_hold_valid_) { taxi_hold_hdg_deg_ = fs.heading_deg; taxi_hold_valid_ = true; }
+    double eff_roll = std::clamp(roll_cmd, -1.0, 1.0);
+    double eff_pitch = std::clamp(pitch_cmd, -1.0, 1.0);
+    apply_autopilot(fs, eff_roll, eff_pitch);
     const FlightAssistOut assist = compute_flight_and_taxi_assist(
-        std::clamp(roll_cmd, -1.0, 1.0), std::clamp(pitch_cmd, -1.0, 1.0), 0.0, false, taxi_hold_hdg_deg_, fs);
+        eff_roll, eff_pitch, 0.0, false, taxi_hold_hdg_deg_, fs);
     if (fs.on_ground && !assist.holding_heading) taxi_hold_hdg_deg_ = fs.heading_deg;
     st_.aileron  += (assist.aileron  - st_.aileron)  * std::min(1.0, dt * 11.0);
     st_.elevator += (assist.elevator - st_.elevator) * std::min(1.0, dt * 11.0);
     st_.rudder   += (assist.rudder   - st_.rudder)   * std::min(1.0, dt * 12.0);
     st_.throttle += (std::clamp(throttle_tgt, 0.0, 1.0) - st_.throttle) * std::min(1.0, dt * 3.5);
-    if (!fs.on_ground && std::abs(pitch_cmd) < 0.14)
+    if (!fs.on_ground && (std::abs(pitch_cmd) < 0.14 || st_.ap_master))
         st_.trim = std::clamp(st_.trim + assist.elevator * dt * 0.14, -0.55, 0.55);
 
     advance_aircraft(dt, atmo, reg_atmo, sim_time_sec, st_.rudder,
@@ -423,11 +461,11 @@ void AircraftAndHud::step_inputs_and_physics(const PlatformWindow &win, double d
     if (win.key_pressed(KEY_Y)) {
         st_.mouse_yoke_enabled = !st_.mouse_yoke_enabled;
         mouse_yoke_roll_ = mouse_yoke_pitch_ = 0.0;
+        raw_yoke_x_ = raw_yoke_y_ = 0.0;
         kb_bank_cmd_ = kb_pitch_cmd_ = 0.0;
-        prev_mouse_x_ = static_cast<double>(win.mouse_x());
-        prev_mouse_y_ = static_cast<double>(win.mouse_y());
-        prev_mouse_valid_ = true;
-        yoke_idle_s_ = 0.0;
+        anchor_mx_ = static_cast<double>(win.mouse_x());
+        anchor_my_ = static_cast<double>(win.mouse_y());
+        yoke_anchor_valid_ = true;
     }
     const bool mouse_yoke = st_.mouse_yoke_enabled && st_.view_mode != 2;
     if (win.mouse_right_down() || (win.mouse_left_down() && !mouse_yoke)) {
@@ -439,11 +477,11 @@ void AircraftAndHud::step_inputs_and_physics(const PlatformWindow &win, double d
         st_.look_pitch_deg = 0.0f;
         st_.free_cam_off_m = {0.0f, 3.0f, 12.0f};
         mouse_yoke_roll_ = mouse_yoke_pitch_ = 0.0;
+        raw_yoke_x_ = raw_yoke_y_ = 0.0;
         kb_bank_cmd_ = kb_pitch_cmd_ = 0.0;
-        prev_mouse_x_ = static_cast<double>(win.mouse_x());
-        prev_mouse_y_ = static_cast<double>(win.mouse_y());
-        prev_mouse_valid_ = true;
-        yoke_idle_s_ = 0.0;
+        anchor_mx_ = static_cast<double>(win.mouse_x());
+        anchor_my_ = static_cast<double>(win.mouse_y());
+        yoke_anchor_valid_ = true;
         taxi_hold_hdg_deg_ = fdm_.state().heading_deg;
         taxi_hold_valid_ = true;
     }
@@ -502,9 +540,9 @@ void AircraftAndHud::step_inputs_and_physics(const PlatformWindow &win, double d
     }
     if (win.key_pressed(KEY_F)) systems_.set_flaps_target_deg(std::min(30.0, systems_.get_flaps_target_deg() + 10.0));
     if (win.key_pressed(KEY_V)) systems_.set_flaps_target_deg(std::max(0.0, systems_.get_flaps_target_deg() - 10.0));
-    // Trackpad Auto-Return Mouse Yoke (zero XWarpPointer -> zero XWayland runaway!):
-    // Gliding on the trackpad steers smoothly; lifting your finger returns the stick smoothly to center,
-    // where the flight director automatically holds wings-level & 0-fpm cruise (or straight taxi heading).
+    // Cursor-Anchored Trackpad/Mouse Yoke (zero XWarpPointer -> zero XWayland runaway!):
+    // Anchors seamlessly around current cursor with compact trackpad travel, magnetic center detent,
+    // sliding boundary clamp, and Left-Click / R instant level+recenter.
     const nspain::FlightState &fs_cur = fdm_.state();
     if (!taxi_hold_valid_) {
         taxi_hold_hdg_deg_ = fs_cur.heading_deg;
@@ -515,53 +553,50 @@ void AircraftAndHud::step_inputs_and_physics(const PlatformWindow &win, double d
     const double cur_mx = static_cast<double>(win.mouse_x());
     const double cur_my = static_cast<double>(win.mouse_y());
     if (moving_yoke) {
-        if (!prev_mouse_valid_ || was_rmb_down_) {
-            prev_mouse_x_ = cur_mx;
-            prev_mouse_y_ = cur_my;
-            prev_mouse_valid_ = true;
+        const auto prect = win.presentation_rect(GAME_OUTPUT_W, GAME_OUTPUT_H);
+        const double rad = std::clamp(std::min<double>(prect.w, prect.h) * 0.17, 96.0, 155.0);
+        if (!yoke_anchor_valid_) {
+            anchor_mx_ = cur_mx;
+            anchor_my_ = cur_my;
+            raw_yoke_x_ = raw_yoke_y_ = 0.0;
+            yoke_anchor_valid_ = true;
+        } else if (was_rmb_down_) {
+            anchor_mx_ = cur_mx - raw_yoke_x_ * rad;
+            anchor_my_ = cur_my - raw_yoke_y_ * rad;
         }
         if (win.mouse_left_clicked()) {
-            mouse_yoke_roll_ = 0.0;
-            mouse_yoke_pitch_ = 0.0;
-            kb_bank_cmd_ = 0.0;
-            kb_pitch_cmd_ = 0.0;
+            anchor_mx_ = cur_mx;
+            anchor_my_ = cur_my;
+            raw_yoke_x_ = raw_yoke_y_ = 0.0;
+            mouse_yoke_roll_ = mouse_yoke_pitch_ = 0.0;
+            kb_bank_cmd_ = kb_pitch_cmd_ = 0.0;
             taxi_hold_hdg_deg_ = fs_cur.heading_deg;
         }
-        const double dx = cur_mx - prev_mouse_x_;
-        const double dy = cur_my - prev_mouse_y_;
-        prev_mouse_x_ = cur_mx;
-        prev_mouse_y_ = cur_my;
-        const double jump = std::hypot(dx, dy);
-        if (jump > 0.6 && jump < 140.0) {
-            const double view_height = std::max(480.0, static_cast<double>(win.presentation_rect(GAME_OUTPUT_W, GAME_OUTPUT_H).h));
-            const double travel_x = std::max(340.0, view_height * 0.44);
-            const double travel_y = std::max(320.0, view_height * 0.42);
-            mouse_yoke_roll_  = std::clamp(mouse_yoke_roll_  + std::clamp(dx / travel_x, -0.32, 0.32), -1.0, 1.0);
-            mouse_yoke_pitch_ = std::clamp(mouse_yoke_pitch_ + std::clamp(dy / travel_y, -0.28, 0.28), -1.0, 1.0);
-            yoke_idle_s_ = 0.0;
-        } else {
-            yoke_idle_s_ += dt;
-            if (yoke_idle_s_ > 0.18) {
-                // Roll/steering springs smoothly back to center on finger lift (wings level / straight taxi).
-                mouse_yoke_roll_ *= std::exp(-dt * 3.8);
-                if (std::abs(mouse_yoke_roll_) < 0.008) mouse_yoke_roll_ = 0.0;
-                // Pitch HOLDS takeoff rotation, climb, approach glide & landing flare (never drops the nose!).
-                // Only gently centers pitch inside a small near-zero detent (<0.09) or slow taxi (<38 kt on ground).
-                if (std::abs(mouse_yoke_pitch_) < 0.09) {
-                    mouse_yoke_pitch_ *= std::exp(-dt * 4.5);
-                    if (std::abs(mouse_yoke_pitch_) < 0.008) mouse_yoke_pitch_ = 0.0;
-                } else if (fs_cur.on_ground && fs_cur.ias_kt < 38.0) {
-                    mouse_yoke_pitch_ *= std::exp(-dt * 1.6);
-                }
-            }
+        double dx = cur_mx - anchor_mx_;
+        double dy = cur_my - anchor_my_;
+        if (std::abs(dx) > rad) {
+            dx = std::copysign(rad, dx);
+            anchor_mx_ = cur_mx - dx;
         }
-    } else {
-        prev_mouse_valid_ = false;
-        yoke_idle_s_ = 0.0;
-        if (!mouse_yoke) {
-            mouse_yoke_roll_ = 0.0;
-            mouse_yoke_pitch_ = 0.0;
+        if (std::abs(dy) > rad) {
+            dy = std::copysign(rad, dy);
+            anchor_my_ = cur_my - dy;
         }
+        raw_yoke_x_ = std::clamp(dx / rad, -1.0, 1.0);
+        raw_yoke_y_ = std::clamp(dy / rad, -1.0, 1.0);
+        auto shape_axis = [](double u) {
+            const double a = std::abs(u);
+            if (a <= 0.09) return 0.0;
+            const double t = (a - 0.09) / 0.91;
+            return std::copysign(t * (0.45 + 0.55 * t), u);
+        };
+        mouse_yoke_roll_ = shape_axis(raw_yoke_x_);
+        mouse_yoke_pitch_ = shape_axis(raw_yoke_y_);
+    } else if (!mouse_yoke) {
+        yoke_anchor_valid_ = false;
+        raw_yoke_x_ = raw_yoke_y_ = 0.0;
+        mouse_yoke_roll_ = 0.0;
+        mouse_yoke_pitch_ = 0.0;
     }
     was_rmb_down_ = rmb_down;
 
@@ -577,36 +612,18 @@ void AircraftAndHud::step_inputs_and_physics(const PlatformWindow &win, double d
     const double man_rud = (win.key_down(KEY_E) ? 0.65 : 0.0) - (win.key_down(KEY_Q) ? 0.65 : 0.0);
     const double roll_cmd = std::clamp((mouse_yoke ? mouse_yoke_roll_ : 0.0) + kb_bank_cmd_, -1.0, 1.0);
     const double pitch_cmd = std::clamp((mouse_yoke ? mouse_yoke_pitch_ : 0.0) + kb_pitch_cmd_, -1.0, 1.0);
+    if (fs_cur.on_ground && (std::abs(roll_cmd) > 0.05 || key_rud)) {
+        taxi_hold_hdg_deg_ = fs_cur.heading_deg;
+    }
 
     double ail_tgt = roll_cmd * 0.70;
     double elv_tgt = pitch_cmd * 0.70;
     double rud_tgt = man_rud;
     double assist_brk_l = 0.0, assist_brk_r = 0.0;
     // Cockpit Autopilot (requires electrical + avionics bus & airborne; strong pilot stick overrides/disconnects).
-    const bool ap_bus_ok = systems_.get_master_battery() && systems_.get_avionics_master() && !fs_cur.on_ground && !st_.slew_fast;
-    if (!ap_bus_ok || std::abs(roll_cmd) > 0.42 || std::abs(pitch_cmd) > 0.42) st_.ap_master = false;
-
     if (!st_.slew_fast) {
         double eff_roll = roll_cmd, eff_pitch = pitch_cmd;
-        if (st_.ap_master) {
-            if (st_.ap_nav_hold && st_.ap_nav_valid) {
-                const double err = std::remainder(st_.ap_nav_brg_deg - fs_cur.heading_deg, 360.0);
-                eff_roll = std::clamp(err / 32.0, -0.72, 0.72);
-            } else if (st_.ap_hdg_hold) {
-                const double err = std::remainder(st_.ap_hdg_deg - fs_cur.heading_deg, 360.0);
-                eff_roll = std::clamp(err / 32.0, -0.72, 0.72);
-            } else {
-                eff_roll = 0.0;
-            }
-            if (st_.ap_alt_hold) {
-                const double cur_ft = fs_cur.alt_msl_m * 3.28084;
-                const double tgt_vsi = std::clamp((st_.ap_alt_ft - cur_ft) * 0.011, -2.6, 2.6);
-                const double vsi_err = tgt_vsi - fs_cur.vsi_mps;
-                eff_pitch = std::clamp(vsi_err * 0.22, -0.58, 0.58);
-            } else {
-                eff_pitch = 0.0;
-            }
-        }
+        apply_autopilot(fs_cur, eff_roll, eff_pitch);
         const FlightAssistOut assist = compute_flight_and_taxi_assist(
             eff_roll, eff_pitch, man_rud, key_rud, taxi_hold_hdg_deg_, fs_cur);
         ail_tgt = assist.aileron;
@@ -850,6 +867,163 @@ void AircraftAndHud::advance_aircraft(double dt, const AtmosphereState &atmo, co
     st_.vsi_mps = ns.vsi_mps;
     st_.vel_east_mps = ns.vel_east_mps;
     st_.vel_north_mps = ns.vel_north_mps;
+    resolve_world_collisions(dt);
+}
+
+void AircraftAndHud::resolve_world_collisions(double dt) {
+    if (impact_fx_s_ > 0.0f) impact_fx_s_ = std::max(0.0f, impact_fx_s_ - static_cast<float>(dt));
+    if (impact_cooldown_s_ > 0.0) impact_cooldown_s_ = std::max(0.0, impact_cooldown_s_ - dt);
+    if (collision_msg_s_ > 0.0) collision_msg_s_ = std::max(0.0, collision_msg_s_ - dt);
+    if (st_.slew_fast) return;
+
+    const nspain::FlightState &fs = fdm_.state();
+    // 1. Detect heavy touchdown / crash-landing shock onto terrain or runway
+    if (!prev_ground_coll_ && fs.on_ground && prev_vsi_coll_ < -3.3) {
+        const double sev = std::clamp((-prev_vsi_coll_ - 3.3) / 8.5, 0.05, 0.90);
+        damage_ = std::min(1.0, damage_ + sev * 0.55);
+        gear_alignment_ = std::clamp(gear_alignment_ + (fs.roll_deg >= 0.0 ? 1.0 : -1.0) * sev * 0.45, -1.0, 1.0);
+        tire_wear_ = std::min(1.0, tire_wear_ + sev * 0.40);
+        if (fs.pitch_deg < -1.5) {
+            dmg_nose_ = std::min(1.0, dmg_nose_ + sev * 0.65);
+            prop_nicks_ = std::min(1.0, prop_nicks_ + sev * 0.70);
+        } else {
+            dmg_tail_ = std::min(1.0, dmg_tail_ + sev * 0.35);
+        }
+        if (sev > 0.25) windshield_crack_ = std::min(1.0, windshield_crack_ + (sev - 0.20) * 0.85);
+        impact_fx_s_ = std::max(impact_fx_s_, static_cast<float>(0.6 + sev));
+        cockpit_head_vel_.y -= static_cast<float>(sev * 1.4);
+        collision_msg_ = (sev > 0.45) ? "HARD IMPACT: GEAR & AIRFRAME DAMAGED" : "HARD LANDING: CHECK GEAR";
+        collision_msg_s_ = 5.5;
+    }
+    prev_ground_coll_ = fs.on_ground;
+    prev_vsi_coll_ = fs.vsi_mps;
+
+    if (!pack_ || impact_cooldown_s_ > 0.0) return;
+
+    double mlat = 111132.0, mlon = 82600.0;
+    nspain::meters_per_degree(fs.lat_deg, mlat, mlon);
+    const Mat4 ac_rot = Mat4::rotate_yxz(
+        static_cast<float>(-fs.heading_deg * DEG2RAD_D),
+        static_cast<float>(fs.pitch_deg * DEG2RAD_D),
+        static_cast<float>(-fs.roll_deg * DEG2RAD_D)
+    );
+    struct Probe { Vec3 local; double radius; int zone; }; // zone: 0=nose,1=wingL,2=wingR,3=tail,4=cabin/gear
+    static const Probe kProbes[5] = {
+        {{ 0.00f, -0.05f, -2.05f}, 0.55, 0},
+        {{-5.35f,  0.42f, -0.15f}, 0.50, 1},
+        {{ 5.35f,  0.42f, -0.15f}, 0.50, 2},
+        {{ 0.00f,  0.35f,  4.35f}, 0.50, 3},
+        {{ 0.00f, -0.45f,  0.15f}, 0.70, 4},
+    };
+
+    PackReader::ObjectCollisionHit best{};
+    int best_zone = -1;
+    for (const Probe &p : kProbes) {
+        const Vec4 w = ac_rot.mul({p.local.x, p.local.y, p.local.z, 0.0f});
+        const double plat = fs.lat_deg + (-w.z) / mlat;
+        const double plon = fs.lon_deg + w.x / mlon;
+        const double palt = fs.alt_msl_m + w.y;
+        const PackReader::ObjectCollisionHit hit = pack_->query_object_collision(plat, plon, palt, p.radius);
+        if (hit.hit && (!best.hit || hit.kind < best.kind || (hit.kind == best.kind && hit.penetration_m > best.penetration_m))) {
+            best = hit;
+            best_zone = p.zone;
+        }
+    }
+    if (!best.hit) return;
+
+    const double ve = fs.vel_east_mps, vu = fs.vsi_mps, vn = fs.vel_north_mps;
+    const double spd = std::hypot(std::hypot(ve, vn), vu);
+    if (best.kind == 3) {
+        // Tree crown canopy foliage snag: slow aircraft, chip prop/leading edge, push gently clear
+        const double sev = std::clamp(spd / 62.0, 0.05, 0.30);
+        damage_ = std::min(1.0, damage_ + sev * 0.45);
+        if (best_zone == 0 || best_zone == 4) {
+            prop_nicks_ = std::min(1.0, prop_nicks_ + sev * 0.75);
+            dmg_nose_ = std::min(1.0, dmg_nose_ + sev * 0.55);
+            windshield_crack_ = std::min(1.0, windshield_crack_ + sev * 0.35);
+        } else if (best_zone == 1) {
+            dmg_wing_l_ = std::min(1.0, dmg_wing_l_ + sev * 0.85);
+        } else if (best_zone == 2) {
+            dmg_wing_r_ = std::min(1.0, dmg_wing_r_ + sev * 0.85);
+        } else {
+            dmg_tail_ = std::min(1.0, dmg_tail_ + sev * 0.75);
+        }
+        const double roll_kick = (best_zone == 1) ? 0.55 : ((best_zone == 2) ? -0.55 : 0.0);
+        const double yaw_kick  = (best_zone == 1) ? -0.45 : ((best_zone == 2) ? 0.45 : 0.0);
+        fdm_.apply_impact_impulse(
+            0.0, best.penetration_m + 0.35, 0.0,
+            ve * 0.86, std::max(vu * 0.75 + 1.2, 0.8), vn * 0.86,
+            fs.p_rps + roll_kick, fs.q_rps + 0.22, fs.r_rps + yaw_kick
+        );
+        impact_fx_s_ = std::max(impact_fx_s_, 0.9f);
+        impact_cooldown_s_ = 0.25;
+        cockpit_head_vel_.y -= 0.45f;
+        collision_msg_ = "TREE CANOPY STRIKE! PROP & WING SCRAPED";
+        collision_msg_s_ = 4.5;
+    } else {
+        // Solid impact (building, bridge/wall/landmark, or tree trunk)
+        const double v_into = -(ve * best.normal_e + vu * best.normal_up + vn * best.normal_n);
+        if (v_into < -1.0 && best.penetration_m < 0.25) return;
+        const double imp = std::max(std::max(v_into, spd * 0.45), 1.8);
+        const double sev = std::clamp(imp / 24.0, 0.12, 0.96);
+
+        damage_ = std::min(1.0, damage_ + sev * 0.72);
+        if (best_zone == 0) {
+            dmg_nose_ = std::min(1.0, dmg_nose_ + sev * 1.15);
+            prop_nicks_ = std::min(1.0, prop_nicks_ + sev * 1.10);
+            windshield_crack_ = std::min(1.0, windshield_crack_ + sev * 0.85);
+            if (sev > 0.36 && systems_.is_engine_running()) {
+                systems_.set_magnetos(0);
+                systems_.set_engine_running_state(false, last_air_.oat_c);
+            }
+        } else if (best_zone == 1) {
+            dmg_wing_l_ = std::min(1.0, dmg_wing_l_ + sev * 1.15);
+        } else if (best_zone == 2) {
+            dmg_wing_r_ = std::min(1.0, dmg_wing_r_ + sev * 1.15);
+        } else if (best_zone == 3) {
+            dmg_tail_ = std::min(1.0, dmg_tail_ + sev * 1.15);
+        } else {
+            dmg_nose_ = std::min(1.0, dmg_nose_ + sev * 0.45);
+            gear_alignment_ = std::clamp(gear_alignment_ + (fs.roll_deg >= 0.0 ? 1.0 : -1.0) * sev * 0.65, -1.0, 1.0);
+            tire_wear_ = std::min(1.0, tire_wear_ + sev * 0.55);
+            windshield_crack_ = std::min(1.0, windshield_crack_ + sev * 0.90);
+        }
+
+        const double bounce = (1.0 + 0.34) * std::max(0.0, v_into) + 2.2;
+        const double nve = std::clamp(ve * 0.55 + best.normal_e * bounce, -65.0, 65.0);
+        const double nvu = std::clamp(vu * 0.55 + best.normal_up * bounce + 0.8, -30.0, 35.0);
+        const double nvn = std::clamp(vn * 0.55 + best.normal_n * bounce, -65.0, 65.0);
+        const double roll_kick = (best_zone == 1) ? (1.8 * sev) : ((best_zone == 2) ? (-1.8 * sev) : 0.0);
+        const double yaw_kick  = (best_zone == 1) ? (-1.9 * sev) : ((best_zone == 2) ? (1.9 * sev) : 0.0);
+        const double push = std::clamp(static_cast<double>(best.penetration_m) + 0.32, 0.25, 16.0);
+        fdm_.apply_impact_impulse(
+            best.normal_e * push, best.normal_up * push + 0.12, best.normal_n * push,
+            nve, nvu, nvn,
+            std::clamp(fs.p_rps + roll_kick, -3.5, 3.5),
+            std::clamp(fs.q_rps + (best_zone == 0 ? 0.6 : -0.4) * sev, -2.5, 2.5),
+            std::clamp(fs.r_rps + yaw_kick, -3.0, 3.0)
+        );
+        impact_fx_s_ = 1.6f;
+        impact_cooldown_s_ = 0.22;
+        cockpit_head_vel_.y -= static_cast<float>(0.65 + sev * 1.1);
+        cockpit_head_vel_.z -= static_cast<float>(0.85 * sev);
+        collision_msg_ = (best.kind == 0) ? "COLLISION: BUILDING IMPACT!"
+            : ((best.kind == 1) ? "COLLISION: STRUCTURE / WALL IMPACT!" : "COLLISION: TREE TRUNK STRIKE!");
+        collision_msg_s_ = 5.5;
+    }
+
+    const nspain::FlightState &post = fdm_.state();
+    st_.lat_deg = post.lat_deg;
+    st_.lon_deg = post.lon_deg;
+    st_.alt_msl_m = post.alt_msl_m;
+    st_.ground_m = pack_->sample_elevation(post.lat_deg, post.lon_deg);
+    st_.heading_deg = post.heading_deg;
+    st_.pitch_deg = post.pitch_deg;
+    st_.roll_deg = post.roll_deg;
+    st_.speed_mps = post.ground_speed_mps;
+    st_.vsi_mps = post.vsi_mps;
+    st_.vel_east_mps = post.vel_east_mps;
+    st_.vel_north_mps = post.vel_north_mps;
 }
 
 void AircraftAndHud::draw_glb(
@@ -921,6 +1095,20 @@ void AircraftAndHud::draw_glb(
 
             glUniformMatrix4fv(u_ac_mvp_,   1, GL_FALSE, mvp.m);
             glUniformMatrix4fv(u_ac_model_, 1, GL_FALSE, m_cam.m);
+            if (u_ac_node_ >= 0) glUniformMatrix4fv(u_ac_node_, 1, GL_FALSE, world_m[ni].m);
+            const float d_nose = static_cast<float>(std::clamp(std::max(dmg_nose_, prop_nicks_ * 0.45), 0.0, 1.0));
+            const float d_wl   = static_cast<float>(std::clamp(dmg_wing_l_, 0.0, 1.0));
+            const float d_wr   = static_cast<float>(std::clamp(dmg_wing_r_, 0.0, 1.0));
+            const float d_tail = static_cast<float>(std::clamp(dmg_tail_, 0.0, 1.0));
+            const float scorch = static_cast<float>(std::clamp(
+                dmg_nose_ * 0.65 + (systems_.get_cht_f() > 445.0 ? (systems_.get_cht_f() - 445.0) / 55.0 : 0.0) +
+                systems_.get_cylinder_wear() * 0.40 + (systems_.has_overtemp_failure() ? 0.85 : 0.0), 0.0, 1.0));
+            if (u_ac_dmg_zones_ >= 0) glUniform4f(u_ac_dmg_zones_, d_nose, d_wl, d_wr, d_tail);
+            if (u_ac_dmg_extra_ >= 0) {
+                glUniform4f(u_ac_dmg_extra_, static_cast<float>(std::clamp(damage_, 0.0, 1.0)),
+                            static_cast<float>(std::clamp(windshield_crack_, 0.0, 1.0)),
+                            scorch, is_interior ? 1.0f : 0.0f);
+            }
             glBindTextureUnit(0, sm.albedo_tex ? sm.albedo_tex : white_tex_);
             glBindTextureUnit(1, sm.normal_tex ? sm.normal_tex : white_tex_);
             glBindTextureUnit(2, sm.mr_tex     ? sm.mr_tex     : white_tex_);
@@ -984,6 +1172,36 @@ void AircraftAndHud::draw_glb(
     glBindVertexArray(0);
 }
 
+void AircraftAndHud::apply_damage_rig(std::vector<Mat4> &anim, float flaps_rad, float ail, float elv, float trm, float rud) const {
+    auto set_node = [](const GlbMeshData &m, std::vector<Mat4> &dst, const char *name, const Mat4 &xf) {
+        auto it = m.node_index.find(name);
+        if (it != m.node_index.end() && static_cast<size_t>(it->second) < dst.size()) dst[static_cast<size_t>(it->second)] = xf;
+    };
+    const float pn = static_cast<float>(std::clamp(prop_nicks_, 0.0, 1.0));
+    const float ga = static_cast<float>(std::clamp(gear_alignment_, -1.0, 1.0));
+    const float wl = static_cast<float>(std::clamp(dmg_wing_l_, 0.0, 1.0));
+    const float wr = static_cast<float>(std::clamp(dmg_wing_r_, 0.0, 1.0));
+    const float td = static_cast<float>(std::clamp(dmg_tail_, 0.0, 1.0));
+    const float gd = static_cast<float>(std::clamp(std::max(std::abs(ga) * 0.8, damage_ * 0.45), 0.0, 1.0));
+
+    // Bent/twisted propeller blades & eccentric damaged hub wobble
+    const float wob = (pn > 0.06f && prop_angle_rad_ > 0.0f) ? (pn * 0.045f) : 0.0f;
+    set_node(ext_mesh_, anim, "PropHub", Mat4::rotate_yxz(wob, wob * 0.6f, prop_angle_rad_));
+    if (pn > 0.05f) {
+        set_node(ext_mesh_, anim, "PropBlades",
+                 Mat4::rotate_yxz(pn * 0.14f, pn * 0.42f, -pn * 0.22f));
+    }
+    set_node(ext_mesh_, anim, "Flap_L",    Mat4::rotate_yxz(0.0f, flaps_rad + wl * 0.16f, wl * 0.08f));
+    set_node(ext_mesh_, anim, "Flap_R",    Mat4::rotate_yxz(0.0f, flaps_rad + wr * 0.16f, -wr * 0.08f));
+    set_node(ext_mesh_, anim, "Aileron_L", Mat4::rotate_yxz(0.0f, +ail * 20.0f * DEG2RAD_F - wl * 0.20f, 0.0f));
+    set_node(ext_mesh_, anim, "Aileron_R", Mat4::rotate_yxz(0.0f, -ail * 20.0f * DEG2RAD_F - wr * 0.20f, 0.0f));
+    set_node(ext_mesh_, anim, "Elevator",  Mat4::rotate_yxz(0.0f, -elv * 22.0f * DEG2RAD_F + td * 0.14f, td * 0.06f));
+    set_node(ext_mesh_, anim, "TrimTab",   Mat4::rotate_yxz(0.0f, +trm * 15.0f * DEG2RAD_F, 0.0f));
+    set_node(ext_mesh_, anim, "Rudder",    Mat4::rotate_yxz(+rud * 24.0f * DEG2RAD_F + td * 0.18f, 0.0f, td * 0.05f));
+    set_node(ext_mesh_, anim, "NoseGear",
+             Mat4::rotate_yxz(-rud * 18.0f * DEG2RAD_F + ga * 0.46f, gd * 0.18f, gd * 0.28f));
+}
+
 void AircraftAndHud::render_aircraft_3d(const Mat4 &vp, const Vec3 &cam_off, const AtmosphereState &atmo,
                                         GLuint refl_env_tex, float sim_time_sec,
                                         bool output_resolution, GLuint output_lut_tex,
@@ -1001,10 +1219,12 @@ void AircraftAndHud::render_aircraft_3d(const Mat4 &vp, const Vec3 &cam_off, con
     const bool cranking = systems_.is_starter_cranking();
     const bool sputtering = systems_.is_sputtering();
     const bool batt_on = systems_.get_master_battery();
-    float rpm = static_cast<float>(std::max(0.0, fs.rpm));
+    float rpm = (st_.visual_rpm_override >= 0.0)
+        ? static_cast<float>(st_.visual_rpm_override)
+        : static_cast<float>(std::max(0.0, fs.rpm));
     // Real continuous propeller spin: frozen when stopped, rhythmic compression-stroke chug when cranking!
     float eff_prop_rpm = rpm;
-    if (cranking && eff_prop_rpm < 140.0f) {
+    if (st_.visual_rpm_override < 0.0 && cranking && eff_prop_rpm < 140.0f) {
         eff_prop_rpm = 115.0f * (0.55f + 0.45f * std::sin(sim_time_sec * 13.0f));
     }
     if (eff_prop_rpm > 5.0f) {
@@ -1014,8 +1234,9 @@ void AircraftAndHud::render_aircraft_3d(const Mat4 &vp, const Vec3 &cam_off, con
     const float gyro_target = (rpm > 450.0f) ? 1.0f : 0.0f;
     ai_gyro_spool_ += (gyro_target - ai_gyro_spool_) * std::min(1.0f, rdt * (gyro_target > 0.5f ? 0.55f : 0.25f));
     float blur_t = (eff_prop_rpm < 20.0f) ? 0.0f : std::clamp((eff_prop_rpm - 260.0f) / 850.0f, cranking ? 0.18f : 0.0f, 1.0f);
-    if (sputtering) blur_t *= 0.68f + 0.32f * std::sin(sim_time_sec * 19.0f);
-    float flaps_rad = static_cast<float>(systems_.get_flaps_actual_deg() * DEG2RAD_D);
+    if (st_.visual_rpm_override < 0.0 && sputtering) blur_t *= 0.68f + 0.32f * std::sin(sim_time_sec * 19.0f);
+    float flaps_rad = static_cast<float>(
+        (st_.visual_rpm_override >= 0.0 ? st_.visual_flaps_deg : systems_.get_flaps_actual_deg()) * DEG2RAD_D);
     float ail = static_cast<float>(st_.aileron);
     float elv = static_cast<float>(st_.elevator);
     float rud = static_cast<float>(st_.rudder);
@@ -1117,19 +1338,10 @@ void AircraftAndHud::render_aircraft_3d(const Mat4 &vp, const Vec3 &cam_off, con
         std::vector<float> emiss(nn, 1.0f);
 
         // Live animated exterior control surfaces, chrome spinner + soft fading PropBlades + PropBlurDisc & aviation lights!
-        set_node(ext_mesh_, anim, "PropHub",      Mat4::rotate_yxz(0.0f, 0.0f, prop_angle_rad_));
+        apply_damage_rig(anim, flaps_rad, ail, elv, trm, rud);
         set_f(ext_mesh_, alpha,   "PropBlades",   1.0f - blur_t * 0.78f);
         set_node(ext_mesh_, anim, "PropBlurDisc", Mat4::rotate_yxz(0.0f, 0.0f, prop_angle_rad_ * 1.37f));
         set_f(ext_mesh_, alpha,   "PropBlurDisc", blur_t * 0.035f);
-
-        set_node(ext_mesh_, anim, "Flap_L",    Mat4::rotate_yxz(0.0f, +flaps_rad, 0.0f));
-        set_node(ext_mesh_, anim, "Flap_R",    Mat4::rotate_yxz(0.0f, +flaps_rad, 0.0f));
-        set_node(ext_mesh_, anim, "Aileron_L", Mat4::rotate_yxz(0.0f, +ail * 20.0f * DEG2RAD_F, 0.0f));
-        set_node(ext_mesh_, anim, "Aileron_R", Mat4::rotate_yxz(0.0f, -ail * 20.0f * DEG2RAD_F, 0.0f));
-        set_node(ext_mesh_, anim, "Elevator",  Mat4::rotate_yxz(0.0f, -elv * 22.0f * DEG2RAD_F, 0.0f));
-        set_node(ext_mesh_, anim, "TrimTab",   Mat4::rotate_yxz(0.0f, +trm * 15.0f * DEG2RAD_F, 0.0f));
-        set_node(ext_mesh_, anim, "Rudder",    Mat4::rotate_yxz(+rud * 24.0f * DEG2RAD_F, 0.0f, 0.0f));
-        set_node(ext_mesh_, anim, "NoseGear",  Mat4::rotate_yxz(-rud * 18.0f * DEG2RAD_F, 0.0f, 0.0f));
 
         // Exterior aviation lights coupled 100% to electrical bus & engine state (all dark when Cold & Dark!)
         const float bus_mul = batt_on ? (cranking ? 0.56f : 1.0f) : 0.0f;
@@ -1155,33 +1367,11 @@ void AircraftAndHud::render_precip_streaks(const Mat4 &vp, const Vec3 &cam_world
                                            const Vec3 &cam_right, const Vec3 &cam_up,
                                            const AtmosphereState &atmo, float sim_time_sec, bool walking) {
     if (!precip_prog_ || !precip_vao_) return;
+    const float dmg_smoke = static_cast<float>(std::clamp(
+        std::max({damage_ * 0.9, dmg_nose_, systems_.has_overtemp_failure() ? 1.0 : 0.0}) +
+        (impact_fx_s_ > 0.05f ? 0.45f : 0.0f), 0.0, 1.0));
     const float rate = static_cast<float>(std::max(0.0, last_air_.precipitation_mm_hr));
-    if (rate < 0.12f) return;
-    const float intensity = std::clamp(rate / 16.0f, 0.05f, 1.0f);
-    // Relative air velocity in render axes (+X east, +Y up, -Z north)
-    Vec3 rel_vel{
-        static_cast<float>(last_air_.wind_east_mps - (walking ? 0.0 : st_.vel_east_mps)),
-        static_cast<float>(last_air_.wind_up_mps - (walking ? 0.0 : st_.vsi_mps)),
-        static_cast<float>(-(last_air_.wind_north_mps - (walking ? 0.0 : st_.vel_north_mps)))
-    };
-    const float day = std::clamp((atmo.sun_dir.y + 0.10f) / 0.25f, 0.0f, 1.0f);
-    const float fl = last_air_.lightning_flash;
-    const float sn = last_air_.snow_factor;
-    const Vec3 rain_c = {
-        (0.55f * day + 0.14f) + fl * 0.45f,
-        (0.62f * day + 0.16f) + fl * 0.52f,
-        (0.70f * day + 0.20f) + fl * 0.72f
-    };
-    const Vec3 snow_c = {
-        (0.84f * day + 0.18f) + fl * 0.35f,
-        (0.88f * day + 0.20f) + fl * 0.40f,
-        (0.94f * day + 0.24f) + fl * 0.50f
-    };
-    const Vec3 col = {
-        std::lerp(rain_c.x, snow_c.x, sn),
-        std::lerp(rain_c.y, snow_c.y, sn),
-        std::lerp(rain_c.z, snow_c.z, sn)
-    };
+    if (rate < 0.12f && dmg_smoke < 0.18f) return;
 
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -1189,22 +1379,62 @@ void AircraftAndHud::render_precip_streaks(const Mat4 &vp, const Vec3 &cam_world
     glDepthFunc(GL_GEQUAL);
     glDepthMask(GL_FALSE);
     glDisable(GL_CULL_FACE);
-
     glUseProgram(precip_prog_);
     glUniformMatrix4fv(u_pr_vp_, 1, GL_FALSE, vp.m);
-    glUniform3f(u_pr_cam_, cam_world_en_alt.x, cam_world_en_alt.y, cam_world_en_alt.z);
-    glUniform3f(u_pr_vel_, rel_vel.x, rel_vel.y, rel_vel.z);
     glUniform3f(u_pr_right_, cam_right.x, cam_right.y, cam_right.z);
     glUniform3f(u_pr_up_, cam_up.x, cam_up.y, cam_up.z);
     glUniform1f(u_pr_time_, sim_time_sec);
-    glUniform1f(u_pr_snow_, sn);
-    glUniform1f(u_pr_int_, intensity);
-    glUniform3f(u_pr_col_, col.x, col.y, col.z);
-
     glBindVertexArray(precip_vao_);
-    glDrawArrays(GL_TRIANGLES, 0, 240 * 6);
-    glBindVertexArray(0);
 
+    if (rate >= 0.12f) {
+        const float intensity = std::clamp(rate / 16.0f, 0.05f, 1.0f);
+        Vec3 rel_vel{
+            static_cast<float>(last_air_.wind_east_mps - (walking ? 0.0 : st_.vel_east_mps)),
+            static_cast<float>(last_air_.wind_up_mps - (walking ? 0.0 : st_.vsi_mps)),
+            static_cast<float>(-(last_air_.wind_north_mps - (walking ? 0.0 : st_.vel_north_mps)))
+        };
+        const float day = std::clamp((atmo.sun_dir.y + 0.10f) / 0.25f, 0.0f, 1.0f);
+        const float fl = last_air_.lightning_flash;
+        const float sn = last_air_.snow_factor;
+        const Vec3 rain_c = {(0.55f * day + 0.14f) + fl * 0.45f, (0.62f * day + 0.16f) + fl * 0.52f, (0.70f * day + 0.20f) + fl * 0.72f};
+        const Vec3 snow_c = {(0.84f * day + 0.18f) + fl * 0.35f, (0.88f * day + 0.20f) + fl * 0.40f, (0.94f * day + 0.24f) + fl * 0.50f};
+        const Vec3 col = {std::lerp(rain_c.x, snow_c.x, sn), std::lerp(rain_c.y, snow_c.y, sn), std::lerp(rain_c.z, snow_c.z, sn)};
+        glUniform3f(u_pr_cam_, cam_world_en_alt.x, cam_world_en_alt.y, cam_world_en_alt.z);
+        glUniform3f(u_pr_vel_, rel_vel.x, rel_vel.y, rel_vel.z);
+        glUniform1f(u_pr_snow_, sn);
+        glUniform1f(u_pr_int_, intensity);
+        glUniform3f(u_pr_col_, col.x, col.y, col.z);
+        glDrawArrays(GL_TRIANGLES, 0, 240 * 6);
+    }
+
+    // Exterior/walkaround engine & impact smoke / sparks plume cleanly trailing nose cowling
+    if (dmg_smoke >= 0.18f && (st_.view_mode != 0 || walking)) {
+        const double hdg_r = st_.heading_deg * DEG2RAD_D;
+        Vec3 cowl_off{static_cast<float>(std::sin(hdg_r) * 1.45), 0.15f, static_cast<float>(-std::cos(hdg_r) * 1.45)};
+        if (walking) cowl_off = {0.0f, 0.0f, 0.0f}; // offset unused in walking unless parked spot known; keep plume over nose when flying/chase
+        if (!walking) {
+            const float dday = std::clamp((atmo.sun_dir.y + 0.08f) / 0.24f, 0.15f, 1.0f);
+            const float sparks = std::clamp(impact_fx_s_ * 0.7f, 0.0f, 1.0f);
+            Vec3 smoke_col = {
+                std::lerp(0.14f, 0.95f, sparks) * dday,
+                std::lerp(0.14f, 0.42f, sparks) * dday,
+                std::lerp(0.16f, 0.10f, sparks) * dday
+            };
+            Vec3 plume_vel{
+                static_cast<float>(last_air_.wind_east_mps - st_.vel_east_mps) * 0.45f,
+                static_cast<float>(1.6 - st_.vsi_mps * 0.45),
+                static_cast<float>(-(last_air_.wind_north_mps - st_.vel_north_mps)) * 0.45f
+            };
+            glUniform3f(u_pr_cam_, cowl_off.x, cowl_off.y, cowl_off.z);
+            glUniform3f(u_pr_vel_, plume_vel.x, plume_vel.y, plume_vel.z);
+            glUniform1f(u_pr_snow_, 2.0f);
+            glUniform1f(u_pr_int_, dmg_smoke);
+            glUniform3f(u_pr_col_, smoke_col.x, smoke_col.y, smoke_col.z);
+            glDrawArrays(GL_TRIANGLES, 0, 28 * 6);
+        }
+    }
+
+    glBindVertexArray(0);
     glDepthMask(GL_TRUE);
     glEnable(GL_CULL_FACE);
     glDisable(GL_BLEND);
@@ -1214,10 +1444,12 @@ void AircraftAndHud::render_parked_aircraft(const Mat4 &vp, Vec3 offset, float h
                                           const AtmosphereState &atmo, GLuint reflection, GLuint lut) {
     const Mat4 model = Mat4::translate(offset) * Mat4::rotate_yxz(-heading * DEG2RAD_F, 0, 0);
     if (lut) glBindTextureUnit(6, lut);
+    std::vector<Mat4> anim(ext_mesh_.nodes.size(), Mat4::identity());
+    apply_damage_rig(anim, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
     std::vector<float> alpha(ext_mesh_.nodes.size(), 1.0f);
     const auto blur = ext_mesh_.node_index.find("PropBlurDisc");
     if (blur != ext_mesh_.node_index.end()) alpha[blur->second] = 0.0f;
-    draw_glb(ext_mesh_, vp, model, model, {}, alpha, {}, atmo, reflection, false, 0.0f, lut != 0);
+    draw_glb(ext_mesh_, vp, model, model, anim, alpha, {}, atmo, reflection, false, 0.0f, lut != 0);
 }
 
 void AircraftAndHud::start_owned_flight(double lat, double lon, double alt, double heading,
@@ -1250,6 +1482,11 @@ void AircraftAndHud::start_owned_flight(double lat, double lon, double alt, doub
     gear_alignment_ = care.gear_alignment;
     prop_nicks_ = care.prop_nicks;
     windshield_dirt_ = care.windshield_dirt;
+    windshield_crack_ = care.windshield_crack;
+    dmg_nose_ = care.dmg_nose;
+    dmg_wing_l_ = care.dmg_wing_l;
+    dmg_wing_r_ = care.dmg_wing_r;
+    dmg_tail_ = care.dmg_tail;
     chocks_on_ = care.chocks_on;
     tie_downs_on_ = care.tie_downs_on;
 
@@ -1284,8 +1521,31 @@ void AircraftAndHud::sync_care_snapshot(AircraftCareSnapshot &care) const {
     care.fuel_selector = systems_.get_fuel_selector();
     care.mixture = st_.mixture;
     care.flaps_deg = systems_.get_flaps_target_deg();
+    care.windshield_crack = std::max(care.windshield_crack, windshield_crack_);
+    care.dmg_nose = std::max(care.dmg_nose, dmg_nose_);
+    care.dmg_wing_l = std::max(care.dmg_wing_l, dmg_wing_l_);
+    care.dmg_wing_r = std::max(care.dmg_wing_r, dmg_wing_r_);
+    care.dmg_tail = std::max(care.dmg_tail, dmg_tail_);
+    care.airframe_damage = std::max(care.airframe_damage, damage_);
+    care.prop_nicks = std::max(care.prop_nicks, prop_nicks_);
+    care.tire_wear = std::max(care.tire_wear, tire_wear_);
+    if (std::abs(gear_alignment_) > std::abs(care.gear_alignment)) care.gear_alignment = gear_alignment_;
     care.carb_heat = systems_.get_carb_heat();
     care.engine_running = systems_.is_engine_running();
+}
+
+void AircraftAndHud::sync_walkaround_damage(const AircraftCareSnapshot &care) {
+    damage_ = care.airframe_damage;
+    tire_wear_ = care.tire_wear;
+    brake_wear_ = care.brake_wear;
+    gear_alignment_ = care.gear_alignment;
+    prop_nicks_ = care.prop_nicks;
+    windshield_dirt_ = care.windshield_dirt;
+    windshield_crack_ = care.windshield_crack;
+    dmg_nose_ = care.dmg_nose;
+    dmg_wing_l_ = care.dmg_wing_l;
+    dmg_wing_r_ = care.dmg_wing_r;
+    dmg_tail_ = care.dmg_tail;
 }
 
 void AircraftAndHud::quick_start_or_shutdown() {
@@ -1503,6 +1763,15 @@ void AircraftAndHud::render_hud(
         hud_text(margin + 12.0f * ui, footer + 6.0f * ui, 19.0f * ui, flight, 0.93f, 0.97f, 1.0f, 1.0f);
         hud_text(wf - 480.0f * ui, footer + 6.0f * ui, 16.0f * ui,
                  "ESC Menu   N Season   F5 Profile   F6 Weather   F7 Physics", 0.94f, 0.97f, 1.0f, 1.0f);
+    }
+
+    if (collision_msg_s_ > 0.0 && !collision_msg_.empty() && !st_.menu_open) {
+        const float bw = 540.0f * ui;
+        const float bx = 0.5f * (wf - bw);
+        const float by = margin + 96.0f * ui;
+        hud_rect(bx, by, bw, 38.0f * ui, 0.38f, 0.05f, 0.04f, 0.88f);
+        hud_border(bx, by, bw, 38.0f * ui, 1.5f * ui, 1.0f, 0.42f, 0.25f, 0.95f);
+        hud_text(bx + 16.0f * ui, by + 8.0f * ui, 19.0f * ui, collision_msg_.c_str(), 1.0f, 0.88f, 0.72f, 1.0f);
     }
 
     if (debug && !st_.menu_open)

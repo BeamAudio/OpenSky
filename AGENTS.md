@@ -14,7 +14,7 @@
 - `AircraftSession` owns the fleet rules. `fleet_profile` validates and atomically writes the save. Keep v1/v2 readers and preserve unreadable user files. Scripted runs use isolated profiles. Keep JSBSim at 120 Hz and keep render calls from advancing simulation time.
 - Terrain jobs use an immutable `PackReader::WorldFrame`. Keep region transitions centralized and reject stale terrain and weather results before publication. Weather consumers read a coherent snapshot with its domain, source, generation, and solved time.
 - `builder/` produces scenery packs and sidecars. `protocol/` defines the C++ and Python pack formats. Keep readers for installed data when retiring obsolete producers. Store generated packs, caches, captures, and temporary bakes outside tracked source.
-- See the [engine handoff](docs/ENGINE_HANDOFF.md) for current verification, performance evidence, and the next engine milestone.
+- See the dated [engine audit](docs/2026-11-23_opensky-engine-audit.md) and [flight/weather audit](docs/2026-11-23_flight-weather-audit.md) for prior performance evidence and known validation gaps.
 
 ## Visual and performance rules
 

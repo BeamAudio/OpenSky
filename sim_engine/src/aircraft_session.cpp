@@ -62,6 +62,103 @@ void AircraftSession::save_profile() const {
         std::fprintf(stderr, "[FLEET] %s (%s)\n", profile_error_.c_str(), profile_file_.c_str());
 }
 
+bool AircraftSession::full_service(const std::string &id) {
+    return id == "ES-0205" || id == "LECS" || id == "LECI" || id == "LEHC" || id == "LEZG";
+}
+
+bool AircraftSession::can_add_fuel(bool left_tank) const {
+    const auto &care = profile_.care_;
+    return !flight_active_ && (left_tank ? care.left_fuel_gal : care.right_fuel_gal) < 26.45 &&
+           (full_service(profile_.parked_id_) || remote_fuel_added_ < 10.0);
+}
+
+void AircraftSession::adjust_fuel(bool left_tank, bool add) {
+    if (flight_active_) return;
+    auto &care = profile_.care_;
+    auto &tank = left_tank ? care.left_fuel_gal : care.right_fuel_gal;
+    if (!add) {
+        tank = std::max(0.0, tank - 5.0);
+    } else {
+        if (!can_add_fuel(left_tank)) return;
+        const bool hangar = full_service(profile_.parked_id_);
+        const double amount = std::min({5.0, 26.5 - tank, hangar ? 5.0 : 10.0 - remote_fuel_added_});
+        tank += amount;
+        if (!hangar) remote_fuel_added_ += amount;
+    }
+    save_profile();
+}
+
+void AircraftSession::service(AircraftService action) {
+    if (flight_active_) return;
+    const bool hangar = full_service(profile_.parked_id_);
+    auto &c = profile_.care_;
+    switch (action) {
+        case AircraftService::TopOil: c.oil_quarts = std::min(8.0, c.oil_quarts + 1.0); break;
+        case AircraftService::ChangeOil:
+            if (!hangar) return;
+            c.oil_quarts = 7.6;
+            c.oil_hours = 0;
+            break;
+        case AircraftService::CleanPlugs: c.spark_fouling = 0; break;
+        case AircraftService::RepairProp:
+            c.prop_nicks = hangar ? 0 : std::max(0.0, c.prop_nicks - 0.35);
+            break;
+        case AircraftService::Overhaul:
+            if (!hangar) return;
+            c.cylinder_wear = c.shock_cooling = 0;
+            break;
+        case AircraftService::FillLeft:
+        case AircraftService::FillBoth:
+            if (!hangar) return;
+            c.left_fuel_gal = 26.5;
+            if (action == AircraftService::FillBoth) c.right_fuel_gal = 26.5;
+            break;
+        case AircraftService::DrainSumps: c.sump_water = 0; break;
+        case AircraftService::TogglePitot: c.pitot_cover_on = !c.pitot_cover_on; break;
+        case AircraftService::ToggleTieDowns: c.tie_downs_on = !c.tie_downs_on; break;
+        case AircraftService::ToggleChocks: c.chocks_on = !c.chocks_on; break;
+        case AircraftService::RepairGear:
+            c.tire_wear = hangar ? 0 : std::min(c.tire_wear, 0.25);
+            c.brake_wear = hangar ? 0 : std::min(c.brake_wear, 0.25);
+            c.gear_alignment = hangar ? 0 : c.gear_alignment * 0.4;
+            break;
+        case AircraftService::RepairAirframe:
+            c.airframe_damage = hangar ? 0 : std::min(c.airframe_damage, 0.25);
+            break;
+        case AircraftService::ChargeBattery:
+            c.battery_soc = hangar ? 0.98 : std::max(c.battery_soc, 0.55);
+            break;
+        case AircraftService::CleanWindshield: c.windshield_dirt = 0; break;
+        case AircraftService::ToggleSecuring:
+            c.chocks_on = c.pitot_cover_on = c.tie_downs_on =
+                !(c.chocks_on || c.pitot_cover_on || c.tie_downs_on);
+            break;
+    }
+    save_profile();
+}
+
+bool AircraftSession::add_route_point(FleetRoutePoint point) {
+    auto &route = profile_.route_;
+    if (flight_active_ || route.size() >= max_route_points ||
+        (!route.empty() && nspain::haversine_m(route.back().lat, route.back().lon, point.lat, point.lon) < 30))
+        return false;
+    route.push_back(std::move(point));
+    save_profile();
+    return true;
+}
+
+void AircraftSession::remove_route_point(size_t index) {
+    if (flight_active_ || index >= profile_.route_.size()) return;
+    profile_.route_.erase(profile_.route_.begin() + index);
+    save_profile();
+}
+
+void AircraftSession::clear_route() {
+    if (flight_active_) return;
+    profile_.route_.clear();
+    save_profile();
+}
+
 void AircraftSession::prepare_parking(const AirportInfo &ap) {
     const bool valid_custom_park = profile_.has_custom_park_ && profile_.parked_id_ == ap.id &&
         nspain::haversine_m(profile_.parking_spot_.lat, profile_.parking_spot_.lon, ap.lat, ap.lon) <= 2500.0;

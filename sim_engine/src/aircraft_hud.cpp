@@ -102,36 +102,7 @@ bool AircraftAndHud::init(const PackReader *pack, const std::string &asset_root,
     if (windshield_rain_front_tex_ && windshield_rain_side_tex_)
         std::printf("[AIRCRAFT] 512x512x4 physically simulated rain LUTs loaded (front + side glass).\n");
 
-    fdm_.set_ground_provider([this](double lat, double lon) {
-        nspain::FlightGround ground{};
-        double runway_elev = 0.0, friction = ground.friction, roughness = ground.roughness;
-        std::string runway_id;
-        if (pack_ && pack_->query_runway(lat, lon, runway_elev, friction, roughness, runway_id)) {
-            ground.elev_m = runway_elev + 0.35;
-            ground.friction = friction;
-            ground.roughness = roughness;
-            ground.solid = true;
-        } else if (pack_) {
-            ground.elev_m = pack_->sample_elevation(lat, lon);
-            ground.friction = 0.58;
-            ground.roughness = 0.36;
-            ground.solid = pack_->sample_surface(lat, lon).z <= 0.35f;
-        }
-        // Weather-coupled surface grip: rain lowers braking friction (wet runway), freezing rain/snow turns slick!
-        if (ground_wetness_ > 0.02) {
-            const bool icy = (last_air_.oat_c < 0.5 && ground_wetness_ > 0.15);
-            const double grip_mult = icy ? std::lerp(1.0, 0.38, ground_wetness_) : std::lerp(1.0, 0.62, ground_wetness_);
-            ground.friction = std::max(0.20, ground.friction * grip_mult);
-        }
-        return ground;
-    });
-    if (!fdm_.load(aircraft_dir)) {
-        std::fprintf(stderr, "[JSBSIM] Factory C172S failed to load from %s\n", aircraft_dir.c_str());
-        return false;
-    }
-    std::printf("[JSBSIM] Upstream JSBSim %s | OpenSky C172S config\n", nspain::FlightModel::version().c_str());
-    systems_.reset_to_running_default();
-    reset_flight(st_.lat_deg, st_.lon_deg, st_.alt_msl_m, st_.heading_deg, st_.speed_mps * 1.94384, false);
+    if (!init_physics(pack, aircraft_dir)) return false;
     opentrack_.start_listening(4242);
 
     WorldObjects::load_colored_glb(asset_root + "/models/aircraft/c172s_exterior.glb", ext_mesh_);
@@ -185,6 +156,42 @@ bool AircraftAndHud::init(const PackReader *pack, const std::string &asset_root,
     glEnableVertexArrayAttrib(hud_vao_, 1); glVertexArrayAttribFormat(hud_vao_, 1, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float)); glVertexArrayAttribBinding(hud_vao_, 1, 0);
     glEnableVertexArrayAttrib(hud_vao_, 2); glVertexArrayAttribFormat(hud_vao_, 2, 4, GL_FLOAT, GL_FALSE, 4 * sizeof(float)); glVertexArrayAttribBinding(hud_vao_, 2, 0);
     hud_verts_.reserve(8192);
+    return true;
+}
+
+bool AircraftAndHud::init_physics(const PackReader *pack, const std::string &aircraft_dir) {
+    if (!pack) return false;
+    pack_ = pack;
+    fdm_.set_ground_provider([this](double lat, double lon) {
+        nspain::FlightGround ground{};
+        double runway_elev = 0.0, friction = ground.friction, roughness = ground.roughness;
+        std::string runway_id;
+        if (pack_ && pack_->query_runway(lat, lon, runway_elev, friction, roughness, runway_id)) {
+            ground.elev_m = runway_elev + 0.35;
+            ground.friction = friction;
+            ground.roughness = roughness;
+            ground.solid = true;
+        } else if (pack_) {
+            ground.elev_m = pack_->sample_elevation(lat, lon);
+            ground.friction = 0.58;
+            ground.roughness = 0.36;
+            ground.solid = pack_->sample_surface(lat, lon).z <= 0.35f;
+        }
+        // Weather-coupled surface grip: rain lowers braking friction (wet runway), freezing rain/snow turns slick!
+        if (ground_wetness_ > 0.02) {
+            const bool icy = (last_air_.oat_c < 0.5 && ground_wetness_ > 0.15);
+            const double grip_mult = icy ? std::lerp(1.0, 0.38, ground_wetness_) : std::lerp(1.0, 0.62, ground_wetness_);
+            ground.friction = std::max(0.20, ground.friction * grip_mult);
+        }
+        return ground;
+    });
+    if (!fdm_.load(aircraft_dir)) {
+        std::fprintf(stderr, "[JSBSIM] Factory C172S failed to load from %s\n", aircraft_dir.c_str());
+        return false;
+    }
+    std::printf("[JSBSIM] Upstream JSBSim %s | OpenSky C172S config\n", nspain::FlightModel::version().c_str());
+    systems_.reset_to_running_default();
+    reset_flight(st_.lat_deg, st_.lon_deg, st_.alt_msl_m, st_.heading_deg, st_.speed_mps * 1.94384, false);
     return true;
 }
 
@@ -399,49 +406,9 @@ void AircraftAndHud::step_autonomous_assist(double dt, double roll_cmd, double p
     if (!fs.on_ground && std::abs(pitch_cmd) < 0.14)
         st_.trim = std::clamp(st_.trim + assist.elevator * dt * 0.14, -0.55, 0.55);
 
-    const float wx_est = std::clamp((atmo.cloud_cov - 0.16f) / 0.78f, 0.0f, 1.0f);
-    last_air_ = reg_atmo.sample_at(fs.lat_deg, fs.lon_deg, fs.alt_msl_m, atmo.sun_dir, sim_time_sec, wx_est,
-                                   dt, fs.heading_deg, std::max(14.0, fs.tas_kt * 0.514444));
-    nspain::C172EnvStep env_step{};
-    env_step.dt = dt; env_step.throttle01 = st_.throttle; env_step.mixture01 = st_.mixture;
-    env_step.rpm = fs.rpm; env_step.ias_kt = fs.ias_kt; env_step.fuel_flow_demand_gph = fs.fuel_flow_gph;
-    env_step.ambient_temp_c = last_air_.oat_c; env_step.precip_mm = last_air_.precipitation_mm_hr;
-    env_step.dewpoint_c = dewpoint_from_temperature_rh(last_air_.oat_c, last_air_.relative_humidity);
-    env_step.cloud_cover_pct = atmo.cloud_cov * 100.0;
-    systems_.update(env_step);
-
-    nspain::FlightControls ci{};
-    ci.aileron = st_.aileron; ci.elevator = st_.elevator; ci.rudder = st_.rudder;
-    ci.elevator_trim = st_.trim; ci.throttle = st_.throttle; ci.mixture = st_.mixture;
-    ci.flaps = systems_.get_flaps_actual_deg() / 30.0;
-    ci.brake_left  = std::clamp(brake_cmd + assist.brake_left_add, 0.0, 1.0);
-    ci.brake_right = std::clamp(brake_cmd + assist.brake_right_add, 0.0, 1.0);
-    fdm_.set_controls(ci);
-
-    nspain::FlightEnvironment ei{};
-    ei.air_temp_c = last_air_.oat_c; ei.relative_humidity = last_air_.relative_humidity;
-    ei.qnh_hpa = last_air_.qnh_hpa; ei.terrain_elev_m = pack_->sample_elevation(fs.lat_deg, fs.lon_deg);
-    ei.wind_east_mps = last_air_.wind_east_mps; ei.wind_north_mps = last_air_.wind_north_mps;
-    ei.wind_down_mps = -last_air_.wind_up_mps;
-    ei.p_turb_rps = last_air_.p_turb_rps; ei.q_turb_rps = last_air_.q_turb_rps; ei.r_turb_rps = last_air_.r_turb_rps;
-    ei.airframe_ice_factor = std::clamp(static_cast<double>(airframe_ice01_), 0.0, 1.0);
-    ei.airframe_ice_kg = std::max(systems_.get_airframe_ice_kg(), static_cast<double>(airframe_ice01_) * 22.0);
-    ei.rain_drag_factor = std::clamp(last_air_.precipitation_mm_hr / 40.0, 0.0, 1.0);
-    fdm_.set_environment(ei);
-
-    nspain::FlightEngineInputs engine{};
-    engine.left_fuel_gal = systems_.get_left_tank_gal(); engine.right_fuel_gal = systems_.get_right_tank_gal();
-    engine.magnetos = systems_.get_magnetos(); engine.power_multiplier = systems_.get_engine_power_mult();
-    engine.starter = systems_.is_starter_cranking(); engine.fuel_starved = systems_.is_fuel_starved();
-    engine.running = systems_.is_engine_running();
-    fdm_.set_engine(engine);
-    if (!fdm_.advance(dt)) return;
-    const nspain::FlightState &ns = fdm_.state();
-    st_.lat_deg = ns.lat_deg; st_.lon_deg = ns.lon_deg; st_.alt_msl_m = ns.alt_msl_m;
-    st_.ground_m = pack_->sample_elevation(ns.lat_deg, ns.lon_deg);
-    st_.heading_deg = ns.heading_deg; st_.pitch_deg = ns.pitch_deg; st_.roll_deg = ns.roll_deg;
-    st_.speed_mps = ns.ground_speed_mps; st_.vsi_mps = ns.vsi_mps;
-    st_.vel_east_mps = ns.vel_east_mps; st_.vel_north_mps = ns.vel_north_mps;
+    advance_aircraft(dt, atmo, reg_atmo, sim_time_sec, st_.rudder,
+                     std::clamp(brake_cmd + assist.brake_left_add, 0.0, 1.0),
+                     std::clamp(brake_cmd + assist.brake_right_add, 0.0, 1.0));
 }
 
 void AircraftAndHud::step_inputs_and_physics(const PlatformWindow &win, double dt, const AtmosphereState &atmo, const RegionalAtmosphere &reg_atmo, double sim_time_sec) {
@@ -691,7 +658,45 @@ void AircraftAndHud::step_inputs_and_physics(const PlatformWindow &win, double d
         return;
     }
 
-    // Full Study-Level JSBSim 6-DOF + Non-Deterministic RegionalAtmosphere (MIL-F-8785C Dryden + Grid Shear) + C172Systems step!
+    const auto &fs = fdm_.state();
+    double brake_left = 0.0, brake_right = 0.0, rudder = st_.rudder;
+    if (st_.parking_brake && !chocks_on_ && !tie_downs_on_ && (win.key_pressed(KEY_X) || st_.throttle >= .08))
+        st_.parking_brake = false;
+    const double brake_eff = std::clamp(1.0 - 0.55 * brake_wear_, 0.35, 1.0);
+    if (chocks_on_ || tie_downs_on_) {
+        brake_left = brake_right = 1.0;
+    } else {
+        const double brk = st_.parking_brake ? 1.0 : std::max(win.key_down(KEY_X) ? brake_eff : 0.0, idle_s_brake * brake_eff);
+        brake_left = std::clamp(brk + assist_brk_l * brake_eff, 0.0, 1.0);
+        brake_right = std::clamp(brk + assist_brk_r * brake_eff, 0.0, 1.0);
+    }
+    if (fs.on_ground && fs.ground_speed_mps > 2.0 && std::abs(gear_alignment_) > 0.01) {
+        rudder = std::clamp(rudder + gear_alignment_ * 0.16, -1.0, 1.0);
+    }
+    if (st_.runway_tracking) {
+        const double heading = departure_heading_ * DEG2RAD_D;
+        const double north = (fs.lat_deg - departure_lat_) * pack_->anchor_m_lat();
+        const double east = (fs.lon_deg - departure_lon_) * pack_->anchor_m_lon();
+        const double cross_track = east * std::cos(heading) - north * std::sin(heading);
+        if ((!fs.on_ground && fs.agl_m > 2.0) || std::abs(cross_track) > 15.0 ||
+            win.key_down(KEY_Q) || win.key_down(KEY_E)) {
+            st_.runway_tracking = false;
+        } else if (fs.on_ground && !st_.parking_brake) {
+            // Aim ahead on the centreline, damping yaw so the nose wheel does
+            // not overcorrect. Pedal input immediately returns full control.
+            const double lookahead = 18.0 + fs.ground_speed_mps * 0.85;
+            const double target_heading = departure_heading_ - std::atan2(cross_track, lookahead) * RAD2DEG_D;
+            const double heading_error = std::remainder(target_heading - fs.heading_deg, 360.0);
+            rudder = std::clamp(0.048 * heading_error - 0.20 * fs.r_rps, -0.32, 0.32);
+        }
+    }
+    advance_aircraft(dt, atmo, reg_atmo, sim_time_sec, rudder, brake_left, brake_right);
+}
+
+void AircraftAndHud::advance_aircraft(double dt, const AtmosphereState &atmo, const RegionalAtmosphere &reg_atmo,
+                                     double sim_time_sec, double rudder, double brake_left, double brake_right) {
+    if (dt <= 0) return;
+    const float wx_est = std::clamp((atmo.cloud_cov - 0.16f) / 0.78f, 0.0f, 1.0f);
     const nspain::FlightState &fs = fdm_.state();
     last_air_ = reg_atmo.sample_at(fs.lat_deg, fs.lon_deg, fs.alt_msl_m, atmo.sun_dir, sim_time_sec, wx_est,
                                    dt, fs.heading_deg, std::max(14.0, fs.tas_kt * 0.514444));
@@ -714,41 +719,13 @@ void AircraftAndHud::step_inputs_and_physics(const PlatformWindow &win, double d
     nspain::FlightControls ci{};
     ci.aileron = st_.aileron;
     ci.elevator = st_.elevator;
-    ci.rudder = st_.rudder;
+    ci.rudder = rudder;
     ci.elevator_trim = st_.trim;
     ci.throttle = st_.throttle;
     ci.mixture = st_.mixture;
     ci.flaps = systems_.get_flaps_actual_deg() / 30.0;
-    if (st_.parking_brake && !chocks_on_ && !tie_downs_on_ && (win.key_pressed(KEY_X) || st_.throttle >= .08))
-        st_.parking_brake = false;
-    const double brake_eff = std::clamp(1.0 - 0.55 * brake_wear_, 0.35, 1.0);
-    if (chocks_on_ || tie_downs_on_) {
-        ci.brake_left = ci.brake_right = 1.0;
-    } else {
-        const double brk = st_.parking_brake ? 1.0 : std::max(win.key_down(KEY_X) ? brake_eff : 0.0, idle_s_brake * brake_eff);
-        ci.brake_left = std::clamp(brk + assist_brk_l * brake_eff, 0.0, 1.0);
-        ci.brake_right = std::clamp(brk + assist_brk_r * brake_eff, 0.0, 1.0);
-    }
-    if (fs.on_ground && fs.ground_speed_mps > 2.0 && std::abs(gear_alignment_) > 0.01) {
-        ci.rudder = std::clamp(ci.rudder + gear_alignment_ * 0.16, -1.0, 1.0);
-    }
-    if (st_.runway_tracking) {
-        const double heading = departure_heading_ * DEG2RAD_D;
-        const double north = (fs.lat_deg - departure_lat_) * pack_->anchor_m_lat();
-        const double east = (fs.lon_deg - departure_lon_) * pack_->anchor_m_lon();
-        const double cross_track = east * std::cos(heading) - north * std::sin(heading);
-        if ((!fs.on_ground && fs.agl_m > 2.0) || std::abs(cross_track) > 15.0 ||
-            win.key_down(KEY_Q) || win.key_down(KEY_E)) {
-            st_.runway_tracking = false;
-        } else if (fs.on_ground && !st_.parking_brake) {
-            // Aim ahead on the centreline, damping yaw so the nose wheel does
-            // not overcorrect. Pedal input immediately returns full control.
-            const double lookahead = 18.0 + fs.ground_speed_mps * 0.85;
-            const double target_heading = departure_heading_ - std::atan2(cross_track, lookahead) * RAD2DEG_D;
-            const double heading_error = std::remainder(target_heading - fs.heading_deg, 360.0);
-            ci.rudder = std::clamp(0.048 * heading_error - 0.20 * fs.r_rps, -0.32, 0.32);
-        }
-    }
+    ci.brake_left = brake_left;
+    ci.brake_right = brake_right;
     fdm_.set_controls(ci);
 
     nspain::FlightEnvironment ei{};

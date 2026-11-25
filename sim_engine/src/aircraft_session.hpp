@@ -10,6 +10,12 @@ class PackReader;
 struct AirportInfo;
 struct LocalAirSample;
 
+enum class AircraftService {
+    TopOil, ChangeOil, CleanPlugs, RepairProp, Overhaul, FillLeft, FillBoth,
+    DrainSumps, TogglePitot, ToggleTieDowns, ToggleChocks, RepairGear,
+    RepairAirframe, ChargeBattery, CleanWindshield, ToggleSecuring
+};
+
 class AircraftSession {
 public:
     void init(const PackReader &pack, std::filesystem::path profile_file);
@@ -19,6 +25,13 @@ public:
     bool park(AircraftAndHud &aircraft, const AirportInfo &airport);
     void step_flight(AircraftAndHud &aircraft, double dt);
     void save_profile() const;
+    static bool full_service(const std::string &airport_id);
+    bool can_add_fuel(bool left_tank) const;
+    void adjust_fuel(bool left_tank, bool add);
+    void service(AircraftService action);
+    bool add_route_point(FleetRoutePoint point);
+    void remove_route_point(size_t index);
+    void clear_route();
     const FleetProfile &profile() const { return profile_; }
     const std::string &profile_error() const { return profile_error_; }
 

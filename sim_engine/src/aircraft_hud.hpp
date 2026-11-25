@@ -96,6 +96,7 @@ public:
     ~AircraftAndHud();
 
     bool init(const PackReader *pack, const std::string &asset_root, const std::string &aircraft_dir, const std::string &shader_root);
+    bool init_physics(const PackReader *pack, const std::string &aircraft_dir);
     void shutdown();
 
     void reset_flight(double lat, double lon, double alt_m, double hdg_deg, double ias_kt, bool on_ground = false);
@@ -149,6 +150,8 @@ public:
 
 private:
     friend class GameFrontend;
+    void advance_aircraft(double dt, const AtmosphereState &atmo, const RegionalAtmosphere &reg_atmo,
+                          double sim_time_sec, double rudder, double brake_left, double brake_right);
     friend class AircraftSession;
     void flush_hud(float width, float height, GLuint font = 0);
     struct HudVert {

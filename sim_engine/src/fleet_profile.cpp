@@ -98,6 +98,8 @@ bool read_profile(std::istream &in, FleetProfile &profile) {
 ProfileLoad read_fleet_profile(const std::filesystem::path &path, FleetProfile &out) {
     std::error_code ec;
     if (!std::filesystem::exists(path, ec)) return ec ? ProfileLoad::Invalid : ProfileLoad::Missing;
+    const auto size = std::filesystem::file_size(path, ec);
+    if (ec || size > 1024 * 1024) return ProfileLoad::Invalid;
     std::ifstream in(path);
     FleetProfile loaded;
     if (!in || !read_profile(in, loaded)) return ProfileLoad::Invalid;

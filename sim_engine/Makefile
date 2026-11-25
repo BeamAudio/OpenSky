@@ -43,6 +43,10 @@ CSRCS := third_party/miniz_tinfl.c
 THIRDPARTY_CPP := third_party/bc7enc.cpp
 OBJS := $(SRCS:.cpp=.o) $(THIRDPARTY_CPP:.cpp=.o) $(CSRCS:.c=.o)
 TARGET := nspain_sim
+DEPS := $(OBJS:.o=.d)
+
+.DEFAULT_GOAL := all
+-include $(DEPS)
 
 all: $(TARGET)
 
@@ -60,20 +64,20 @@ $(JSBSIM_SONAME): $(JSBSIM_INPUTS)
 $(JSBSIM_LIB): $(JSBSIM_SONAME)
 	ln -sfn $(notdir $(JSBSIM_SONAME)) $@
 
-src/%.o: src/%.cpp $(wildcard src/*.hpp) $(wildcard src/*.h) ../engine/src/flight_model_jsb.hpp ../engine/src/c172_systems.hpp
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+src/%.o: src/%.cpp
+	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
 
 third_party/%.o: third_party/%.cpp
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
 
-../engine/src/%.o: ../engine/src/%.cpp $(wildcard ../engine/src/*.hpp)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+../engine/src/%.o: ../engine/src/%.cpp
+	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
 
 third_party/%.o: third_party/%.c
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
 clean:
-	rm -f $(TARGET) $(JSBSIM_LIB) $(JSBSIM_SONAME) src/*.o third_party/*.o ../engine/src/*.o
+	rm -f $(TARGET) $(JSBSIM_LIB) $(JSBSIM_SONAME) $(OBJS) $(DEPS)
 
 .build/test_flight_and_systems: ../engine/tests/test_flight_and_systems.cpp ../engine/src/flight_model_jsb.cpp ../engine/src/c172_systems.cpp $(JSBSIM_SONAME) $(JSBSIM_LIB)
 	mkdir -p .build

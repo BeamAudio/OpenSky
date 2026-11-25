@@ -468,7 +468,7 @@ int main(int argc, char **argv) {
     if (!sky_clouds.init(root + "/sim_engine/shaders", output_w, output_h, quality,
                          graphics_settings.pixel_percent, graphics_settings.aa_mode)) return 1;
     profiler.startup_stage("sky_cloud_resources");
-    if (!reg_atmo.init(&pack, true, "", autotest_dir.empty() && topdown_dir.empty() && airport_qa_dir.empty() && !quick_profile)) return 1;
+    if (!reg_atmo.init(&pack, true, "", interactive_run)) return 1;
     if (weather_arg != "auto") {
         reg_atmo.set_manual_weather_override(true);
         if (weather_arg == "thermal" || weather_arg == "clear") {
@@ -508,9 +508,13 @@ int main(int argc, char **argv) {
     if (!ac_hud.init(&pack, root + "/game/assets", root + "/game/aircraft/c172s", root + "/sim_engine/shaders")) return 1;
     ac_hud.set_graphics_settings(graphics_settings);
     profiler.startup_stage("aircraft_resources");
-    const bool interactive = autotest_dir.empty() && topdown_dir.empty() && airport_qa_dir.empty() && !quick_profile;
+    const bool interactive = interactive_run;
     audio.init(interactive && !no_audio);
-    if ((interactive || !airport_qa_dir.empty()) && !frontend.init(pack, root + "/sim_engine/shaders", root + "/game/assets")) return 1;
+    // An empty path gives scripted runs an in-memory profile with no read/write access.
+    const auto profile_file = interactive
+        ? graphics_settings_path().parent_path() / "fleet.ini" : std::filesystem::path{};
+    if ((interactive || !airport_qa_dir.empty()) &&
+        !frontend.init(pack, root + "/sim_engine/shaders", root + "/game/assets", profile_file)) return 1;
     auto show_loading = [&](const char *title, const char *stage, float progress01) {
         if (!interactive) return;
         frontend.draw_loading_screen(ac_hud, win.width(), win.height(), title, stage, progress01);

@@ -88,9 +88,6 @@ struct GlobeProjection {
     }
 };
 
-std::filesystem::path profile_path() {
-    return graphics_settings_path().parent_path() / "fleet.ini";
-}
 } // namespace
 
 GameFrontend::~GameFrontend() {
@@ -104,7 +101,9 @@ GameFrontend::~GameFrontend() {
     if (backdrop_) glDeleteProgram(backdrop_);
 }
 
-bool GameFrontend::init(const PackReader &pack, const std::string &shader_root, const std::string &asset_root) {
+bool GameFrontend::init(const PackReader &pack, const std::string &shader_root, const std::string &asset_root,
+                        std::filesystem::path profile_file) {
+    profile_file_ = std::move(profile_file);
     pack_ = &pack;
     backdrop_ = compile_program_files(shader_root + "/fullscreen.vert", shader_root + "/frontend.frag");
     if (!backdrop_) return false;
@@ -177,7 +176,8 @@ bool GameFrontend::init(const PackReader &pack, const std::string &shader_root, 
 }
 
 void GameFrontend::load_profile() {
-    std::ifstream in(profile_path());
+    if (profile_file_.empty()) return;
+    std::ifstream in(profile_file_);
     int version = 0;
     if (!(in >> version) || (version != 1 && version != 2)) return;
 
@@ -270,7 +270,8 @@ void GameFrontend::load_profile() {
 }
 
 void GameFrontend::save_profile() const {
-    const auto path = profile_path();
+    if (profile_file_.empty()) return;
+    const auto &path = profile_file_;
     std::error_code ec;
     std::filesystem::create_directories(path.parent_path(), ec);
     if (ec) return;

@@ -8,6 +8,7 @@
 #include "regional_atmosphere.hpp"
 
 #include <cstdint>
+#include <filesystem>
 #include <future>
 #include <optional>
 #include <string>
@@ -34,7 +35,8 @@ public:
     enum class Request { None, Walk, Board, Park, Editor, Quit };
 
     ~GameFrontend();
-    bool init(const PackReader &pack, const std::string &shader_root, const std::string &asset_root);
+    bool init(const PackReader &pack, const std::string &shader_root, const std::string &asset_root,
+              std::filesystem::path profile_file);
     void draw_menu(AircraftAndHud &aircraft, SkyAndClouds &sky, const PlatformWindow &win,
                    bool preparing_airfield, int &time_of_day,
                    RegionalAtmosphere *reg_atmo = nullptr, double sim_time_sec = 0.0);
@@ -82,6 +84,7 @@ private:
     void draw_settings(AircraftAndHud &aircraft, int &time_of_day, RegionalAtmosphere *reg_atmo);
     void draw_controls(AircraftAndHud &aircraft);
     void load_profile();
+    std::filesystem::path profile_file_;
     void focus_airport(const AirportInfo &airport, float zoom);
     void add_point(RoutePoint point);
     float distance_to_plane() const;

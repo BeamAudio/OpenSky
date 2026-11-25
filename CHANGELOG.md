@@ -8,7 +8,7 @@ This file records user-visible changes. No GitHub release version has been assig
 - Added aircraft discovery with `--list-aircraft`, selection with `--aircraft <id>`, and fleet profile v4 persistence while retaining v1-v3 readers.
 - Generalized the shared light-piston systems class while preserving the factory C172S profile and saves.
 - Updated the start menu, aircraft card, and Credits page for package-based aircraft and open-source attribution.
-- Prepared a Debian/Ubuntu desktop package with the Aragón world, app-menu icon, portable CPU flags, and per-user region/cache paths.
+- Prepared Debian/Ubuntu desktop and region packages for Aragón and both Catalonia regions, with an app-menu icon, portable CPU flags, and per-user mod/cache paths.
 - Added modding and contribution guides and a commercial release readiness review. Removed the obsolete delivery plan.
 
 ### Current limitations

@@ -6,7 +6,7 @@ The product target is 1920×1080 output at 60 FPS on integrated graphics, with t
 
 ## Install and launch the game
 
-The player release target for Debian/Ubuntu is an installable `opensky-vfr_<version>_amd64.deb`. Install it with the graphical Software app or `sudo apt install ./opensky-vfr_<version>_amd64.deb`, then launch **OpenSky VFR** from the Games menu. It includes the game, the Aragón region, and its desktop icon; players do not compile the source or start the game from a script. The package recipe is in `tools/package_deb.py`; a downloadable `.deb` is not published yet because the asset and data rights listed in [release readiness](docs/RELEASE_READINESS.md) still need to be cleared. Windows 11 is not supported yet.
+The Debian/Ubuntu release is packaged as `opensky-vfr_<version>_amd64.deb` (the app and Aragón) plus `opensky-vfr-catalonia_<version>_all.deb` (Catalonia Coast and Pyrenees). Install both with the graphical Software app, or run `sudo apt install ./opensky-vfr_<version>_amd64.deb ./opensky-vfr-catalonia_<version>_all.deb`, then launch **OpenSky VFR** from the Games menu. Players do not compile the source or start the game from a script. The package recipe is in `tools/package_deb.py`; these downloads are not published yet because the asset and data rights listed in [release readiness](docs/RELEASE_READINESS.md) still need to be cleared. Windows 11 is not supported yet.
 
 Add-on regions can be installed in `~/.local/share/opensky-vfr/packs/`. Saves and aircraft packages stay in the user's config folder; downloaded imagery stays in the user's cache folder.
 

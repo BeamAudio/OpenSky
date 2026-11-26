@@ -182,6 +182,8 @@ private:
     struct WeatherFlowTrace {
         double east_m = 0.0, north_m = 0.0;
         int level = 0;
+        float life_s = 0.0f;
+        float max_life_s = 48.0f;
         std::vector<Vec3> points;
     };
 

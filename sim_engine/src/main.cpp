@@ -2079,7 +2079,8 @@ int main(int argc, char **argv) {
                 reg_atmo.set_grid_detail(graphics_settings.weather_grid_detail, lat, lon);
 
                 FlightSimState &state = ac_hud.state();
-                ac_hud.reset_flight(lat, lon, ground + 6500.0, 0.0, 0.0, false);
+                const double cam_agl_m = graphics_settings.weather_grid_detail > 0 ? 6500.0 : 12800.0;
+                ac_hud.reset_flight(lat, lon, ground + cam_agl_m, 0.0, 0.0, false);
                 state.paused = true;
                 state.slew_fast = false;
                 state.view_mode = 2;

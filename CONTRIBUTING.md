@@ -13,6 +13,8 @@ Thanks for helping improve OpenSky VFR. Read [the modding guide](docs/MODDING.md
 
 ## Build
 
+See [Installation](README.md#installation) for required build tools, X11/OpenGL/ALSA libraries, and Python scenery-builder dependencies, then run from the repository root:
+
 ```bash
 make -C sim_engine -j"$(nproc)"
 ./run_sim.sh

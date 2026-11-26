@@ -9,7 +9,7 @@ The game is built around unhurried exploration rather than missions or ownership
 - **Supported development runtime:** C++20, OpenGL 4.6, Linux/X11/GLX.
 - **Aircraft simulation:** upstream JSBSim, dynamically linked under LGPL; the game advances it at 120 Hz independently of rendering.
 - **Release scenery baseline:** Aragón and Catalunya are included together in the standard game.
-- **Windows 11:** a supported build and installer are not available yet.
+- **Windows 10 / 11:** no native `.exe` or Windows installer is available yet; Windows users can run the Linux build through **WSL2 (Ubuntu + WSLg)** (see [Windows 10 / 11 (via WSL2)](#windows-10--11-via-wsl2)).
 - **Open-source release:** see the [release checklist](docs/OPEN_SOURCE_RELEASE.md) and [third-party notices](THIRD_PARTY_LICENSES.md).
 
 ## Screenshots
@@ -58,16 +58,69 @@ The following 20-second vertical clips each cover six simulated minutes at 24 fp
 
 Scenery imagery in these captures: © Instituto Geográfico Nacional de España (IGN), [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/); PNOA imagery has been cropped and rendered in the simulator. Source: [IGN Spain PNOA](https://pnoa.ign.es/pnoa-imagen/visualizadores-y-servicios-web). City and building data © [OpenStreetMap contributors](https://www.openstreetmap.org/copyright), ODbL 1.0.
 
-## Getting started
+## Installation
 
-There is no packaged desktop release yet. Contributors can build the Linux development version from source:
+There is no prebuilt desktop installer or GitHub release archive yet. Build OpenSky and install regional scenery from the repository using the steps below.
 
-```bash
-make -C sim_engine -j"$(nproc)"
-./run_sim.sh
-```
+### Linux (Ubuntu / Debian)
 
-The build needs a C++20 compiler, CMake, OpenGL development files, X11 development files, and the system dependencies listed in [contributing](CONTRIBUTING.md). Run from the repository root. The source checkout does not contain generated scenery packs; region data is built or installed separately.
+1. **Install build, runtime, and scenery-builder dependencies:**
+
+   ```bash
+   sudo apt update && sudo apt install -y \
+     build-essential cmake git libx11-dev libgl-dev libxrandr2 \
+     libasound2-dev libasound2-plugins curl \
+     python3 python3-venv python3-tk \
+     python3-numpy python3-pil python3-scipy python3-requests python3-pyosmium
+   ```
+
+   > On other Linux distributions (Fedora, Arch, etc.), install a C++20 compiler (`g++`), `make`, `cmake`, `git`, X11 and OpenGL 4.6 development headers, `libXrandr`, ALSA runtime libraries (`alsa-lib`), `curl`, and Python 3 (with `tk`, plus `pip install numpy pillow scipy requests osmium` inside a virtual environment).
+
+2. **Clone and build OpenSky:**
+
+   ```bash
+   git clone https://github.com/BeamAudio/OpenSky.git
+   cd OpenSky
+   make -C sim_engine -j"$(nproc)"
+   ```
+
+   Use `CMAKE=/path/to/cmake` if CMake is outside `PATH`. Building compiles the bundled JSBSim library (`game/bin/libJSBSim.so.1`) and `sim_engine/nspain_sim`.
+
+3. **Install regional scenery packs:**
+
+   The git checkout does not ship prebuilt `.nspack` scenery files. Download and bake the Aragón and Catalunya regions into `packs/`:
+
+   ```bash
+   ./install_region.sh zaragoza-pyrenees-quick catalonia-pyrenees catalonia-coast
+   ```
+
+   Use `./install_region.sh presets` to list all Spanish presets and quality tiers, or `./run_builder.sh` for the graphical World Editor. Shared `.nspack` packs and their companion files can also be placed in `~/.local/share/opensky-vfr/packs/`.
+
+4. **Launch OpenSky:**
+
+   ```bash
+   ./run_sim.sh
+   ```
+
+### Windows 10 / 11 (via WSL2)
+
+There is no native Windows `.exe` or installer yet (OpenSky uses Linux X11/GLX, ALSA audio, and Linux `evdev` for USB yokes). On **Windows 10 (build 19044+)** or **Windows 11**, you can run the Linux build through **WSL2** with **WSLg** graphics:
+
+1. Install or update your Windows **GPU drivers** (AMD, NVIDIA, or Intel) so WSLg provides hardware-accelerated OpenGL.
+2. Open **PowerShell as Administrator** and install WSL2 with Ubuntu:
+
+   ```powershell
+   wsl --install -d Ubuntu-24.04
+   ```
+
+   Reboot if prompted, then open **Ubuntu** from the Start menu and create your Linux username and password.
+3. Inside the **Ubuntu** terminal, follow steps 1–4 of **Linux (Ubuntu / Debian)** above (`sudo apt update ...`, `git clone ...`, `make -C sim_engine -j"$(nproc)"`, `./install_region.sh ...`, and `./run_sim.sh`).
+
+**WSL2 caveats:**
+- **OpenGL 4.6 required:** if your GPU driver / WSLg Mesa version exposes an older OpenGL version or software rendering (`llvmpipe`), startup may fail or performance may be low (check inside Ubuntu with `glxinfo -B | grep "OpenGL"`, from `sudo apt install mesa-utils`).
+- **USB flight yokes and pedals:** Windows does not forward USB HID devices to Linux `/dev/input/event*` automatically. Keyboard, mouse, and **Cursor Yoke (`Y`)** work out of the box; plug-and-play USB yoke support currently targets native Linux.
+
+### First flight
 
 On a new save the aircraft is based at Castejón de Sos. Open **World** to explore installed airports and landmarks. Select an airfield or landmark and add route points if you want a plan. Choose **Walk to aircraft** to inspect and board at the saved stand. After landing, taxi clear of the runway, shut down, and use **Esc → Park** to save a temporary base.
 

@@ -42,10 +42,9 @@ The worker writes private solve buffers. Consumers read a published snapshot tha
 ## Player-facing weather
 
 - **Airport briefing:** samples the active model at the selected airport and reports local wind, temperature, pressure, cloud and precipitation when that point is covered.
-- **Map overlay:** visualizes the current field on the World map. Layer values are interpolated from the active model grid.
-- **History:** displays previously published states and their source/region/time. It must not imply that an un-solved boundary fetch was a past regional solve.
-- **Outlook:** runs a separate model projection at +1, +3 and +5 simulation minutes with its current boundary inputs held fixed. The outlook is a short in-game projection, not a remote forecast.
-- **Coverage:** an airport outside the model domain is labelled as uncovered. Do not silently extrapolate a precise briefing beyond the active domain.
+- **Map flowmap overlay:** renders animated, zoom-adaptive GPU wind streamlines, cloud cover, and precipitation across all installed `.nswx` regions with dividing-streamline terrain flow deflection.
+- **History & outlook:** displays previously published states and +1/+3/+5 min projections under fixed boundary inputs.
+- **Coverage:** an airport outside the active regional model domain is labelled as uncovered (`Airfield is outside the active regional model grid.`). Do not silently extrapolate a precise briefing beyond the active domain.
 
 When live conditions are not available, UI labels identify the baked, manual or default source. Attribution and provider terms are in [third-party licenses](../THIRD_PARTY_LICENSES.md).
 

@@ -5,6 +5,7 @@
 
 #include "../../engine/src/c172_systems.hpp"
 #include "../../engine/src/opentrack_udp.hpp"
+#include "../../engine/src/flight_yoke.hpp"
 #include "../../engine/src/flight_model_jsb.hpp"
 #include "async_streamer.hpp"
 #include "cdlod_terrain.hpp"
@@ -141,6 +142,11 @@ public:
     const nspain::FlightState &jsb_state() const { return fdm_.state(); }
     const GraphicsSettings &graphics_settings() const { return graphics_settings_; }
     void set_graphics_settings(const GraphicsSettings &settings) { graphics_settings_ = settings; }
+    void poll_yoke();
+    void calibrate_yoke() { yoke_.calibrate_center(); }
+    void reset_yoke_calibration() { yoke_.reset_calibration(); }
+    void rescan_yokes() { yoke_.rescan(); }
+    const nspain::YokeState &yoke_state() const { return yoke_.state(); }
     void render_parked_aircraft(const Mat4 &vp, Vec3 offset, float heading,
                                const AtmosphereState &atmo, GLuint reflection, GLuint lut = 0);
     void start_owned_flight(double lat, double lon, double alt, double heading,
@@ -201,6 +207,11 @@ private:
     double departure_lat_ = 0, departure_lon_ = 0, departure_heading_ = 0;
     nspain::PistonAircraftSystems systems_;
     nspain::OpenTrackUDP opentrack_;
+    nspain::FlightYokeInput yoke_;
+    bool throttle_hw_active_ = false;
+    double throttle_hw_last_ = -1.0;
+    bool mixture_hw_active_ = false;
+    double mixture_hw_last_ = -1.0;
     LocalAirSample last_air_{};
     FlightSimState st_{};
     float prop_angle_rad_ = 0.0f;
@@ -259,6 +270,7 @@ private:
     GLint u_hud_scr_ = -1;
     GLuint hud_vao_ = 0;
     GLuint hud_vbo_ = 0;
+    size_t hud_vbo_cap_ = 0;
     std::vector<HudVert> hud_verts_;
     std::vector<WeatherFlowTrace> weather_flow_traces_;
     double weather_flow_last_time_s_ = -1.0;

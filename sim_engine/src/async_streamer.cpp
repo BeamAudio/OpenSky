@@ -377,10 +377,11 @@ void AsyncTerrainStreamer::worker_loop() {
             continue;
         }
         staging_[free_slot].state.store(StageState::READY, std::memory_order_release);
-        // Never stall visible nearby terrain (best_prio >= 1400); only pace far background work when hot.
+        // Never stall visible terrain unless package nears 80C; always pace far background work when warm.
         int tms = thermal_sleep_ms_.load(std::memory_order_relaxed);
-        if (tms > 0 && !is_next_job && best_prio < 1400.0f && !sync_flushing_.load(std::memory_order_relaxed)) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(tms));
+        if (tms > 0 && !sync_flushing_.load(std::memory_order_relaxed)) {
+            if (!is_next_job && best_prio < 1400.0f) std::this_thread::sleep_for(std::chrono::milliseconds(tms));
+            else if (tms >= 24) std::this_thread::sleep_for(std::chrono::milliseconds(4));
         }
     }
 }

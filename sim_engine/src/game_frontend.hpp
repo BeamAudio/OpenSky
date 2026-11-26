@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -92,12 +93,22 @@ private:
     bool contains(PixelRect area) const;
     void label(AircraftAndHud &ui, float x, float y, float size, const char *text, bool muted = false);
     void panel(AircraftAndHud &ui, PixelRect area);
+    struct RegionWeatherPreview {
+        int layer = -1;
+        double lon_min = 0, lat_min = 0, lon_max = 0, lat_max = 0;
+        std::unique_ptr<WeatherLibrary> lib;
+        bool terrain_ready = false;
+        std::vector<float> slope_e, slope_n, ridge, basin;
+    };
+    void sync_region_weather_previews(const RegionalAtmosphere *reg_atmo);
     void draw_globe(const RegionalAtmosphere *reg_atmo, double sim_time_sec);
 
     const PackReader *pack_ = nullptr;
-    GLuint backdrop_ = 0, land_ = 0, bounds_ = 0, vao_ = 0, font_ = 0, relief_ = 0;
+    GLuint backdrop_ = 0, land_ = 0, bounds_ = 0, vao_ = 0, font_ = 0, relief_ = 0, region_wx_ = 0;
     GLint globe_uniform_ = -1, region_count_uniform_ = -1, aspect_uniform_ = -1;
-    GLint wx_geo_uniform_ = -1, wx_overlay_uniform_ = -1, wx_time_uniform_ = -1;
+    GLint wx_geo_uniform_ = -1, wx_overlay_uniform_ = -1, wx_time_uniform_ = -1, wx_base_cloud_uniform_ = -1;
+    std::vector<RegionWeatherPreview> region_wx_previews_;
+    int wx_preview_state_key_ = -1;
     int region_count_ = 0;
     Page page_ = Page::World;
     Request request_ = Request::None;

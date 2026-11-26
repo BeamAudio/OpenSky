@@ -20,6 +20,42 @@
 
 namespace nsim {
 
+// Smooth dividing-streamline terrain deflection shared by the 3D solver and World map previews:
+// blocks cross-slope flow, splits around peaks, channels along valleys, and adds lee wake & slope breezes.
+// h_fac = exp(-agl_m / 1350.0f) is hoisted per vertical layer to avoid per-cell exp() overhead.
+inline void orographic_deflect_wind(float u0, float v0, float ge, float gn,
+                                    float ridge, float basin, float h_fac, float solar,
+                                    float &out_u, float &out_v) {
+    const float s2 = ge * ge + gn * gn;
+    float u = u0, v = v0;
+    if (s2 > 3.6e-5f && h_fac > 0.04f) {
+        const float s = std::sqrt(s2);
+        const float inv_s = 1.0f / s;
+        const float nx = ge * inv_s, ny = gn * inv_s; // upslope normal
+        const float tx = -ny, ty = nx;                // contour tangent
+        const float un = u0 * nx + v0 * ny;
+        const float ut = u0 * tx + v0 * ty;
+        const float spd = std::sqrt(u0 * u0 + v0 * v0);
+        const float t_s = std::clamp((s - 0.006f) / 0.085f, 0.0f, 1.0f);
+        const float beta = (t_s * t_s * (3.0f - 2.0f * t_s)) * h_fac;
+        const float un_blocked = un * (1.0f - 0.90f * beta);
+        const float eps = 0.14f * spd + 0.28f;
+        const float smooth_sign = ut / std::sqrt(ut * ut + eps * eps);
+        const float ut_deflected = ut * (1.0f + 0.42f * beta) + smooth_sign * (0.95f * beta * std::abs(un));
+        const float lee = (un < 0.0f) ? (beta * std::clamp(-un / (spd + 1.0f), 0.0f, 1.0f)) : 0.0f;
+        u = nx * un_blocked + tx * ut_deflected;
+        v = ny * un_blocked + ty * ut_deflected;
+        u = u * (1.0f - 0.34f * lee) + tx * (0.46f * lee * spd);
+        v = v * (1.0f - 0.34f * lee) + ty * (0.46f * lee * spd);
+        const float slope_drv = (solar - 0.22f) * 2.8f * beta;
+        u += nx * slope_drv;
+        v += ny * slope_drv;
+    }
+    const float gain = 1.0f + (0.26f * ridge + 0.22f * basin) * h_fac;
+    out_u = std::clamp(u * gain, -60.0f, 60.0f);
+    out_v = std::clamp(v * gain, -60.0f, 60.0f);
+}
+
 enum class WindRegime : int {
     PYRENEAN_THERMAL = 0, // Sunny anabatic up-valley breeze + cliff thermals
     CIERZO_NW        = 1, // Iconic Aragon NW Ebro Valley Venturi jet + Santa Cilia lee waves
@@ -184,6 +220,7 @@ public:
         return last > 0 ? std::max<int64_t>(0, static_cast<int64_t>(std::time(nullptr)) - last) : -1;
     }
     void set_solver_seed(uint32_t seed, bool synchronous = false) { solver_seed_ = seed; synchronous_solver_ = synchronous; }
+    void set_thermal_sleep_ms(int ms) { thermal_sleep_ms_.store(std::clamp(ms, 0, 120), std::memory_order_relaxed); }
     void request_outlook();
     void cancel_outlook();
     WeatherOutlook outlook() const;
@@ -203,6 +240,7 @@ public:
                              double sim_time_sec, float wx_advance01 = 0.28f,
                              double dt_sec = 0.0, double heading_deg = 0.0, double tas_mps = 50.0) const;
     WeatherDebugSlice debug_slice(double east_m, double north_m, int level, int sample_stride = 3) const;
+    WeatherDebugCell debug_sample(double east_m, double north_m, int level) const;
     WeatherWorkStats work_stats() const;
 
     GLuint field_tex() const { return field_tex_; }
@@ -245,6 +283,7 @@ private:
         bool suppress_dynamic_advance_ = false;
         std::vector<SimWeatherCell> weather_grid_, weather_next_;
         std::vector<float> weather_rain_flux_, terrain_height_, terrain_slope_e_, terrain_slope_n_;
+        std::vector<float> flow_slope_e_, flow_slope_n_;
         std::vector<float> terrain_ridge_exposure_, terrain_valley_basin_, weather_worker_climate_field_;
         WeatherSnapshot weather_worker_active_{}, synoptic_weather_{};
         double min_e_ = 0, min_n_ = 0, span_e_ = 1, span_n_ = 1;
@@ -266,11 +305,12 @@ private:
     struct WeatherPublication {
         int grid_w = GRID_W, grid_h = GRID_H;
         std::vector<SimWeatherCell> grid;
-        std::vector<float> field;
+        std::vector<uint16_t> field;
         std::vector<float> terrain;
         int local_grid_w = 0, local_grid_h = 0;
         std::vector<SimWeatherCell> local_grid;
-        std::vector<float> local_field, local_terrain;
+        std::vector<uint16_t> local_field;
+        std::vector<float> local_terrain;
         std::vector<float> local_ridge_exposure, local_valley_basin;
         std::array<DynamicCell, 6> cells{};
         int cell_count = 0;
@@ -278,6 +318,7 @@ private:
         WeatherSource source = WeatherSource::Default;
         WindRegime regime = WindRegime::PYRENEAN_THERMAL;
         uint64_t generation = 0;
+        uint64_t local_terrain_generation = 0;
         double solved_time = 0;
         double anchor_lat = 0, anchor_lon = 0, metres_lat = 1, metres_lon = 1;
         double min_e = 0, min_n = 0, span_e = 1, span_n = 1;
@@ -295,9 +336,10 @@ private:
     void allocate_weather_textures();
     void allocate_local_weather_textures();
     void initialize_local_weather_model();
-    void update_local_refinement_climate();
+    void refresh_local_refinement_climate();
+    void sync_local_refinement_boundary();
     void advance_weather_with_refinement(float dt, const Vec3 &sun, const WeatherSnapshot &forcing);
-    void build_weather_texture_field(const WeatherSolver &solver, std::vector<float> &out) const;
+    void build_weather_texture_field(const WeatherSolver &solver, std::vector<uint16_t> &out) const;
     void live_weather_worker();
     void initialize_weather_model();
     void weather_worker_loop();
@@ -352,8 +394,10 @@ private:
     WeatherPublication frame_weather_, pending_weather_, staging_weather_;
     mutable std::mutex weather_publish_mtx_;
     uint64_t weather_generation_ = 0;
+    uint64_t local_terrain_generation_ = 0;
     uint64_t uploaded_weather_generation_ = 0;
     uint64_t uploaded_local_weather_generation_ = 0;
+    uint64_t uploaded_local_terrain_generation_ = 0;
     uint64_t field_uploads_ = 0;
     std::atomic<uint64_t> weather_steps_{0}, weather_solve_us_{0}, weather_publish_us_{0};
     std::optional<uint32_t> solver_seed_;
@@ -371,6 +415,7 @@ private:
     mutable std::mutex weather_job_mtx_;
     std::condition_variable weather_job_cv_;
     std::atomic<bool> weather_worker_stop_{false};
+    std::atomic<int> thermal_sleep_ms_{0};
     int weather_pending_steps_ = 0;
     bool weather_pending_climate_ = false;
     std::vector<float> weather_pending_climate_field_;

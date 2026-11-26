@@ -96,6 +96,8 @@ Change the paired Python and C++ format implementations together. Preserve the r
 | `engine/src/c172_systems.cpp` | Fuel, battery, starter, oil, icing, wear and power-state behavior. |
 | `engine/src/flight_model_jsb.hpp` | Flight model, environment, control and engine interfaces. |
 | `engine/src/flight_model_jsb.cpp` | JSBSim package loading, fixed-step integration, control transfer and ground callback. |
+| `engine/src/flight_yoke.hpp` | Linux `evdev` multi-device USB flight yoke, pedal, and throttle calibration interfaces. |
+| `engine/src/flight_yoke.cpp` | Plug-and-play USB yoke/pedal/throttle scanning, role mapping, tare calibration, and selftests. |
 | `engine/src/geo_math.hpp` | WGS84, local-distance and geodetic helper functions. |
 | `engine/src/opentrack_udp.hpp` | OpenTrack UDP input interface. |
 | `engine/src/opentrack_udp.cpp` | Head-pose UDP listener and state conversion. |

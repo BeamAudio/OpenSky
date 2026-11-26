@@ -92,10 +92,90 @@ vec3 perturb_normal(vec3 N, vec3 pos, vec2 uv, vec3 map_n, float strength) {
     return normalize(TBN * tn);
 }
 
-vec4 sample_rain_lut(vec2 uv, float weather_z, bool front_glass) {
-    vec3 coord = vec3(uv, weather_z);
-    return front_glass ? texture(u_windscreen_rain_front, coord)
-                       : texture(u_windscreen_rain_side, coord);
+float rain_hash11(float p) {
+    p = fract(p * 0.1031);
+    p *= p + 33.33;
+    p *= p + p;
+    return fract(p);
+}
+vec3 rain_hash32(vec2 p) {
+    vec3 p3 = fract(vec3(p.xyx) * vec3(0.1031, 0.1030, 0.0973));
+    p3 += dot(p3, p3.yxz + 33.33);
+    return fract((p3.xxy + p3.yzz) * p3.zyx);
+}
+
+// Analytical pinned micro-beads that appear, bead up, and clear organically (zero wallpaper scrolling).
+// Returns xy = dome normal, z = bead mask, w = dome height.
+vec4 rain_static_beads(vec2 uv, float scale, float t, float dens) {
+    vec2 st = uv * scale;
+    vec2 id = floor(st);
+    vec2 gv = fract(st) - 0.5;
+    vec3 h = rain_hash32(id);
+    if (h.x > dens) return vec4(0.0);
+    float cycle = fract(t * (0.032 + 0.055 * h.z) + h.y * 11.37);
+    float life = smoothstep(0.0, 0.09, cycle) * smoothstep(1.0, 0.74, cycle);
+    if (life < 0.01) return vec4(0.0);
+    vec2 jitter = (h.xy - 0.5) * 0.56;
+    vec2 dvec = gv - jitter;
+    float r = mix(0.085, 0.185, h.z * h.z) * (0.55 + 0.45 * life);
+    float dist = length(dvec);
+    float aa = max(0.014, fwidth(dist) * 1.25);
+    float m = smoothstep(r + aa, r - aa, dist) * life;
+    if (m < 0.005) return vec4(0.0);
+    vec2 nrm = clamp(dvec / max(r, 1e-4), vec2(-1.0), vec2(1.0));
+    float h_dome = sqrt(max(0.0, 1.0 - dot(nrm, nrm)));
+    return vec4(nrm * m, m, h_dome * m);
+}
+
+// Analytical meandering stick-slip rivulet layer with Rayleigh-Plateau beaded wake trail.
+// Flow always runs toward +uv.y inside this helper. Returns xy = normal, z = mask, w = cleared film wake.
+vec4 rain_rivulet_layer(vec2 uv, float scale, float t, float dens, float stretch) {
+    const vec2 aspect = vec2(2.15, 1.0);
+    vec2 st = uv * scale * aspect;
+    st.y -= t * 0.28;
+    vec2 id = floor(st);
+    float col_shift = rain_hash11(id.x * 19.37 + scale);
+    st.y += col_shift;
+    id = floor(st);
+    vec2 gv = fract(st) - 0.5;
+    vec3 h = rain_hash32(id + vec2(scale * 3.1, 0.0));
+    if (h.x > dens) return vec4(0.0);
+
+    // Organic acrylic wiggle along the flow axis.
+    float w = (uv.y * scale + col_shift) * 3.1 + h.y * 6.2831;
+    float x = (h.z - 0.5) * 0.58;
+    x += (0.42 - abs(x)) * sin(3.0 * w) * pow(sin(w), 6.0) * 0.44;
+
+    // Stick-slip motion: drops pause, tremble, then surge forward instead of scrolling uniformly.
+    float ti = t * (0.68 + 0.52 * h.y) + h.x * 6.2831;
+    float y = -sin(ti + sin(ti + sin(ti) * 0.5)) * 0.37;
+    y -= (gv.x - x) * (gv.x - x) * 0.30;
+
+    // Leading drop head (slightly elongated along slipstream at cruise speed).
+    vec2 head_d = (gv - vec2(x, y)) / aspect;
+    head_d.y /= stretch;
+    float r_head = mix(0.024, 0.041, h.y);
+    float d_head = length(head_d);
+    float aa = max(0.005, fwidth(d_head) * 1.25);
+    float m_head = smoothstep(r_head + aa, r_head - aa, d_head);
+    vec2 n_head = clamp(head_d / max(r_head, 1e-4), vec2(-1.0), vec2(1.0)) * m_head;
+
+    // Beaded micro-droplet trail left behind the sliding head (only upstream of y).
+    float behind = smoothstep(y, y - 0.05, gv.y) * smoothstep(-0.49, y - 0.06, gv.y);
+    float trail_sub = (fract(gv.y * 8.0 + h.z * 3.7) - 0.5) / 8.0;
+    vec2 trail_d = vec2(gv.x - x, trail_sub) / aspect;
+    float taper = clamp((gv.y + 0.5) / max(0.08, y + 0.5), 0.0, 1.0);
+    float r_trail = r_head * mix(0.24, 0.48, taper);
+    float d_trail = length(trail_d);
+    float m_trail = smoothstep(r_trail + aa, r_trail - aa, d_trail) * behind;
+    vec2 n_trail = clamp(trail_d / max(r_trail, 1e-4), vec2(-1.0), vec2(1.0)) * m_trail * 0.72;
+
+    // Wiped clear channel behind the moving head.
+    float wipe = behind * smoothstep(r_head * 1.35, r_head * 0.35, abs(gv.x - x) / aspect.x);
+
+    float m = max(m_head, m_trail);
+    vec2 nrm = mix(n_trail, n_head, m_head);
+    return vec4(nrm, m, wipe);
 }
 
 // Fast zero-trig tactile micro-grain for vinyl/leather & bead-blasted aluminum panel finish (~4 ALU ops!)
@@ -238,42 +318,53 @@ void main() {
         float sim_time = u_glass_weather.y;
         bool front_glass = (u_cabin_glass == 2);
 
-        // 1. Physically-simulated 4-layer fluid rain LUTs (real surface tension, organic beads & streaks,
-        //    ZERO grid popping or tadpole shapes!) shaded with TRUE optical HDR backdrop refraction!
+        // 1. Procedural optical water beads & meandering stick-slip rivulets (zero scrolling-LUT artifacts).
         vec2 drop_nrm = vec2(0.0);
         float drop_mask = 0.0;
         float drop_relief = 0.0;
+        float wipe_clear = 0.0;
         if (wet > 0.005) {
-            float rain_index = clamp(log2(1.0 + rain_mm * 0.75) / log2(1.0 + 42.0 * 0.75) * 3.0, 0.0, 3.0);
-            float rain_layer = (rain_index + 0.5) * 0.25;
-            // Two overlaid tiling scales of the fluid LUT eliminate visible repetition & give fine + coarse beads
-            vec2 uv_a = v_uv * (front_glass ? vec2(2.15, 1.55) : vec2(1.65, 1.55));
-            vec2 uv_b = v_uv * (front_glass ? vec2(3.40, 2.35) : vec2(2.60, 2.35)) + vec2(0.41, 0.27);
-            float spd_c = min(airspeed, 110.0);
+            float air01 = smoothstep(4.5, 24.0, airspeed);
+            float rain_dens = clamp(0.18 + 0.52 * wet + 0.30 * heavy_rain, 0.0, 0.96);
+            float stretch = mix(1.06, 1.65, air01);
+            vec2 flow_uv;
+            float slide_t;
+            float nrm_flip_y = 1.0;
+            bool rot_side = false;
             if (front_glass) {
-                // Air pushes droplets UP the curved windshield at cruise; gravity creeps them slowly down when parked
-                float v_up = sim_time * spd_c * 0.0042;
-                float v_dn = sim_time * 0.012;
-                uv_a.y = uv_a.y / (1.0 + spd_c * 0.0045) - mod(v_dn, 1.0) + mod(v_up, 1.0);
-                uv_b.y = uv_b.y / (1.0 + spd_c * 0.0030) - mod(v_dn * 0.7, 1.0) + mod(v_up * 0.68, 1.0);
+                // Propwash & slipstream fan droplets UP and slightly OUTWARD from the cowl in flight;
+                // gravity creeps drops slowly DOWNWARD when parked or taxiing.
+                float fan = (v_uv.x - 0.5) * 0.24 * air01;
+                flow_uv = vec2((v_uv.x - 0.5) * 1.68 - fan * (1.0 - v_uv.y), 1.0 - v_uv.y);
+                float slide_v = mix(-0.22, 0.42 + min(airspeed, 90.0) * 0.022, air01);
+                if (slide_v < 0.0) {
+                    flow_uv.y = -flow_uv.y;
+                    nrm_flip_y = -1.0;
+                }
+                slide_t = sim_time * abs(slide_v);
             } else {
-                // Side windows: airflow sweeps droplets AFT (towards tail = +u_x in UV, so subtract from sample UV.x)
-                float v_aft = sim_time * spd_c * 0.0055;
-                float v_dn = sim_time * 0.014;
-                uv_a.x = uv_a.x / (1.0 + spd_c * 0.0040) - mod(v_aft, 1.0);
-                uv_a.y -= mod(v_dn, 1.0);
-                uv_b.x = uv_b.x / (1.0 + spd_c * 0.0028) - mod(v_aft * 0.65, 1.0);
-                uv_b.y -= mod(v_dn * 0.75, 1.0);
+                // Side windows: slipstream sweeps droplets AFT (+v_uv.x) with slight gravity droop at low speed.
+                float droop = mix(0.58, 0.06, air01);
+                flow_uv = vec2((v_uv.y - 0.5) - v_uv.x * droop, v_uv.x * 1.32 + v_uv.y * (1.0 - air01) * 0.42);
+                slide_t = sim_time * mix(0.20, 0.46 + min(airspeed, 90.0) * 0.024, air01);
+                rot_side = true;
             }
-            vec4 da = sample_rain_lut(uv_a, rain_layer, front_glass);
-            vec4 db = sample_rain_lut(uv_b, max(0.125, rain_layer - 0.25), front_glass);
-            float ma = da.a * wet;
-            float mb = db.a * wet * (0.55 + 0.35 * heavy_rain);
-            vec2 na = (da.rg * 2.0 - 1.0) * ma;
-            vec2 nb = (db.rg * 2.0 - 1.0) * mb;
-            drop_mask = clamp(max(ma, mb * 0.85), 0.0, 1.0);
-            drop_relief = clamp(max(da.b * ma, db.b * mb), 0.0, 1.0);
-            drop_nrm = clamp(na + nb * (1.0 - ma * 0.65), vec2(-1.0), vec2(1.0));
+            vec4 st0 = rain_static_beads(flow_uv, front_glass ? 28.0 : 30.0, sim_time, rain_dens * 0.82);
+            vec4 st1 = rain_static_beads(flow_uv + vec2(0.37, 0.61), front_glass ? 50.0 : 52.0, sim_time * 1.25 + 3.1, rain_dens * 0.68);
+            vec4 rv0 = rain_rivulet_layer(flow_uv, front_glass ? 4.8 : 5.8, slide_t, rain_dens * 0.85, stretch);
+            vec4 rv1 = rain_rivulet_layer(flow_uv + vec2(0.43, 0.19), front_glass ? 8.2 : 9.6, slide_t * 1.18 + 2.3, rain_dens * 0.65, stretch * 0.92);
+
+            float m_st = max(st0.z, st1.z * 0.88);
+            vec2 n_st = mix(st1.xy * 0.82, st0.xy, st0.z);
+            float m_rv = max(rv0.z, rv1.z * 0.90);
+            vec2 n_rv = mix(rv1.xy * 0.88, rv0.xy, rv0.z);
+
+            drop_mask = clamp(max(m_rv, m_st * (1.0 - rv0.w * 0.65)), 0.0, 1.0) * wet;
+            vec2 n_flow = mix(n_st, n_rv, m_rv);
+            // Convert flow-aligned bead normal back to screen-aligned (right, up) optical normal.
+            drop_nrm = rot_side ? vec2(n_flow.y, -n_flow.x) : vec2(n_flow.x, n_flow.y * nrm_flip_y);
+            drop_relief = clamp(max(max(st0.w, st1.w * 0.75), m_rv * 0.95), 0.0, 1.0) * wet;
+            wipe_clear = clamp(max(rv0.w, rv1.w * 0.75), 0.0, 1.0);
         }
 
         // 2. Crystalline Frost / Rime Ice creeping inward from A-pillars & top frame, cleared by lower-center defroster!
@@ -305,40 +396,58 @@ void main() {
         float crack_mask = glass_crack_mask(v_uv, crack_raw, front_glass);
 
         float fresnel = pow(1.0 - max(0.0, dot(N, V)), 4.5);
-        float drop_alpha = smoothstep(0.04, 0.42, drop_mask);
+        float drop_alpha = smoothstep(0.02, 0.35, drop_mask);
+        float film_alpha = front_glass ? (heavy_rain * 0.16 * (1.0 - wipe_clear * 0.85)) : 0.0;
         float non_drop_alpha = fresnel * 0.055 + frost_mask * 0.80 + mist_mask + grime_mask + crack_mask * 0.72;
-        float glass_alpha = clamp(max(drop_alpha, non_drop_alpha), 0.0, 0.96);
+        float glass_alpha = clamp(max(max(drop_alpha, film_alpha), non_drop_alpha), 0.0, 0.96);
         if (glass_alpha < 0.012) { frag_color = vec4(0.0); return; }
 
         float daylight = smoothstep(-0.10, 0.16, u_sun_dir.y);
         vec3 glass_color;
-        if (u_native_output != 0 && drop_alpha > 0.02) {
+        if (u_native_output != 0 && (drop_alpha > 0.02 || film_alpha > 0.02)) {
             float slope_mag = clamp(length(drop_nrm), 0.0, 1.0);
-            float crest = pow(max(0.0, dot(normalize(drop_nrm + vec2(1e-4)), vec2(0.28, 0.96))), 5.0) * smoothstep(0.22, 0.82, slope_mag);
-            float edge_dark = smoothstep(0.58, 0.96, slope_mag) * 0.26;
+            float dome_z = sqrt(max(0.08, 1.0 - slope_mag * slope_mag * 0.86));
+            vec3 bead_n = normalize(vec3(drop_nrm * 0.92, dome_z));
+            float water_fresnel = (0.025 + 0.975 * pow(1.0 - dome_z, 4.0)) * drop_alpha;
+            float spec = pow(max(0.0, dot(bead_n, normalize(vec3(0.24, 0.62, 0.75)))), 36.0) * drop_alpha;
+            float sky_arc = pow(max(0.0, dot(bead_n, normalize(vec3(-0.15, 0.85, 0.50)))), 5.0) * smoothstep(0.35, 0.92, slope_mag) * drop_alpha;
+            float meniscus_dark = smoothstep(0.64, 0.96, slope_mag) * 0.34 * drop_alpha;
+            vec3 sky_refl = mix(vec3(0.22, 0.28, 0.36), mix(u_haze_cool, vec3(0.92, 0.96, 1.0), 0.45), daylight);
+            vec3 spec_col = mix(vec3(0.55, 0.65, 0.78), vec3(1.45, 1.48, 1.52), daylight);
             vec3 water_hdr;
             float out_drop_a;
             if (front_glass) {
-                // Front windshield: TRUE optical refraction of live linear HDR world+sky behind the glass!
+                // Front windshield: true optical HDR convex-lens refraction + subtle cleared wet-film softening.
                 vec2 screen_uv = gl_FragCoord.xy / vec2(textureSize(u_backdrop_tex, 0));
-                vec2 refr_uv = clamp(screen_uv - drop_nrm * vec2(0.022, 0.032) * (0.45 + 0.75 * drop_relief), vec2(0.002), vec2(0.998));
+                float edge_guard = smoothstep(0.0, 0.035, min(min(screen_uv.x, 1.0 - screen_uv.x), min(screen_uv.y, 1.0 - screen_uv.y)));
+                vec2 refr_uv = clamp(screen_uv - drop_nrm * vec2(0.030, 0.046) * (0.55 + 0.65 * drop_relief) * edge_guard,
+                                     vec2(0.002), vec2(0.998));
                 vec3 refr_hdr = textureLod(u_backdrop_tex, refr_uv, 0.0).rgb;
-                water_hdr = refr_hdr * (1.0 - edge_dark)
-                          + mix(vec3(0.45, 0.55, 0.68), vec3(1.10, 1.14, 1.18), daylight) * (crest * 0.48)
-                          + vec3(0.68, 0.84, 1.20) * (flash * (0.20 + crest * 0.85));
-                out_drop_a = drop_alpha;
+                if (film_alpha > 0.02 && drop_alpha < 0.85) {
+                    vec2 blur_r = vec2(0.0020, 0.0034) * edge_guard;
+                    vec3 film_hdr = 0.25 * (
+                        textureLod(u_backdrop_tex, clamp(screen_uv + vec2(blur_r.x, blur_r.y), vec2(0.002), vec2(0.998)), 0.0).rgb +
+                        textureLod(u_backdrop_tex, clamp(screen_uv + vec2(-blur_r.x, blur_r.y), vec2(0.002), vec2(0.998)), 0.0).rgb +
+                        textureLod(u_backdrop_tex, clamp(screen_uv + vec2(blur_r.x, -blur_r.y), vec2(0.002), vec2(0.998)), 0.0).rgb +
+                        textureLod(u_backdrop_tex, clamp(screen_uv + vec2(-blur_r.x, -blur_r.y), vec2(0.002), vec2(0.998)), 0.0).rgb);
+                    refr_hdr = mix(film_hdr, refr_hdr, drop_alpha);
+                }
+                water_hdr = refr_hdr * (1.0 - meniscus_dark)
+                          + sky_refl * (water_fresnel * 0.52 + sky_arc * 0.22)
+                          + spec_col * (spec * 0.85)
+                          + vec3(0.68, 0.84, 1.20) * (flash * (0.16 * drop_alpha + spec * 0.90));
+                out_drop_a = max(drop_alpha, film_alpha);
             } else {
-                // Side windows sit in front of the cockpit wing underside (not in u_backdrop_tex):
-                // use translucent optical rim + crisp sky reflection so drops blend naturally over BOTH wing & sky!
-                float dip = clamp(dot(drop_nrm, vec2(0.28, 0.92)), -1.0, 1.0);
-                vec3 rim_dark = vec3(0.05, 0.07, 0.10) * (0.35 + 0.65 * daylight);
-                vec3 rim_lit  = mix(u_haze_cool, vec3(0.96, 0.98, 1.0), 0.55) * (0.35 + 0.75 * daylight);
-                water_hdr = mix(rim_dark, rim_lit, dip * 0.5 + 0.5)
-                          + vec3(0.95, 0.98, 1.0) * (crest * 0.55)
-                          + vec3(0.68, 0.84, 1.20) * (flash * (0.18 + crest * 0.70));
-                out_drop_a = drop_alpha * clamp(0.14 + slope_mag * 0.24 + crest * 0.34, 0.0, 0.52);
+                // Side windows: crystal-clear bead centers with optical dark meniscus & crisp sky/sun Fresnel rim.
+                float rim_dark_a = smoothstep(0.60, 0.95, slope_mag) * 0.28 * drop_alpha;
+                float rim_lit_a = clamp(water_fresnel * 0.42 + sky_arc * 0.24 + spec * 0.72, 0.0, 0.62);
+                vec3 dark_col = vec3(0.02, 0.03, 0.05) * (0.35 + 0.65 * daylight);
+                vec3 lit_col = sky_refl * (0.75 + 0.55 * sky_arc) + spec_col * (spec * 1.35)
+                             + vec3(0.68, 0.84, 1.20) * (flash * (0.18 + spec * 0.80));
+                out_drop_a = clamp(rim_dark_a + rim_lit_a + drop_alpha * 0.035, 0.0, 0.66);
+                water_hdr = mix(dark_col, lit_col, clamp(rim_lit_a / max(0.01, rim_dark_a + rim_lit_a), 0.0, 1.0));
             }
-            water_hdr = mix(water_hdr, vec3(0.84, 0.90, 0.97) * (0.30 + 0.72 * daylight), snow_fac * 0.30);
+            water_hdr = mix(water_hdr, vec3(0.84, 0.90, 0.97) * (0.30 + 0.72 * daylight), snow_fac * 0.28 * drop_alpha);
 
             vec3 frost_col = mix(vec3(0.80, 0.89, 0.98), vec3(1.12, 1.16, 1.20), crystal_sparkle) * (0.25 + 0.88 * daylight)
                            + vec3(0.55, 0.70, 0.95) * (flash * 0.30);

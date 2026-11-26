@@ -52,6 +52,7 @@ SRCS := \
 	src/main.cpp \
 	../engine/src/c172_systems.cpp \
 	../engine/src/flight_model_jsb.cpp \
+	../engine/src/flight_yoke.cpp \
 	../engine/src/opentrack_udp.cpp
 
 CSRCS := third_party/miniz_tinfl.c

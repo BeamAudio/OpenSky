@@ -277,7 +277,7 @@ bool record_castejon_catalonia_flight(PackReader &pack, const std::filesystem::p
     add_default_route(trace, *dest);
 
     RegionalAtmosphere weather;
-    weather.set_solver_seed(20261125, false);
+    weather.set_solver_seed(20261125, true);
     weather.set_manual_weather_override(true);
     weather.set_regime(WindRegime::PYRENEAN_THERMAL);
     weather.set_season(trace.season);
@@ -326,6 +326,7 @@ bool record_castejon_catalonia_flight(PackReader &pack, const std::filesystem::p
     if (const auto *r0 = pack.find_region_at(dep->lat, dep->lon)) init_region = r0->region_id;
 
     constexpr int max_steps = 160000;
+    double next_wx_t = 45.0;
     for (int i = 0; i < max_steps && phase != Phase::Done; ++i) {
         const auto &fs = aircraft.jsb_state();
         const double d_lesu_thr = nspain::haversine_m(fs.lat_deg, fs.lon_deg, dest->rwy_lat_a, dest->rwy_lon_a);
@@ -346,9 +347,14 @@ bool record_castejon_catalonia_flight(PackReader &pack, const std::filesystem::p
             (fr && fr != ar)) {
             if (pack.reanchor_to(fs.lat_deg, fs.lon_deg)) {
                 weather.sync_region(fs.lat_deg, fs.lon_deg);
+                weather.update_field(replay_sun, sim_time, false, trace.wx_advance);
+                next_wx_t = sim_time + 45.0;
             }
         }
-        weather.update_field(replay_sun, sim_time, false, trace.wx_advance);
+        if (sim_time >= next_wx_t) {
+            weather.update_field(replay_sun, sim_time, false, trace.wx_advance);
+            next_wx_t = sim_time + 45.0;
+        }
 
         ReplayStep s{};
         s.dt = dt;
@@ -493,13 +499,13 @@ bool record_castejon_catalonia_flight(PackReader &pack, const std::filesystem::p
                 double re = 0.0, mu = 0.0, rough = 0.0;
                 std::string rid;
                 const bool on_rwy = pack.query_runway(fs.lat_deg, fs.lon_deg, re, mu, rough, rid);
-                if (!on_rwy && phase_timer > 1.2) {
+                if (!on_rwy && phase_timer > 0.6) {
                     phase = Phase::StopForPark;
                     phase_timer = 0.0;
                     break;
                 }
-                // Turn ~90 deg right off RWY 03 (hdg 121 deg) with gentle steer (<=0.33 avoids differential brake lock).
-                const double exit_hdg = std::fmod(rwy_03_hdg + 90.0, 360.0);
+                // Turn ~90 deg left off RWY 03 (hdg 301 deg) onto LESU's flat west apron plateau; east drops sharply.
+                const double exit_hdg = std::fmod(rwy_03_hdg + 270.0, 360.0);
                 const double herr = std::remainder(exit_hdg - fs.heading_deg, 360.0);
                 s.roll_cmd = static_cast<float>(std::clamp(herr / 45.0, -0.33, 0.33));
                 s.throttle_tgt = fs.ground_speed_mps < 3.0 ? 0.44f : 0.10f;
@@ -569,7 +575,7 @@ bool replay_flight_headless(PackReader &pack, const std::filesystem::path &trace
     const auto profile_path = temp.dir / "fleet.ini";
 
     RegionalAtmosphere weather;
-    weather.set_solver_seed(20261125, false);
+    weather.set_solver_seed(20261125, true);
     weather.set_manual_weather_override(true);
     weather.set_regime(WindRegime::PYRENEAN_THERMAL);
     weather.set_season(trace.season);
@@ -590,6 +596,7 @@ bool replay_flight_headless(PackReader &pack, const std::filesystem::path &trace
     std::string init_region = "es_aragon_pyrenees";
     if (const auto *r0 = pack.find_region_at(dep->lat, dep->lon)) init_region = r0->region_id;
 
+    double next_wx_t = 45.0;
     for (const auto &s : trace.steps) {
         sim_time += s.dt;
         const auto &fs = aircraft.jsb_state();
@@ -598,9 +605,16 @@ bool replay_flight_headless(PackReader &pack, const std::filesystem::path &trace
         if (fr && fr->region_id != init_region) crossed_region = true;
         if (nspain::haversine_m(fs.lat_deg, fs.lon_deg, pack.anchor_lat(), pack.anchor_lon()) > 60000.0 ||
             (fr && fr != ar)) {
-            if (pack.reanchor_to(fs.lat_deg, fs.lon_deg)) weather.sync_region(fs.lat_deg, fs.lon_deg);
+            if (pack.reanchor_to(fs.lat_deg, fs.lon_deg)) {
+                weather.sync_region(fs.lat_deg, fs.lon_deg);
+                weather.update_field(replay_sun, sim_time, false, trace.wx_advance);
+                next_wx_t = sim_time + 45.0;
+            }
         }
-        weather.update_field(replay_sun, sim_time, false, trace.wx_advance);
+        if (sim_time >= next_wx_t) {
+            weather.update_field(replay_sun, sim_time, false, trace.wx_advance);
+            next_wx_t = sim_time + 45.0;
+        }
         apply_replay_step(aircraft, session, s, sky, weather, sim_time);
     }
 

@@ -104,6 +104,7 @@ GameFrontend::~GameFrontend() {
     if (land_) glDeleteTextures(1, &land_);
     if (font_) glDeleteTextures(1, &font_);
     if (relief_) glDeleteTextures(1, &relief_);
+    if (region_wx_) glDeleteTextures(1, &region_wx_);
     if (backdrop_) glDeleteProgram(backdrop_);
 }
 
@@ -128,6 +129,7 @@ bool GameFrontend::init(const PackReader &pack, const std::string &shader_root, 
     wx_geo_uniform_ = glGetUniformLocation(backdrop_, "u_wx_geo");
     wx_overlay_uniform_ = glGetUniformLocation(backdrop_, "u_wx_overlay");
     wx_time_uniform_ = glGetUniformLocation(backdrop_, "u_wx_time");
+    wx_base_cloud_uniform_ = glGetUniformLocation(backdrop_, "u_wx_base_cloud");
     int tw, th, channels;
     unsigned char *pixels = stbi_load((asset_root + "/ui/globe_land.png").c_str(), &tw, &th, &channels, 1);
     if (!pixels) {
@@ -156,15 +158,42 @@ bool GameFrontend::init(const PackReader &pack, const std::string &shader_root, 
     constexpr int relief_width = 1536, relief_height = 1024, mip_levels = 11;
     std::vector<Vec4> bounds;
     int layer_count = 0;
+    int wx_layer_count = 0;
+    region_wx_previews_.clear();
+    wx_preview_state_key_ = -1;
     for (const auto &region : pack.regions()) {
         const auto &b = region.hdr;
         auto path = std::filesystem::path(region.pack_path).replace_extension(".relief.png");
         bounds.emplace_back(b.lon_min, b.lat_min, b.lon_max, b.lat_max);
         std::error_code ec;
         const int layer = std::filesystem::is_regular_file(path, ec) ? layer_count++ : -1;
-        bounds.emplace_back(static_cast<float>(layer), 0, 0, 0);
+        int wx_layer = -1;
+        if (!region.weather_path.empty()) {
+            auto lib = std::make_unique<WeatherLibrary>();
+            if (lib->load(region.weather_path)) {
+                wx_layer = wx_layer_count++;
+                RegionWeatherPreview preview;
+                preview.layer = wx_layer;
+                preview.lon_min = b.lon_min;
+                preview.lat_min = b.lat_min;
+                preview.lon_max = b.lon_max;
+                preview.lat_max = b.lat_max;
+                preview.lib = std::move(lib);
+                region_wx_previews_.push_back(std::move(preview));
+            }
+        }
+        bounds.emplace_back(static_cast<float>(layer), static_cast<float>(wx_layer), 0, 0);
     }
     region_count_ = static_cast<int>(pack.regions().size());
+    if (wx_layer_count > 0) {
+        glCreateTextures(GL_TEXTURE_2D_ARRAY, 1, &region_wx_);
+        glTextureStorage3D(region_wx_, 1, GL_RGBA16F, 256, 192, wx_layer_count);
+        glTextureParameteri(region_wx_, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTextureParameteri(region_wx_, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTextureParameteri(region_wx_, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTextureParameteri(region_wx_, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTextureParameteri(region_wx_, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+    }
     if (layer_count > 0) {
         glCreateTextures(GL_TEXTURE_2D_ARRAY, 1, &relief_);
         glTextureStorage3D(relief_, mip_levels, GL_RGBA8, relief_width, relief_height, layer_count);
@@ -416,7 +445,123 @@ bool GameFrontend::button(AircraftAndHud &ui, PixelRect a, const char *value, bo
     return true;
 }
 
-void GameFrontend::draw_globe(const RegionalAtmosphere *reg_atmo, double sim_time_sec) {
+void GameFrontend::sync_region_weather_previews(const RegionalAtmosphere *reg_atmo) {
+    if (!region_wx_ || region_wx_previews_.empty() || !pack_) return;
+    int season = 1, slot = 2, wtype = 0, sev_bucket = 1;
+    float solar = 0.45f;
+    if (reg_atmo) {
+        const auto &w = reg_atmo->weather();
+        const auto &lib = reg_atmo->library();
+        season = std::clamp(lib.valid() ? lib.snapshot().season : w.season, 0, nspain::NSWX_SEASONS - 1);
+        slot = std::clamp(lib.valid() ? lib.snapshot().slot : w.slot, 0, nspain::NSWX_SLOTS - 1);
+        wtype = reg_atmo->manual_weather_override()
+            ? std::clamp(static_cast<int>(reg_atmo->regime()), 0, nspain::NSWX_TYPES - 1)
+            : std::clamp(lib.valid() ? lib.snapshot().wtype : static_cast<int>(reg_atmo->regime()), 0, nspain::NSWX_TYPES - 1);
+        sev_bucket = std::clamp(static_cast<int>(std::round(std::max(w.precip, w.storm_int) * 4.0f)), 0, 4);
+        solar = (slot == nspain::NSWX_NIGHT_SLOT) ? 0.0f : std::sin(std::clamp((slot + 0.5f) / 10.0f, 0.0f, 1.0f) * 3.14159265f) * 0.72f;
+    }
+    const int key = (((season * 16 + slot) * 8 + wtype) * 8) + sev_bucket;
+    if (key == wx_preview_state_key_) return;
+    wx_preview_state_key_ = key;
+    const float severity = sev_bucket * 0.25f;
+    constexpr int kW = 256, kH = 192;
+    constexpr size_t kCells = static_cast<size_t>(kW) * kH;
+    constexpr int kSrcW = nspain::NSWX_GRID_W, kSrcH = nspain::NSWX_GRID_H;
+    constexpr size_t kSrcCells = static_cast<size_t>(kSrcW) * kSrcH;
+    std::vector<float> rgba(kCells * 4, 0.0f);
+    auto smooth01 = [](float e0, float e1, float x) {
+        float t = std::clamp((x - e0) / std::max(1e-5f, e1 - e0), 0.0f, 1.0f);
+        return t * t * (3.0f - 2.0f * t);
+    };
+    for (auto &preview : region_wx_previews_) {
+        if (!preview.lib || !preview.lib->valid()) continue;
+        // Lazily bake terrain gradients once per region for realistic valley/ridge flow deflection.
+        if (!preview.terrain_ready) {
+            std::vector<float> elev(kCells, 0.0f), horiz(kCells, 0.0f), sm(kCells, 0.0f);
+            double mlat = 111320.0, mlon = 82000.0;
+            nspain::meters_per_degree(0.5 * (preview.lat_min + preview.lat_max), mlat, mlon);
+            const float dx = static_cast<float>(std::max(50.0, (preview.lon_max - preview.lon_min) * mlon / (kW - 1)));
+            const float dy = static_cast<float>(std::max(50.0, (preview.lat_max - preview.lat_min) * mlat / (kH - 1)));
+            for (int y = 0; y < kH; ++y) {
+                const double lat = preview.lat_min + (preview.lat_max - preview.lat_min) * (static_cast<double>(y) / (kH - 1));
+                for (int x = 0; x < kW; ++x) {
+                    const double lon = preview.lon_min + (preview.lon_max - preview.lon_min) * (static_cast<double>(x) / (kW - 1));
+                    elev[static_cast<size_t>(y) * kW + x] = static_cast<float>(pack_->sample_elevation(lat, lon));
+                }
+            }
+            for (int y = 0; y < kH; ++y) {
+                const size_t row = static_cast<size_t>(y) * kW;
+                for (int x = 0; x < kW; ++x) {
+                    float s = 0.0f;
+                    for (int ox = -2; ox <= 2; ++ox) s += elev[row + static_cast<size_t>(std::clamp(x + ox, 0, kW - 1))];
+                    horiz[row + x] = s * 0.2f;
+                }
+            }
+            for (int y = 0; y < kH; ++y) {
+                for (int x = 0; x < kW; ++x) {
+                    float s = 0.0f;
+                    for (int oy = -2; oy <= 2; ++oy)
+                        s += horiz[static_cast<size_t>(std::clamp(y + oy, 0, kH - 1)) * kW + x];
+                    sm[static_cast<size_t>(y) * kW + x] = s * 0.2f;
+                }
+            }
+            preview.slope_e.assign(kCells, 0.0f);
+            preview.slope_n.assign(kCells, 0.0f);
+            preview.ridge.assign(kCells, 0.0f);
+            preview.basin.assign(kCells, 0.0f);
+            for (int y = 0; y < kH; ++y) {
+                const int yd = std::max(0, y - 1), yu = std::min(kH - 1, y + 1);
+                for (int x = 0; x < kW; ++x) {
+                    const int xl = std::max(0, x - 1), xr = std::min(kW - 1, x + 1);
+                    const size_t i = static_cast<size_t>(y) * kW + x;
+                    const float ge = (sm[static_cast<size_t>(y) * kW + xr] - sm[static_cast<size_t>(y) * kW + xl]) / std::max(1.0f, dx * (xr - xl));
+                    const float gn = (sm[static_cast<size_t>(yu) * kW + x] - sm[static_cast<size_t>(yd) * kW + x]) / std::max(1.0f, dy * (yu - yd));
+                    preview.slope_e[i] = ge;
+                    preview.slope_n[i] = gn;
+                    const float sl = std::hypot(ge, gn);
+                    const float rh = elev[i] - sm[i];
+                    preview.ridge[i] = std::clamp(std::max(smooth01(0.025f, 0.20f, sl) * 0.72f, smooth01(35.0f, 220.0f, rh) * 0.62f), 0.0f, 1.0f);
+                    preview.basin[i] = std::clamp(smooth01(25.0f, 180.0f, -rh) * (1.0f - smooth01(0.035f, 0.16f, sl)), 0.0f, 1.0f);
+                }
+            }
+            preview.terrain_ready = true;
+        }
+        preview.lib->select(season, static_cast<float>(slot), wtype, severity);
+        const auto &src = preview.lib->field_rgba();
+        const auto &snap = preview.lib->snapshot();
+        if (src.size() != kSrcCells * 4) continue;
+        for (int y = 0; y < kH; ++y) {
+            const float sy = static_cast<float>(y) / (kH - 1) * (kSrcH - 1);
+            const int y0 = std::min(kSrcH - 2, static_cast<int>(sy));
+            const float ty = sy - y0;
+            for (int x = 0; x < kW; ++x) {
+                const float sx = static_cast<float>(x) / (kW - 1) * (kSrcW - 1);
+                const int x0 = std::min(kSrcW - 2, static_cast<int>(sx));
+                const float tx = sx - x0;
+                const size_t a = (static_cast<size_t>(y0) * kSrcW + x0) * 4;
+                const size_t b = a + 4, c = a + static_cast<size_t>(kSrcW) * 4, d = c + 4;
+                auto bilerp = [&](int ch) {
+                    return std::lerp(std::lerp(src[a + ch], src[b + ch], tx),
+                                     std::lerp(src[c + ch], src[d + ch], tx), ty);
+                };
+                const size_t i = static_cast<size_t>(y) * kW + x;
+                float u = 0.0f, v = 0.0f;
+                orographic_deflect_wind(bilerp(0), bilerp(1), preview.slope_e[i], preview.slope_n[i],
+                                        preview.ridge[i], preview.basin[i], 0.9926f, solar, u, v);
+                const float cloud = std::clamp(snap.cloud_cov + bilerp(3) * 0.35f, 0.0f, 1.0f);
+                // Localize precipitation to denser cloud cores so regions do not tint as solid boxes.
+                const float core = std::clamp((cloud - 0.58f) / 0.36f, 0.0f, 1.0f);
+                rgba[i * 4 + 0] = u;
+                rgba[i * 4 + 1] = v;
+                rgba[i * 4 + 2] = std::clamp(snap.precip_mm_hr * core * core, 0.0f, 48.0f);
+                rgba[i * 4 + 3] = cloud;
+            }
+        }
+        glTextureSubImage3D(region_wx_, 0, 0, 0, preview.layer, kW, kH, 1, GL_RGBA, GL_FLOAT, rgba.data());
+    }
+}
+
+void GameFrontend::draw_globe(const RegionalAtmosphere *reg_atmo, double /*sim_time_sec*/) {
     const PixelRect a = map_area;
     glViewport(a.x, h - a.y - a.h, a.w, a.h);
     glDisable(GL_DEPTH_TEST);
@@ -430,6 +575,7 @@ void GameFrontend::draw_globe(const RegionalAtmosphere *reg_atmo, double sim_tim
     glBindTextureUnit(1, relief_);
     Vec4 wx_geo{0.0f, 0.0f, 0.0f, 0.0f};
     const bool has_wx = weather_overlay_ && reg_atmo && reg_atmo->has_model() && reg_atmo->field_tex() != 0 && pack_;
+    if (weather_overlay_) sync_region_weather_previews(reg_atmo);
     if (has_wx) {
         const Vec4 db = reg_atmo->domain_bounds();
         const double span_e = 1.0 / std::max(1e-6f, db.z);
@@ -441,9 +587,14 @@ void GameFrontend::draw_globe(const RegionalAtmosphere *reg_atmo, double sim_tim
                   static_cast<float>(pack_->anchor_m_lat() / std::max(1.0, span_n))};
         glBindTextureUnit(2, reg_atmo->field_tex());
     }
+    if (region_wx_) glBindTextureUnit(3, region_wx_);
+    const bool show_flow = weather_overlay_ && (has_wx || region_wx_ != 0);
+    static const double anim_t0 = PlatformWindow::now_sec();
+    const float flow_time = static_cast<float>(PlatformWindow::now_sec() - anim_t0);
     if (wx_geo_uniform_ >= 0) glUniform4f(wx_geo_uniform_, wx_geo.x, wx_geo.y, wx_geo.z, wx_geo.w);
-    if (wx_overlay_uniform_ >= 0) glUniform1f(wx_overlay_uniform_, has_wx ? 1.0f : 0.0f);
-    if (wx_time_uniform_ >= 0) glUniform1f(wx_time_uniform_, static_cast<float>(sim_time_sec));
+    if (wx_overlay_uniform_ >= 0) glUniform1f(wx_overlay_uniform_, show_flow ? 1.0f : 0.0f);
+    if (wx_base_cloud_uniform_ >= 0) glUniform1f(wx_base_cloud_uniform_, has_wx ? reg_atmo->weather().cloud_cov : 0.35f);
+    if (wx_time_uniform_ >= 0) glUniform1f(wx_time_uniform_, flow_time);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, bounds_);
     glBindVertexArray(vao_);
     glDrawArrays(GL_TRIANGLES, 0, 3);
@@ -454,6 +605,7 @@ void GameFrontend::draw_menu(AircraftAndHud &aircraft, SkyAndClouds &sky, const 
                              bool preparing_airfield, int &time_of_day,
                              RegionalAtmosphere *reg_atmo, double sim_time_sec) {
     read_pointer(win);
+    aircraft.poll_yoke();
     sky.begin_native_cockpit_pass();
     glClearColor(.022f, .039f, .058f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
@@ -705,28 +857,22 @@ void GameFrontend::draw_world(AircraftAndHud &ui, const PlatformWindow &win,
     draw_globe(reg_atmo, sim_time_sec);
     ui.hud_border(map_area.x, map_area.y, map_area.w, map_area.h, 1, .29f, .42f, .50f, .8f);
 
-    if (weather_overlay_ && reg_atmo && reg_atmo->has_model() && atmo) {
-        const float wx_est = std::clamp((atmo->cloud_cov - 0.16f) / 0.78f, 0.0f, 1.0f);
-        for (int gy = 0; gy < 5; ++gy) {
-            for (int gx = 0; gx < 8; ++gx) {
-                const Vec2 sp{map_area.x + 95.0f + gx * 145.0f, map_area.y + 85.0f + gy * 145.0f};
-                auto up = projection.unproject(sp);
-                if (!up) continue;
-                const auto [glat, glon] = globe_geo(*up);
-                if (!reg_atmo->covers(glat, glon)) continue;
-                const LocalAirSample sw = reg_atmo->sample_at(glat, glon, pack_->sample_elevation(glat, glon) + 450.0,
-                                                              atmo->sun_dir, sim_time_sec, wx_est);
-                const float spd = static_cast<float>(std::hypot(sw.wind_east_mps, sw.wind_north_mps));
-                if (spd < 0.8f) continue;
-                const Vec2 dir{static_cast<float>(sw.wind_east_mps / spd), static_cast<float>(-sw.wind_north_mps / spd)};
-                const float alen = std::clamp(8.0f + spd * 1.15f, 10.0f, 26.0f);
-                const Vec2 tip{sp.x + dir.x * alen, sp.y + dir.y * alen};
-                const Vec2 tail{sp.x - dir.x * alen * 0.4f, sp.y - dir.y * alen * 0.4f};
-                ui.hud_arrow(tail, tip, 1.8f, {.65f, .90f, 1.0f});
-            }
+    if (weather_overlay_ && (reg_atmo != nullptr || region_wx_ != 0)) {
+        ui.hud_rect(762, 238, 280, 34, .025f, .052f, .072f, .90f);
+        ui.hud_border(762, 238, 280, 34, 1, .19f, .36f, .42f, .82f);
+        label(ui, 774, 248, 13, "FLOW", true);
+        static const Vec3 kSwatches[4] = {
+            {.38f, .78f, .98f}, {.32f, .94f, .86f}, {.95f, .88f, .34f}, {1.00f, .46f, .28f}
+        };
+        static constexpr const char *kSpeeds[4] = {"8", "18", "30", "40kt"};
+        for (int i = 0; i < 4; ++i) {
+            const float sx = 824.0f + i * 52.0f;
+            ui.hud_rect(sx, 250, 12, 10, kSwatches[i].x, kSwatches[i].y, kSwatches[i].z, 1.0f);
+            label(ui, sx + 16.0f, 248, 12, kSpeeds[i], true);
         }
     }
-    if (button(ui, {1052, 238, 198, 34}, weather_overlay_ ? "Weather Map: ON" : "Weather Map: OFF", reg_atmo != nullptr, weather_overlay_)) {
+    if (button(ui, {1052, 238, 198, 34}, weather_overlay_ ? "Flowmap: ON" : "Flowmap: OFF",
+               reg_atmo != nullptr || region_wx_ != 0, weather_overlay_)) {
         weather_overlay_ = !weather_overlay_;
     }
 
@@ -1185,12 +1331,12 @@ void GameFrontend::draw_settings(AircraftAndHud &ui, int &time_of_day, RegionalA
     auto &s = ui.graphics_settings_;
     bool changed = false;
     auto setting = [&](int row, const char *name, const char *value) {
-        const int y = 296 + row * 60;
-        ui.hud_rect(91,y+49,1046,1,.21f,.32f,.39f,.85f);
-        label(ui, 91, y+10, 20, name);
-        label(ui, 763, y+10, 19, value);
-        if (button(ui, {697,y,44,40}, "<")) { changed = true; return -1; }
-        if (button(ui, {1093,y,44,40}, ">")) { changed = true; return 1; }
+        const int y = 290 + row * 50;
+        ui.hud_rect(91,y+43,1046,1,.21f,.32f,.39f,.85f);
+        label(ui, 91, y+8, 19, name);
+        label(ui, 763, y+8, 18, value);
+        if (button(ui, {697,y,44,36}, "<")) { changed = true; return -1; }
+        if (button(ui, {1093,y,44,36}, ">")) { changed = true; return 1; }
         return 0;
     };
     static const char *presets[] = {"Low (F1 / Cooler)", "Medium (F2 / 60 FPS)", "High (F3 / Balanced)", "Ultra (F4 / dGPU)"};
@@ -1217,7 +1363,21 @@ void GameFrontend::draw_settings(AircraftAndHud &ui, int &time_of_day, RegionalA
         s.show_flight_hud = !s.show_flight_hud;
     static const char *display_modes[] = {"Windowed", "Fullscreen", "Fullscreen windowed"};
     s.display_mode = (s.display_mode + setting(9, "Display mode", display_modes[s.display_mode]) + 3) % 3;
-    label(ui, 91, 898, 13, "Display changes apply after restarting the game.", true);
+    if (setting(10, "VSync", s.vsync ? "On (Tear-free)" : "Off (Low latency)"))
+        s.vsync = !s.vsync;
+    static constexpr int kFpsLimits[] = {30, 45, 60, 75, 90, 120, 144, 0};
+    constexpr int kFpsCount = static_cast<int>(sizeof(kFpsLimits) / sizeof(kFpsLimits[0]));
+    int fps_idx = kFpsCount - 1;
+    if (s.fps_limit > 0) {
+        fps_idx = 0;
+        for (int i = 1; i < kFpsCount - 1; ++i)
+            if (std::abs(kFpsLimits[i] - s.fps_limit) < std::abs(kFpsLimits[fps_idx] - s.fps_limit)) fps_idx = i;
+    }
+    if (s.fps_limit > 0) std::snprintf(value, sizeof(value), "%d FPS", s.fps_limit);
+    else std::snprintf(value, sizeof(value), "Unlimited");
+    if (int delta = setting(11, "FPS limit", value))
+        s.fps_limit = kFpsLimits[(fps_idx + delta + kFpsCount) % kFpsCount];
+    label(ui, 91, 900, 13, "Display mode applies after restart; VSync and FPS limit apply live.", true);
 
     panel(ui, {1192,225,664,720});
     label(ui, 1218, 246, 24, "Cockpit POV & Audio");
@@ -1300,6 +1460,62 @@ void GameFrontend::draw_settings(AircraftAndHud &ui, int &time_of_day, RegionalA
         label(ui, 1218, 905, 14, "Added solver work: about 33% / 133% of regional mode.", true);
         label(ui, 1218, 927, 14, "Press M to cycle weather; F1-F4 change graphics.", true);
     }
+
+    panel(ui, {64, 956, 1792, 88});
+    const auto &yk = ui.yoke_state();
+    char yk_line[224];
+    if (yk.connected) {
+        std::snprintf(yk_line, sizeof(yk_line), "Flight Yoke & Pedals: %.72s%s",
+                      yk.device_summary.c_str(), yk.has_brakes ? "  [Toe Brakes]" : "");
+        label(ui, 91, 965, 18, yk_line);
+        std::snprintf(yk_line, sizeof(yk_line), "Roll %+4.0f%%  |  Pitch %+4.0f%%  |  Rudder %+4.0f%%  |  Throttle %3.0f%%",
+                      yk.roll * 100.0, yk.pitch * 100.0, yk.rudder * 100.0,
+                      (yk.has_throttle ? yk.throttle : ui.state().throttle) * 100.0);
+        label(ui, 1180, 966, 16, yk_line, true);
+    } else {
+        label(ui, 91, 965, 18, "Flight Yoke & Pedals: No USB controller detected (plug & play via Linux evdev)");
+        label(ui, 1180, 966, 16, "Connect a yoke, stick, throttle quadrant, or rudder pedals.", true);
+    }
+    if (button(ui, {91, 996, 228, 36}, s.yoke_direct ? "Mode: Direct Yoke" : "Mode: Flight Assist", true, s.yoke_direct)) {
+        s.yoke_direct = !s.yoke_direct;
+        changed = true;
+    }
+    label(ui, 335, 1004, 17, "Deadzone");
+    if (button(ui, {434, 996, 36, 36}, "<")) { s.yoke_deadzone_pct = std::clamp(s.yoke_deadzone_pct - 1, 0, 20); changed = true; }
+    std::snprintf(value, sizeof(value), "%d%%", s.yoke_deadzone_pct);
+    label(ui, 478, 1004, 17, value);
+    if (button(ui, {528, 996, 36, 36}, ">")) { s.yoke_deadzone_pct = std::clamp(s.yoke_deadzone_pct + 1, 0, 20); changed = true; }
+    label(ui, 586, 1004, 17, "Curve");
+    if (button(ui, {656, 996, 36, 36}, "<")) { s.yoke_curve_pct = std::clamp(s.yoke_curve_pct - 5, 0, 80); changed = true; }
+    std::snprintf(value, sizeof(value), "%d%%", s.yoke_curve_pct);
+    label(ui, 700, 1004, 17, value);
+    if (button(ui, {750, 996, 36, 36}, ">")) { s.yoke_curve_pct = std::clamp(s.yoke_curve_pct + 5, 0, 80); changed = true; }
+    if (button(ui, {812, 996, 152, 36}, "Inv Pitch", true, s.yoke_invert_pitch)) {
+        s.yoke_invert_pitch = !s.yoke_invert_pitch;
+        changed = true;
+    }
+    if (button(ui, {976, 996, 144, 36}, "Inv Roll", true, s.yoke_invert_roll)) {
+        s.yoke_invert_roll = !s.yoke_invert_roll;
+        changed = true;
+    }
+    if (button(ui, {1132, 996, 152, 36}, "Inv Thr", true, s.yoke_invert_throttle)) {
+        s.yoke_invert_throttle = !s.yoke_invert_throttle;
+        changed = true;
+    }
+    if (button(ui, {1320, 996, 228, 36}, "Center Yoke", yk.connected)) {
+        ui.calibrate_yoke();
+    }
+    if (button(ui, {1564, 996, 124, 36}, "Rescan")) {
+        ui.rescan_yokes();
+    }
+    if (button(ui, {1704, 996, 126, 36}, "Reset")) {
+        s.yoke_deadzone_pct = 5;
+        s.yoke_curve_pct = 35;
+        s.yoke_direct = true;
+        s.yoke_invert_pitch = s.yoke_invert_roll = s.yoke_invert_throttle = false;
+        ui.reset_yoke_calibration();
+        changed = true;
+    }
     if (changed) save_graphics_settings(s);
 }
 
@@ -1364,6 +1580,21 @@ void GameFrontend::draw_controls(AircraftAndHud &ui) {
     label(ui, 968, 814, 19, "Backspace / Esc     Reset seat/cam   |   Pause & Menu");
     label(ui, 968, 870, 18, "Tip: Lean mixture (5) above 1,500 m MSL for full Pyrenean climb.", true);
     label(ui, 968, 902, 18, "Warm oil past 110 F before full power to preserve cylinder health.", true);
+
+    panel(ui, {64, 988, 1792, 56});
+    const auto &yk = ui.yoke_state();
+    char yk_msg[224];
+    if (yk.connected) {
+        std::snprintf(yk_msg, sizeof(yk_msg),
+                      "USB Yoke Active: %.56s  |  Trigger: Brakes   Thumb: Park   Rockers: Trim/Flaps   Hat: Look",
+                      yk.device_summary.c_str());
+        label(ui, 90, 1007, 16, yk_msg);
+        if (button(ui, {1628, 998, 202, 36}, "Center Yoke")) ui.calibrate_yoke();
+    } else {
+        label(ui, 90, 1007, 16,
+              "USB Yoke / Rudder Pedals / Throttle: Plug & Play via Linux evdev  (Settings -> Deadzone, Curve, Direct Mode, Calibration)", true);
+        if (button(ui, {1628, 998, 202, 36}, "Yoke Settings")) page_ = Page::Settings;
+    }
 }
 
 void GameFrontend::draw_credits(AircraftAndHud &ui) {

@@ -52,6 +52,7 @@ bool SkyAndClouds::init(const std::string &shader_root, int win_w, int win_h, in
     u_cld_dom_     = glGetUniformLocation(cloud_prog_, "u_atmo_domain");
     u_cld_local_dom_ = glGetUniformLocation(cloud_prog_, "u_atmo_local_domain");
     u_cld_wx_fx_   = glGetUniformLocation(cloud_prog_, "u_wx_fx");
+    u_cld_advect_  = glGetUniformLocation(cloud_prog_, "u_cloud_advect");
     u_post_exp_    = glGetUniformLocation(post_prog_, "u_exposure");
     u_post_sun_uv_ = glGetUniformLocation(post_prog_, "u_sun_uv_vis");
     u_post_warm_   = glGetUniformLocation(post_prog_, "u_haze_warm");
@@ -320,6 +321,22 @@ void SkyAndClouds::update_solar_and_weather(
     east /= hl; north /= hl;
 
     float wx = std::clamp(wx_advance01, 0.0f, 1.0f);
+    if (cloud_advect_time_ < 0.0 || sim_time_sec + 1e-4 < cloud_advect_time_) {
+        cloud_advect_en_ = {0.0f, 0.0f};
+        cloud_advect_time_ = sim_time_sec;
+    } else {
+        const float adv_dt = static_cast<float>(std::clamp(sim_time_sec - cloud_advect_time_, 0.0, 2.0));
+        cloud_advect_time_ = sim_time_sec;
+        float wx_u = 9.5f, wx_v = 4.2f;
+        if (baked) {
+            const double dir = baked->wind_dir_from_deg * DEG2RAD_D;
+            const float spd = std::clamp(baked->wind_speed_10m_mps * 1.08f, 1.5f, 35.0f);
+            wx_u = static_cast<float>(-std::sin(dir) * spd);
+            wx_v = static_cast<float>(-std::cos(dir) * spd);
+        }
+        cloud_advect_en_.x += wx_u * adv_dt;
+        cloud_advect_en_.y += wx_v * adv_dt;
+    }
     const bool live_open_meteo = baked && baked->label.rfind("LIVE OPEN-METEO", 0) == 0;
     if (baked) {
         float dyn_osc = 0.015f * std::sin(static_cast<float>(sim_time_sec) * 0.015f);
@@ -538,6 +555,7 @@ void SkyAndClouds::render_clouds_and_post(
     glUniform4f(u_cld_local_dom_, local_atmo_domain.x, local_atmo_domain.y,
                 local_atmo_domain.z, local_atmo_domain.w);
     glUniform4f(u_cld_wx_fx_, wx_fx.x, wx_fx.y, wx_fx.z, wx_fx.w);
+    glUniform2f(u_cld_advect_, -cloud_advect_en_.x, -cloud_advect_en_.y);
 
     glBindTextureUnit(0, cloud_noise_tex);
     glBindTextureUnit(1, cloud_vol_tex);

@@ -30,6 +30,14 @@ struct GraphicsSettings {
     int quality_preset = 2; // 0 = Low, 1 = Medium, 2 = High, 3 = Ultra
     bool show_flight_hud = false;
     int display_mode = 0; // 0 = Windowed, 1 = Fullscreen, 2 = Fullscreen windowed
+    bool vsync = true;
+    int fps_limit = 60; // 0 = Unlimited, otherwise 24..240 FPS
+    int yoke_deadzone_pct = 5;  // 0..20% hardware yoke deadzone
+    int yoke_curve_pct = 35;    // 0..80% cubic S-curve sensitivity
+    bool yoke_direct = true;    // true: direct C172S surfaces; false: assisted bank/VSI envelope
+    bool yoke_invert_pitch = false;
+    bool yoke_invert_roll = false;
+    bool yoke_invert_throttle = false;
 };
 
 inline std::filesystem::path graphics_settings_path() {
@@ -58,6 +66,14 @@ inline GraphicsSettings load_graphics_settings() {
         else if (key == "quality_preset") settings.quality_preset = std::clamp(value, 0, 3);
         else if (key == "show_flight_hud") settings.show_flight_hud = value != 0;
         else if (key == "display_mode") settings.display_mode = std::clamp(value, 0, 2);
+        else if (key == "vsync") settings.vsync = value != 0;
+        else if (key == "fps_limit") settings.fps_limit = value <= 0 ? 0 : std::clamp(value, 24, 240);
+        else if (key == "yoke_deadzone_pct") settings.yoke_deadzone_pct = std::clamp(value, 0, 20);
+        else if (key == "yoke_curve_pct") settings.yoke_curve_pct = std::clamp(value, 0, 80);
+        else if (key == "yoke_direct") settings.yoke_direct = value != 0;
+        else if (key == "yoke_invert_pitch") settings.yoke_invert_pitch = value != 0;
+        else if (key == "yoke_invert_roll") settings.yoke_invert_roll = value != 0;
+        else if (key == "yoke_invert_throttle") settings.yoke_invert_throttle = value != 0;
     }
     settings.pixel_percent = std::clamp(settings.pixel_percent, 40, 100);
     settings.aa_mode = std::clamp(settings.aa_mode, 0, 2);
@@ -69,6 +85,9 @@ inline GraphicsSettings load_graphics_settings() {
     settings.quality_preset = std::clamp(settings.quality_preset, 0, 3);
     settings.display_mode = std::clamp(settings.display_mode, 0, 2);
     settings.weather_grid_detail = std::clamp(settings.weather_grid_detail, 0, 2);
+    settings.fps_limit = settings.fps_limit <= 0 ? 0 : std::clamp(settings.fps_limit, 24, 240);
+    settings.yoke_deadzone_pct = std::clamp(settings.yoke_deadzone_pct, 0, 20);
+    settings.yoke_curve_pct = std::clamp(settings.yoke_curve_pct, 0, 80);
     return settings;
 }
 
@@ -84,6 +103,9 @@ inline void save_graphics_settings(const GraphicsSettings &input) {
     settings.quality_preset = std::clamp(settings.quality_preset, 0, 3);
     settings.display_mode = std::clamp(settings.display_mode, 0, 2);
     settings.weather_grid_detail = std::clamp(settings.weather_grid_detail, 0, 2);
+    settings.fps_limit = settings.fps_limit <= 0 ? 0 : std::clamp(settings.fps_limit, 24, 240);
+    settings.yoke_deadzone_pct = std::clamp(settings.yoke_deadzone_pct, 0, 20);
+    settings.yoke_curve_pct = std::clamp(settings.yoke_curve_pct, 0, 80);
     const auto path = graphics_settings_path();
     std::error_code ec;
     std::filesystem::create_directories(path.parent_path(), ec);
@@ -106,7 +128,15 @@ inline void save_graphics_settings(const GraphicsSettings &input) {
             << "atmosphere_clarity " << settings.atmosphere_clarity << '\n'
             << "quality_preset " << settings.quality_preset << '\n';
         out << "show_flight_hud " << settings.show_flight_hud << '\n'
-            << "display_mode " << settings.display_mode << '\n';
+            << "display_mode " << settings.display_mode << '\n'
+            << "vsync " << settings.vsync << '\n'
+            << "fps_limit " << settings.fps_limit << '\n'
+            << "yoke_deadzone_pct " << settings.yoke_deadzone_pct << '\n'
+            << "yoke_curve_pct " << settings.yoke_curve_pct << '\n'
+            << "yoke_direct " << settings.yoke_direct << '\n'
+            << "yoke_invert_pitch " << settings.yoke_invert_pitch << '\n'
+            << "yoke_invert_roll " << settings.yoke_invert_roll << '\n'
+            << "yoke_invert_throttle " << settings.yoke_invert_throttle << '\n';
         if (!out) return;
     }
     std::filesystem::rename(temp, path, ec);

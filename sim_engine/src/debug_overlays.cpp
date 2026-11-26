@@ -100,9 +100,9 @@ void AircraftAndHud::render_debug_overlays(float w, float h, float top, const Re
                     if (speed > 0.20f && show_wind_arrow) {
                         const Vec3 wind_world{wind.x, wind.z, -wind.y};
                         const float max_arrow = std::min(560.0f,
-                            std::min(slice.step_e_m, slice.step_n_m) * 0.75f);
-                        const float min_arrow = std::min(110.0f, max_arrow);
-                        const float arrow_len = std::clamp(speed * 24.0f, min_arrow, max_arrow);
+                            std::min(slice.step_e_m, slice.step_n_m) * (slice.locally_refined ? 1.45f : 0.75f));
+                        const float min_arrow = std::min(78.0f, max_arrow * 0.45f);
+                        const float arrow_len = std::clamp(speed * (max_arrow / 14.0f), min_arrow, max_arrow);
                         Vec2 b;
                         if (project(base + wind_world * (arrow_len / speed), b))
                             hud_arrow(a, b, 3.2f * wx_scale, kLayerColors[level]);
@@ -151,14 +151,19 @@ void AircraftAndHud::render_debug_overlays(float w, float h, float top, const Re
         // Advected pathlines leave a visible history of where the published wind field has carried air.
         constexpr size_t kTracesPerLayer = 8;
         constexpr size_t kTraceCount = kTracesPerLayer * 4;
-        static const std::array<Vec2, kTracesPerLayer> kTraceSeeds{{
-            {-2500.0f, -2500.0f}, {0.0f, -2500.0f}, {2500.0f, -2500.0f},
-            {-2500.0f, 0.0f}, {2500.0f, 0.0f},
-            {-2500.0f, 2500.0f}, {0.0f, 2500.0f}, {2500.0f, 2500.0f}
+        const float trace_span = std::clamp(slices[0].step_e_m * (WeatherDebugSlice::width - 1) * 0.42f, 550.0f, 2400.0f);
+        static const std::array<Vec2, kTracesPerLayer> kTraceSeedUnit{{
+            {-0.85f, -0.85f}, {0.0f, -0.85f}, {0.85f, -0.85f},
+            {-0.85f, 0.0f}, {0.85f, 0.0f},
+            {-0.85f, 0.85f}, {0.0f, 0.85f}, {0.85f, 0.85f}
         }};
+        auto trace_seed_offset = [&](int level, size_t seed) {
+            const float layer_scale = level == 3 ? 0.55f : (level == 2 ? 0.80f : 1.0f);
+            return kTraceSeedUnit[seed] * (trace_span * layer_scale);
+        };
         const bool reset_traces = weather_flow_traces_.size() != kTraceCount ||
             (weather_flow_last_time_s_ >= 0.0 && view.simulation_time_s + 0.1 < weather_flow_last_time_s_) ||
-            std::hypot(view.east_m - weather_flow_origin_e_, view.north_m - weather_flow_origin_n_) > 25000.0;
+            std::hypot(view.east_m - weather_flow_origin_e_, view.north_m - weather_flow_origin_n_) > 12000.0;
         if (reset_traces) {
             weather_flow_traces_.clear();
             weather_flow_traces_.resize(kTraceCount);
@@ -167,9 +172,10 @@ void AircraftAndHud::render_debug_overlays(float w, float h, float top, const Re
             for (int level = 0; level < 4; ++level) {
                 for (size_t seed = 0; seed < kTracesPerLayer; ++seed) {
                     auto &trace = weather_flow_traces_[static_cast<size_t>(level) * kTracesPerLayer + seed];
+                    const Vec2 off = trace_seed_offset(level, seed);
                     trace.level = level;
-                    trace.east_m = view.east_m + kTraceSeeds[seed].x;
-                    trace.north_m = view.north_m + kTraceSeeds[seed].y;
+                    trace.east_m = view.east_m + off.x;
+                    trace.north_m = view.north_m + off.y;
                 }
             }
             weather_flow_last_time_s_ = view.simulation_time_s;
@@ -177,31 +183,31 @@ void AircraftAndHud::render_debug_overlays(float w, float h, float top, const Re
         const double flow_dt = weather_flow_last_time_s_ < 0.0 ? 0.0 :
             std::clamp(view.simulation_time_s - weather_flow_last_time_s_, 0.0, 2.0);
         weather_flow_last_time_s_ = view.simulation_time_s;
+        const float min_seg_m = std::max(32.0f, slices[0].step_e_m * 0.22f);
+        const float recycle_dist = trace_span * 1.85f;
         for (auto &trace : weather_flow_traces_) {
             const size_t trace_index = static_cast<size_t>(&trace - weather_flow_traces_.data());
-            auto slice = atmo.debug_slice(trace.east_m, trace.north_m, trace.level, 1);
-            const auto &center = slice.cells[slice.cells.size() / 2];
-            if (!center.valid) {
+            const auto sample = atmo.debug_sample(trace.east_m, trace.north_m, trace.level);
+            const bool out_of_view = std::hypot(trace.east_m - view.east_m, trace.north_m - view.north_m) > recycle_dist;
+            if (!sample.valid || out_of_view) {
                 trace.points.clear();
-                const auto &seed = kTraceSeeds[trace_index % kTracesPerLayer];
-                trace.east_m = view.east_m + seed.x;
-                trace.north_m = view.north_m + seed.y;
+                const Vec2 off = trace_seed_offset(trace.level, trace_index % kTracesPerLayer);
+                trace.east_m = view.east_m + off.x;
+                trace.north_m = view.north_m + off.y;
                 continue;
             }
-            if (trace.points.empty()) trace.points.push_back(center.position_enu_m);
+            if (trace.points.empty()) trace.points.push_back(sample.position_enu_m);
             if (flow_dt > 0.0) {
-                const Vec3 wind = center.wind_enu_mps;
+                const Vec3 wind = sample.wind_enu_mps;
                 trace.east_m += wind.x * flow_dt;
                 trace.north_m += wind.y * flow_dt;
-                auto next_slice = atmo.debug_slice(trace.east_m, trace.north_m, trace.level, 1);
-                const auto &next_center = next_slice.cells[next_slice.cells.size() / 2];
-                if (next_center.valid) {
-                    const Vec3 next_point{next_center.position_enu_m.x, next_center.position_enu_m.y,
-                                          static_cast<float>(next_center.position_enu_m.z + wind.z * flow_dt)};
-                    if (length(next_point - trace.points.back()) > 24.0f) trace.points.push_back(next_point);
+                const auto next_sample = atmo.debug_sample(trace.east_m, trace.north_m, trace.level);
+                if (next_sample.valid) {
+                    if (length(next_sample.position_enu_m - trace.points.back()) > min_seg_m)
+                        trace.points.push_back(next_sample.position_enu_m);
                 }
             }
-            if (trace.points.size() > 144) trace.points.erase(trace.points.begin(), trace.points.begin() + 24);
+            if (trace.points.size() > 56) trace.points.erase(trace.points.begin(), trace.points.begin() + 12);
         }
         for (const auto &trace : weather_flow_traces_) {
             const size_t count = trace.points.size();
@@ -218,14 +224,14 @@ void AircraftAndHud::render_debug_overlays(float w, float h, float top, const Re
                              static_cast<float>(view.north_m - b_world.y)};
                 if (!project(a, a_screen) || !project(b, b_screen)) continue;
                 const float age = static_cast<float>(i) / static_cast<float>(count - 1);
-                const Vec3 flow_color = mix(kLayerColors[trace.level], white, 0.42f);
-                hud_line(a_screen, b_screen, 7.0f * wx_scale, {0.012f, 0.020f, 0.030f}, 0.82f);
-                hud_line(a_screen, b_screen, 5.2f * wx_scale, flow_color, 0.42f + age * 0.58f);
-                if (i + 1 == count) hud_arrow(a_screen, b_screen, 5.0f * wx_scale, flow_color);
+                const Vec3 flow_color = mix(kLayerColors[trace.level], white, 0.35f);
+                hud_line(a_screen, b_screen, 5.4f * wx_scale, {0.012f, 0.020f, 0.030f}, 0.55f + age * 0.30f);
+                hud_line(a_screen, b_screen, 3.6f * wx_scale, flow_color, 0.30f + age * 0.68f);
+                if (i + 1 == count) hud_arrow(a_screen, b_screen, 4.2f * wx_scale, flow_color);
             }
         }
 
-        const float x = wx_pad, y = wx_pad, pw = 700.0f * wx_scale, ph = 5.95f * wx_row;
+        const float x = wx_pad, y = wx_pad, pw = 760.0f * wx_scale, ph = 5.95f * wx_row;
         hud_rect(x, y, pw, ph, 0.012f, 0.027f, 0.046f, 0.97f);
         hud_border(x, y, pw, ph, 2.0f * wx_scale, 0.35f, 0.78f, 1.0f, 0.92f);
         if (slices[0].locally_refined) {

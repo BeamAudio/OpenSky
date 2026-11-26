@@ -181,7 +181,8 @@ bool AircraftAndHud::init(const PackReader *pack, const std::string &asset_root,
 
     glCreateVertexArrays(1, &hud_vao_);
     glCreateBuffers(1, &hud_vbo_);
-    glNamedBufferData(hud_vbo_, static_cast<GLsizeiptr>(32768 * sizeof(HudVert)), nullptr, GL_STREAM_DRAW);
+    hud_vbo_cap_ = 32768;
+    glNamedBufferData(hud_vbo_, static_cast<GLsizeiptr>(hud_vbo_cap_ * sizeof(HudVert)), nullptr, GL_STREAM_DRAW);
     glVertexArrayVertexBuffer(hud_vao_, 0, hud_vbo_, 0, sizeof(HudVert));
     glEnableVertexArrayAttrib(hud_vao_, 0); glVertexArrayAttribFormat(hud_vao_, 0, 2, GL_FLOAT, GL_FALSE, 0); glVertexArrayAttribBinding(hud_vao_, 0, 0);
     glEnableVertexArrayAttrib(hud_vao_, 1); glVertexArrayAttribFormat(hud_vao_, 1, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float)); glVertexArrayAttribBinding(hud_vao_, 1, 0);
@@ -237,6 +238,7 @@ bool AircraftAndHud::init_physics(const PackReader *pack, const std::string &air
 
 void AircraftAndHud::shutdown() {
     opentrack_.stop_listening();
+    yoke_.shutdown();
     auto del_g = [](GlbMeshData &m) {
         if (m.vao) { glDeleteVertexArrays(1, &m.vao); m.vao = 0; }
         if (m.vbo) { glDeleteBuffers(1, &m.vbo); m.vbo = 0; }
@@ -255,7 +257,7 @@ void AircraftAndHud::shutdown() {
     if (precip_vao_)  { glDeleteVertexArrays(1, &precip_vao_); precip_vao_ = 0; }
     if (hud_prog_) { glDeleteProgram(hud_prog_); hud_prog_ = 0; }
     if (hud_vao_)  { glDeleteVertexArrays(1, &hud_vao_); hud_vao_ = 0; }
-    if (hud_vbo_)  { glDeleteBuffers(1, &hud_vbo_); hud_vbo_ = 0; }
+    if (hud_vbo_)  { glDeleteBuffers(1, &hud_vbo_); hud_vbo_ = 0; hud_vbo_cap_ = 0; }
 }
 
 void AircraftAndHud::reset_flight(double lat, double lon, double alt_m, double hdg_deg, double ias_kt, bool on_ground) {
@@ -264,6 +266,8 @@ void AircraftAndHud::reset_flight(double lat, double lon, double alt_m, double h
     raw_yoke_x_ = raw_yoke_y_ = 0.0;
     yoke_anchor_valid_ = false;
     kb_bank_cmd_ = kb_pitch_cmd_ = 0.0;
+    throttle_hw_active_ = mixture_hw_active_ = false;
+    throttle_hw_last_ = mixture_hw_last_ = -1.0;
     st_.ap_master = false;
     st_.ap_hdg_deg = hdg_deg;
     st_.ap_alt_ft = std::round(alt_m * 3.28084 / 100.0) * 100.0;
@@ -487,8 +491,21 @@ void AircraftAndHud::step_autonomous_assist(double dt, double roll_cmd, double p
                      std::clamp(brake_cmd + assist.brake_right_add, 0.0, 1.0));
 }
 
+void AircraftAndHud::poll_yoke() {
+    nspain::YokeConfig ycfg{};
+    ycfg.deadzone = static_cast<double>(graphics_settings_.yoke_deadzone_pct) * 0.01;
+    ycfg.curve = static_cast<double>(graphics_settings_.yoke_curve_pct) * 0.01;
+    ycfg.invert_roll = graphics_settings_.yoke_invert_roll;
+    ycfg.invert_pitch = graphics_settings_.yoke_invert_pitch;
+    ycfg.invert_throttle = graphics_settings_.yoke_invert_throttle;
+    ycfg.direct_control = graphics_settings_.yoke_direct;
+    yoke_.poll(ycfg);
+}
+
 void AircraftAndHud::step_inputs_and_physics(const PlatformWindow &win, double dt, const AtmosphereState &atmo, const RegionalAtmosphere &reg_atmo, double sim_time_sec) {
     opentrack_.poll(dt);
+    poll_yoke();
+    const auto &yk = yoke_.state();
     const bool pause = win.key_pressed(KEY_ESC) || win.key_pressed(KEY_SPACE);
     if (!st_.menu_open && pause) {
         st_.menu_open = st_.paused = true;
@@ -510,7 +527,7 @@ void AircraftAndHud::step_inputs_and_physics(const PlatformWindow &win, double d
         st_.look_yaw_deg   = std::clamp(st_.look_yaw_deg   - win.mouse_dx() * 0.22f, -165.0f, 165.0f);
         st_.look_pitch_deg = std::clamp(st_.look_pitch_deg - win.mouse_dy() * 0.18f, -75.0f,  75.0f);
     }
-    if (win.key_pressed(KEY_R)) {
+    if (win.key_pressed(KEY_R) || yk.recenter_pressed) {
         st_.look_yaw_deg = 0.0f;
         st_.look_pitch_deg = 0.0f;
         st_.free_cam_off_m = {0.0f, 3.0f, 12.0f};
@@ -522,6 +539,10 @@ void AircraftAndHud::step_inputs_and_physics(const PlatformWindow &win, double d
         yoke_anchor_valid_ = true;
         taxi_hold_hdg_deg_ = fdm_.state().heading_deg;
         taxi_hold_valid_ = true;
+    }
+    if (std::abs(yk.hat_x) > 0.2 || std::abs(yk.hat_y) > 0.2) {
+        st_.look_yaw_deg = std::clamp(st_.look_yaw_deg - static_cast<float>(yk.hat_x * dt * 110.0), -165.0f, 165.0f);
+        st_.look_pitch_deg = std::clamp(st_.look_pitch_deg - static_cast<float>(yk.hat_y * dt * 85.0), -75.0f, 75.0f);
     }
     if (win.key_pressed(KEY_C)) st_.view_mode = (st_.view_mode + 1) % 3;
     if (st_.view_mode == 0) {
@@ -568,16 +589,24 @@ void AircraftAndHud::step_inputs_and_physics(const PlatformWindow &win, double d
             if (systems_.get_magnetos() == 4) systems_.set_magnetos(3);
             starter_held_ = false;
         }
-        if (win.key_down(KEY_5)) st_.mixture = std::clamp(st_.mixture - dt * 0.55, 0.0, 1.0);
-        if (win.key_down(KEY_6)) st_.mixture = std::clamp(st_.mixture + dt * 0.55, 0.0, 1.0);
+        if (win.key_down(KEY_5)) { st_.mixture = std::clamp(st_.mixture - dt * 0.55, 0.0, 1.0); mixture_hw_active_ = false; }
+        if (win.key_down(KEY_6)) { st_.mixture = std::clamp(st_.mixture + dt * 0.55, 0.0, 1.0); mixture_hw_active_ = false; }
+        if (yk.has_mixture) {
+            if (mixture_hw_last_ < 0.0) mixture_hw_last_ = yk.mixture;
+            else if (std::abs(yk.mixture - mixture_hw_last_) > 0.015) mixture_hw_active_ = true;
+            if (mixture_hw_active_) { st_.mixture = yk.mixture; mixture_hw_last_ = yk.mixture; }
+        }
         if (win.key_pressed(KEY_7)) systems_.set_carb_heat(systems_.get_carb_heat() > 0.5 ? 0.0 : 1.0);
         if (win.key_pressed(KEY_8)) {
             if (!systems_.is_engine_running()) systems_.actuate_primer();
             else systems_.set_pitot_heat_switch(!systems_.get_pitot_heat_switch());
         }
     }
-    if (win.key_pressed(KEY_F)) systems_.set_flaps_target_deg(std::min(aircraft_.max_flaps_deg, systems_.get_flaps_target_deg() + 10.0));
-    if (win.key_pressed(KEY_V)) systems_.set_flaps_target_deg(std::max(0.0, systems_.get_flaps_target_deg() - 10.0));
+    if (win.key_pressed(KEY_F) || yk.flaps_down_pressed) systems_.set_flaps_target_deg(std::min(aircraft_.max_flaps_deg, systems_.get_flaps_target_deg() + 10.0));
+    if (win.key_pressed(KEY_V) || yk.flaps_up_pressed) systems_.set_flaps_target_deg(std::max(0.0, systems_.get_flaps_target_deg() - 10.0));
+    if (yk.parking_brake_pressed && !chocks_on_ && !tie_downs_on_) st_.parking_brake = !st_.parking_brake;
+    if (yk.ap_disc_pressed) st_.ap_master = false;
+    if (std::abs(yk.trim_rate) > 0.1) st_.trim = std::clamp(st_.trim + yk.trim_rate * dt * 0.28, -0.55, 0.55);
     // Cursor-Anchored Trackpad/Mouse Yoke (zero XWarpPointer -> zero XWayland runaway!):
     // Anchors seamlessly around current cursor with compact trackpad travel, magnetic center detent,
     // sliding boundary clamp, and Left-Click / R instant level+recenter.
@@ -647,42 +676,73 @@ void AircraftAndHud::step_inputs_and_physics(const PlatformWindow &win, double d
     else if ((fs_cur.on_ground && fs_cur.ias_kt < 38.0) || std::abs(kb_pitch_cmd_) < 0.09) kb_pitch_cmd_ *= std::exp(-dt * 3.5);
 
     const bool key_rud = win.key_down(KEY_E) || win.key_down(KEY_Q);
-    const double man_rud = (win.key_down(KEY_E) ? 0.65 : 0.0) - (win.key_down(KEY_Q) ? 0.65 : 0.0);
-    const double roll_cmd = std::clamp((mouse_yoke ? mouse_yoke_roll_ : 0.0) + kb_bank_cmd_, -1.0, 1.0);
-    const double pitch_cmd = std::clamp((mouse_yoke ? mouse_yoke_pitch_ : 0.0) + kb_pitch_cmd_, -1.0, 1.0);
-    if (fs_cur.on_ground && (std::abs(roll_cmd) > 0.05 || key_rud)) {
+    const double kb_rud = (win.key_down(KEY_E) ? 0.65 : 0.0) - (win.key_down(KEY_Q) ? 0.65 : 0.0);
+    const bool manual_rud = key_rud || yk.has_rudder;
+    const double man_rud = key_rud ? kb_rud : (yk.has_rudder ? yk.rudder : 0.0);
+    const bool hw_yoke_active = yk.has_yoke && (!mouse_yoke || std::abs(yk.roll) > 0.02 || std::abs(yk.pitch) > 0.02);
+    const double roll_cmd = std::clamp((hw_yoke_active ? yk.roll : (mouse_yoke ? mouse_yoke_roll_ : 0.0)) + kb_bank_cmd_, -1.0, 1.0);
+    const double pitch_cmd = std::clamp((hw_yoke_active ? yk.pitch : (mouse_yoke ? mouse_yoke_pitch_ : 0.0)) + kb_pitch_cmd_, -1.0, 1.0);
+    if (fs_cur.on_ground && (std::abs(roll_cmd) > 0.05 || manual_rud)) {
         taxi_hold_hdg_deg_ = fs_cur.heading_deg;
     }
 
-    double ail_tgt = roll_cmd * 0.70;
-    double elv_tgt = pitch_cmd * 0.70;
+    double ail_tgt = roll_cmd;
+    double elv_tgt = pitch_cmd;
     double rud_tgt = man_rud;
     double assist_brk_l = 0.0, assist_brk_r = 0.0;
     // Cockpit Autopilot (requires electrical + avionics bus & airborne; strong pilot stick overrides/disconnects).
     if (!st_.slew_fast) {
         double eff_roll = roll_cmd, eff_pitch = pitch_cmd;
         apply_autopilot(fs_cur, eff_roll, eff_pitch);
-        const FlightAssistOut assist = compute_flight_and_taxi_assist(
-            eff_roll, eff_pitch, man_rud, key_rud, taxi_hold_hdg_deg_, fs_cur);
-        ail_tgt = assist.aileron;
-        elv_tgt = assist.elevator;
-        rud_tgt = assist.rudder;
-        assist_brk_l = assist.brake_left_add;
-        assist_brk_r = assist.brake_right_add;
-        if (fs_cur.on_ground) {
-            if (!assist.holding_heading) taxi_hold_hdg_deg_ = fs_cur.heading_deg;
-            if (std::abs(roll_cmd) > 0.10 || key_rud) st_.runway_tracking = false;
+        if (hw_yoke_active && graphics_settings_.yoke_direct && !st_.ap_master) {
+            // Direct physical yoke authority: bypasses bank/VSI assist envelope for true manual flight feel.
+            ail_tgt = eff_roll;
+            elv_tgt = eff_pitch;
+            if (manual_rud) {
+                rud_tgt = man_rud;
+            } else if (fs_cur.on_ground) {
+                const double spd = std::max(0.0, fs_cur.ground_speed_mps);
+                if (std::abs(eff_roll) <= 0.04 && spd > 0.6) {
+                    const double hdg_err = std::remainder(taxi_hold_hdg_deg_ - fs_cur.heading_deg, 360.0);
+                    rud_tgt = std::clamp(hdg_err * 0.065 - fs_cur.r_rps * 1.1, -0.75, 0.75);
+                } else {
+                    rud_tgt = std::clamp(eff_roll * 0.85, -0.95, 0.95);
+                }
+            } else {
+                rud_tgt = std::clamp(ail_tgt * 0.35 - fs_cur.beta_deg * 0.050 - fs_cur.r_rps * 0.35, -0.55, 0.55);
+            }
+            if (fs_cur.on_ground && !manual_rud) taxi_hold_hdg_deg_ = fs_cur.heading_deg;
+            else if (!fs_cur.on_ground) taxi_hold_hdg_deg_ = fs_cur.heading_deg;
+            if (fs_cur.on_ground && (std::abs(eff_roll) > 0.10 || manual_rud)) st_.runway_tracking = false;
         } else {
-            taxi_hold_hdg_deg_ = fs_cur.heading_deg;
-            if ((std::abs(pitch_cmd) < 0.14 || st_.ap_master) && !st_.paused)
-                st_.trim = std::clamp(st_.trim + assist.elevator * dt * 0.14, -0.55, 0.55);
+            const FlightAssistOut assist = compute_flight_and_taxi_assist(
+                eff_roll, eff_pitch, man_rud, manual_rud, taxi_hold_hdg_deg_, fs_cur);
+            ail_tgt = assist.aileron;
+            elv_tgt = assist.elevator;
+            rud_tgt = assist.rudder;
+            assist_brk_l = assist.brake_left_add;
+            assist_brk_r = assist.brake_right_add;
+            if (fs_cur.on_ground) {
+                if (!assist.holding_heading) taxi_hold_hdg_deg_ = fs_cur.heading_deg;
+                if (std::abs(roll_cmd) > 0.10 || manual_rud) st_.runway_tracking = false;
+            } else {
+                taxi_hold_hdg_deg_ = fs_cur.heading_deg;
+                if ((std::abs(pitch_cmd) < 0.14 || st_.ap_master) && !st_.paused)
+                    st_.trim = std::clamp(st_.trim + assist.elevator * dt * 0.14, -0.55, 0.55);
+            }
         }
     }
-    st_.aileron  += (ail_tgt - st_.aileron) * std::min(1.0, dt * 11.0);
-    st_.elevator += (elv_tgt - st_.elevator) * std::min(1.0, dt * 11.0);
-    st_.rudder   += (rud_tgt - st_.rudder) * std::min(1.0, dt * 12.0);
-    if (win.key_down(KEY_W)) st_.throttle = std::clamp(st_.throttle + dt * 0.55, 0.0, 1.0);
-    if (win.key_down(KEY_S)) st_.throttle = std::clamp(st_.throttle - dt * 0.55, 0.0, 1.0);
+    const double ctrl_rate = (hw_yoke_active && graphics_settings_.yoke_direct) ? 28.0 : 11.0;
+    st_.aileron  += (ail_tgt - st_.aileron) * std::min(1.0, dt * ctrl_rate);
+    st_.elevator += (elv_tgt - st_.elevator) * std::min(1.0, dt * ctrl_rate);
+    st_.rudder   += (rud_tgt - st_.rudder) * std::min(1.0, dt * (yk.has_rudder ? 24.0 : 12.0));
+    if (win.key_down(KEY_W)) { st_.throttle = std::clamp(st_.throttle + dt * 0.55, 0.0, 1.0); throttle_hw_active_ = false; }
+    if (win.key_down(KEY_S)) { st_.throttle = std::clamp(st_.throttle - dt * 0.55, 0.0, 1.0); throttle_hw_active_ = false; }
+    if (yk.has_throttle) {
+        if (throttle_hw_last_ < 0.0) throttle_hw_last_ = yk.throttle;
+        else if (std::abs(yk.throttle - throttle_hw_last_) > 0.015) throttle_hw_active_ = true;
+        if (throttle_hw_active_) { st_.throttle = yk.throttle; throttle_hw_last_ = yk.throttle; }
+    }
     // Convenience ground brake: holding S at idle smoothly slows the aircraft to a stop!
     const double idle_s_brake = (fs_cur.on_ground && st_.throttle <= 0.02 && win.key_down(KEY_S)) ? 0.65 : 0.0;
 
@@ -721,9 +781,10 @@ void AircraftAndHud::step_inputs_and_physics(const PlatformWindow &win, double d
     if (chocks_on_ || tie_downs_on_) {
         brake_left = brake_right = 1.0;
     } else {
-        const double brk = st_.parking_brake ? 1.0 : std::max(win.key_down(KEY_X) ? brake_eff : 0.0, idle_s_brake * brake_eff);
-        brake_left = std::clamp(brk + assist_brk_l * brake_eff, 0.0, 1.0);
-        brake_right = std::clamp(brk + assist_brk_r * brake_eff, 0.0, 1.0);
+        const double brk_btn = (win.key_down(KEY_X) || yk.brake_held) ? brake_eff : 0.0;
+        const double brk = st_.parking_brake ? 1.0 : std::max(brk_btn, idle_s_brake * brake_eff);
+        brake_left = std::clamp(std::max(brk, yk.brake_left * brake_eff) + assist_brk_l * brake_eff, 0.0, 1.0);
+        brake_right = std::clamp(std::max(brk, yk.brake_right * brake_eff) + assist_brk_r * brake_eff, 0.0, 1.0);
     }
     if (fs.on_ground && fs.ground_speed_mps > 2.0 && std::abs(gear_alignment_) > 0.01) {
         rudder = std::clamp(rudder + gear_alignment_ * 0.16, -1.0, 1.0);
@@ -734,7 +795,7 @@ void AircraftAndHud::step_inputs_and_physics(const PlatformWindow &win, double d
         const double east = (fs.lon_deg - departure_lon_) * pack_->anchor_m_lon();
         const double cross_track = east * std::cos(heading) - north * std::sin(heading);
         if ((!fs.on_ground && fs.agl_m > 2.0) || std::abs(cross_track) > 15.0 ||
-            win.key_down(KEY_Q) || win.key_down(KEY_E)) {
+            win.key_down(KEY_Q) || win.key_down(KEY_E) || std::abs(yk.rudder) > 0.12) {
             st_.runway_tracking = false;
         } else if (fs.on_ground && !st_.parking_brake) {
             // Aim ahead on the centreline, damping yaw so the nose wheel does
@@ -1823,7 +1884,11 @@ void AircraftAndHud::render_hud(
 
 void AircraftAndHud::flush_hud(float wf, float hf, GLuint font) {
     if (hud_verts_.empty()) return;
-    size_t max_v = std::min<size_t>(hud_verts_.size(), 32768);
+    if (hud_verts_.size() > hud_vbo_cap_) {
+        while (hud_vbo_cap_ < hud_verts_.size()) hud_vbo_cap_ = std::max<size_t>(32768, hud_vbo_cap_ * 2);
+        glNamedBufferData(hud_vbo_, static_cast<GLsizeiptr>(hud_vbo_cap_ * sizeof(HudVert)), nullptr, GL_STREAM_DRAW);
+    }
+    const size_t max_v = hud_verts_.size();
     glNamedBufferSubData(hud_vbo_, 0, static_cast<GLsizeiptr>(max_v * sizeof(HudVert)), hud_verts_.data());
 
     glDisable(GL_DEPTH_TEST);

@@ -99,6 +99,7 @@ private:
     GLint u_cld_base_ = -1, u_cld_thick_ = -1, u_cld_cov_ = -1, u_cld_precip_ = -1, u_cld_time_ = -1;
     GLint u_cld_frame_ = -1, u_cld_tblend_ = -1, u_cld_steps_ = -1, u_cld_sparse_ = -1;
     GLint u_cld_lit_ = -1, u_cld_sh_ = -1, u_cld_cool_ = -1, u_cld_warm_ = -1, u_cld_dom_ = -1, u_cld_local_dom_ = -1, u_cld_wx_fx_ = -1;
+    GLint u_cld_advect_ = -1;
     GLint u_post_exp_ = -1, u_post_sun_uv_ = -1, u_post_warm_ = -1;
     GLint u_post_inv_vp_ = -1, u_post_prev_vp_ = -1, u_post_camera_delta_ = -1;
     GLint u_post_history_valid_ = -1, u_post_aa_mode_ = -1;
@@ -124,6 +125,8 @@ private:
     bool history_valid_ = false;
     Mat4 prev_vp_ = Mat4::identity();
     double prev_cam_east_m_ = 0.0, prev_cam_north_m_ = 0.0, prev_cam_alt_m_ = 0.0;
+    Vec2 cloud_advect_en_{0.0f, 0.0f};
+    double cloud_advect_time_ = -1.0;
     Vec3 prev_camera_forward_{0.0f, 0.0f, -1.0f};
     bool prev_camera_valid_ = false;
     bool cycle_clock_seeded_ = false;

@@ -283,7 +283,85 @@ int run_selftest(const PackReader &pack) {
             return 1;
         }
     }
+    // Verify local weather refinement stays numerically stable and spatially coherent at both 192^2 and 384^2.
+    for (int detail : {1, 2}) {
+        RegionalAtmosphere local_atmo;
+        local_atmo.set_solver_seed(0x4F50534Bu, true);
+        if (!local_atmo.init(&pack, false, "", false)) {
+            std::fprintf(stderr, "[FAIL] Local refinement init failed (detail=%d)\n", detail);
+            return 1;
+        }
+        local_atmo.set_manual_weather_override(true);
+        local_atmo.set_regime(WindRegime::CONVECTIVE_STORM);
+        local_atmo.set_grid_detail(detail, 42.53131, 0.47676);
+        local_atmo.update_field(sun_day, 0.0, true, 0.94f);
+        for (int step = 1; step <= 80; ++step)
+            local_atmo.update_field(sun_day, step * 0.75, false, 0.94f);
+        const double ce = (0.47676 - pack.anchor_lon()) * pack.anchor_m_lon();
+        const double cn = (42.53131 - pack.anchor_lat()) * pack.anchor_m_lat();
+        for (int lev = 0; lev < 4; ++lev) {
+            const auto slice = local_atmo.debug_slice(ce, cn, lev, 4 * detail);
+            if (!slice.locally_refined) {
+                std::fprintf(stderr, "[FAIL] Local refinement slice inactive (detail=%d lev=%d)\n", detail, lev);
+                return 1;
+            }
+            double dot_sum = 0.0, sum_ux = 0.0, sum_uy = 0.0;
+            int pairs = 0, valid_n = 0;
+            float max_spd = 0.0f;
+            for (int r = 0; r < slice.width; ++r) {
+                for (int c = 0; c < slice.width; ++c) {
+                    const auto &cell = slice.cells[static_cast<size_t>(r * slice.width + c)];
+                    if (!cell.valid) continue;
+                    const float spd = std::hypot(cell.wind_enu_mps.x, cell.wind_enu_mps.y);
+                    if (!std::isfinite(spd) || spd > 50.0f) {
+                        std::fprintf(stderr, "[FAIL] Local refinement unstable wind=%.2f (detail=%d lev=%d)\n", spd, detail, lev);
+                        return 1;
+                    }
+                    max_spd = std::max(max_spd, spd);
+                    if (spd > 0.5f) {
+                        sum_ux += cell.wind_enu_mps.x / spd;
+                        sum_uy += cell.wind_enu_mps.y / spd;
+                        ++valid_n;
+                    }
+                    if (c + 1 < slice.width && spd > 0.5f) {
+                        const auto &nb = slice.cells[static_cast<size_t>(r * slice.width + c + 1)];
+                        const float nspd = std::hypot(nb.wind_enu_mps.x, nb.wind_enu_mps.y);
+                        if (nb.valid && nspd > 0.5f) {
+                            dot_sum += (cell.wind_enu_mps.x * nb.wind_enu_mps.x +
+                                        cell.wind_enu_mps.y * nb.wind_enu_mps.y) / (spd * nspd);
+                            ++pairs;
+                        }
+                    }
+                }
+            }
+            const double coherence = pairs > 0 ? dot_sum / pairs : 0.0;
+            const double min_coh = lev == 0 ? 0.72 : 0.90;
+            if (pairs < 40 || coherence < min_coh) {
+                std::fprintf(stderr, "[FAIL] Local refinement incoherent (detail=%d lev=%d coh=%.3f max_spd=%.1f)\n",
+                             detail, lev, coherence, max_spd);
+                return 1;
+            }
+            // Surface flow in the Pyrenees must visibly deform around valley slopes (not point uniformly).
+            if (lev == 0 && valid_n > 10) {
+                const double mn_len = std::max(1e-6, std::hypot(sum_ux, sum_uy));
+                const double mx = sum_ux / mn_len, my = sum_uy / mn_len;
+                double min_align = 1.0;
+                for (const auto &cell : slice.cells) {
+                    if (!cell.valid) continue;
+                    const float spd = std::hypot(cell.wind_enu_mps.x, cell.wind_enu_mps.y);
+                    if (spd > 0.5f)
+                        min_align = std::min(min_align, (cell.wind_enu_mps.x * mx + cell.wind_enu_mps.y * my) / spd);
+                }
+                if (min_align > 0.95) { // < 18 deg max deflection from slice mean (~36 deg peak-to-peak)
+                    std::fprintf(stderr, "[FAIL] Local refinement shows too little flow deformation (detail=%d min_align=%.3f)\n",
+                                 detail, min_align);
+                    return 1;
+                }
+            }
+        }
+    }
     if (!AudioEngine::run_selftest()) return 1;
+    if (!nspain::FlightYokeInput::run_selftest()) return 1;
     if (!LivingTraffic::run_selftest(pack)) return 1;
     const auto &w = atmo.weather();
     std::printf("[SELFTEST OK] LEZG=%.1fm LEHC=%.1fm ES-0205=%.1fm | baked %s | WX %s | Cierzo=%.1fkt pyr_night_n=%.1f dVn(day-night)=%.1f | stormTurb=%.2f clearTurb=%.2f | ice=%.2f snow=%.2f\n",
@@ -332,6 +410,7 @@ int main(int argc, char **argv) {
     bool weather_model_debug = false;
     bool no_audio = false;
     bool no_live_weather = false;
+    bool offscreen = false;
     // Mode-6 BC7 keeps the same 16-byte blocks while releasing L7-L9 pages
     // about four times faster than the partition-search encoder on Renoir.
     OrthoFormat ortho_format = OrthoFormat::BC7Fast;
@@ -402,6 +481,7 @@ int main(int argc, char **argv) {
         else if (a == "--record-crossing-flight" && i + 1 < argc) record_crossing_path = argv[++i];
         else if (a == "--replay-flight" && i + 1 < argc) replay_flight_path = argv[++i];
         else if (a == "--replay-headless") replay_headless = true;
+        else if (a == "--offscreen") offscreen = true;
         else if (a == "--online-ortho" && i + 1 < argc) {
             ortho_explicit = true;
             std::string p = argv[++i];
@@ -542,17 +622,16 @@ int main(int argc, char **argv) {
     const int output_w = !topdown_dir.empty() ? 1024 : (portrait_promo ? 1080 : GAME_OUTPUT_W);
     const int output_h = !topdown_dir.empty() ? 1024 : (portrait_promo ? 1920 : GAME_OUTPUT_H);
     if (!win.create("OpenSky VFR Simulator", output_w, output_h,
-                    static_cast<DisplayMode>(graphics_settings.display_mode), !promo_only)) {
+                    static_cast<DisplayMode>(graphics_settings.display_mode), !(promo_only || offscreen))) {
         return 1;
     }
-    // Cap FPS to monitor refresh rate (<= 60 Hz for iGPU thermal stability <80C) and enable VSync interactively.
-    const double fps_cap = std::clamp(win.refresh_hz(), 30.0, 60.0);
-    const double frame_period = 1.0 / fps_cap;
-    if (interactive_run) win.set_vsync(true);
-    std::printf("[OPENSKY] OpenGL %s | Renderer: %s | %dx%d output, %dx%d window (%.0f Hz, limit %.0f FPS) | %zu region(s) | %d tiles | %zu airfields | %zu OSM bldgs | %zu OSM roads\n",
+    bool active_vsync = interactive_run && graphics_settings.vsync;
+    if (interactive_run) win.set_vsync(active_vsync);
+    std::printf("[OPENSKY] OpenGL %s | Renderer: %s | %dx%d output, %dx%d window (%.0f Hz, limit %d FPS, VSync %s) | %zu region(s) | %d tiles | %zu airfields | %zu OSM bldgs | %zu OSM roads\n",
                 reinterpret_cast<const char *>(glGetString(GL_VERSION)),
                 reinterpret_cast<const char *>(glGetString(GL_RENDERER)),
-                output_w, output_h, win.width(), win.height(), win.refresh_hz(), fps_cap,
+                output_w, output_h, win.width(), win.height(), win.refresh_hz(),
+                graphics_settings.fps_limit, active_vsync ? "on" : "off",
                 pack.regions().size(), pack.tile_count(), pack.airports().size(), pack.buildings().size(), pack.roads().size());
 
     profiler.init_gpu();
@@ -624,6 +703,8 @@ int main(int argc, char **argv) {
         }
     }
     reg_atmo.set_season(season_override);
+    if (weather_arg != "auto" || season_override >= 0)
+        reg_atmo.update_field(normalize(Vec3(0.86f, 0.32f, 0.38f)), 0.0, true, wx_advance);
     profiler.startup_stage("weather_init");
     if (!cockpit_qa && !objects.init(&pack, root + "/game/assets", root + "/sim_engine/shaders", packs_dir)) return 1;
     if (!cockpit_qa && !living_traffic.init(&pack, root + "/sim_engine/shaders")) {
@@ -839,7 +920,7 @@ int main(int argc, char **argv) {
         RouteVideoRecording active_rec;
         GameFrontend::ReplayAction last_action = GameFrontend::ReplayAction::None;
     } route_play;
-    const auto update_environment = [&] {
+    const auto update_environment = [&](bool step_weather = true) {
         const double weather_start = profiler.cpu_start();
         const bool walking = frontend.walking();
         const auto &walker = frontend.walker();
@@ -849,7 +930,7 @@ int main(int argc, char **argv) {
         const double cam_ground = walking ? walker.alt - 1.68 : aircraft.ground_m;
         if ((frame_idx % 180) == 0) reg_atmo.sync_region(lat, lon);
         if (!walking) reg_atmo.update_refinement_center(aircraft.lat_deg, aircraft.lon_deg);
-        reg_atmo.update_field(sky_clouds.atmo().sun_dir, sim_time, false, wx_advance);
+        if (step_weather) reg_atmo.update_field(sky_clouds.atmo().sun_dir, sim_time, false, wx_advance);
         const WeatherSnapshot *bakedw = reg_atmo.has_weather() ? &reg_atmo.weather() : nullptr;
         sky_clouds.update_solar_and_weather(lat, lon, cam_ground, tod_slot, sim_time,
                                             regime_fog_mult(), wx_advance, bakedw, season_override,
@@ -875,24 +956,34 @@ int main(int argc, char **argv) {
             last_thermal_check_t = wall_now;
             const double temp_c = FlightProfiler::peak_package_temp_c();
             const double avg_ms = profiler.enabled() ? profiler.frame_avg_ms() : cur_avg_ms;
-            if (temp_c >= 76.5) {
+            if (temp_c >= 77.5) {
                 thermal_pixel_cap = 40;
-                streamer.set_thermal_sleep_ms(16);
+                streamer.set_thermal_sleep_ms(26);
+                reg_atmo.set_thermal_sleep_ms(60);
+                sky_clouds.set_thermal_sparse_clouds(true);
+                thermal_fps_cap = 24.0;
+            } else if (temp_c >= 74.5) {
+                thermal_pixel_cap = 42;
+                streamer.set_thermal_sleep_ms(18);
+                reg_atmo.set_thermal_sleep_ms(32);
                 sky_clouds.set_thermal_sparse_clouds(true);
                 thermal_fps_cap = 30.0;
-            } else if (temp_c >= 73.5) {
-                thermal_pixel_cap = std::max(44, thermal_pixel_cap - 6);
-                streamer.set_thermal_sleep_ms(6);
+            } else if (temp_c >= 72.0) {
+                thermal_pixel_cap = std::max(46, thermal_pixel_cap - 6);
+                streamer.set_thermal_sleep_ms(8);
+                reg_atmo.set_thermal_sleep_ms(12);
                 sky_clouds.set_thermal_sparse_clouds(true);
                 thermal_fps_cap = 40.0;
-            } else if (temp_c >= 69.5 || (avg_ms > 0.1 && avg_ms >= 17.5)) {
+            } else if (temp_c >= 69.0 || (avg_ms > 0.1 && avg_ms >= 17.5)) {
                 thermal_pixel_cap = std::max(50, thermal_pixel_cap - 4);
                 streamer.set_thermal_sleep_ms(0);
-                sky_clouds.set_thermal_sparse_clouds(temp_c >= 71.0);
-                thermal_fps_cap = (temp_c >= 71.0) ? 48.0 : 60.0;
+                reg_atmo.set_thermal_sleep_ms(0);
+                sky_clouds.set_thermal_sparse_clouds(temp_c >= 70.5);
+                thermal_fps_cap = (temp_c >= 70.5) ? 48.0 : 60.0;
             } else if ((temp_c <= 0.0 || temp_c <= 64.0) && (avg_ms <= 0.1 || avg_ms <= 14.5)) {
                 thermal_pixel_cap = std::min(85, thermal_pixel_cap + 3);
                 streamer.set_thermal_sleep_ms(0);
+                reg_atmo.set_thermal_sleep_ms(0);
                 sky_clouds.set_thermal_sparse_clouds(false);
                 thermal_fps_cap = 60.0;
             }
@@ -1180,7 +1271,8 @@ int main(int argc, char **argv) {
             const double present_start = profiler.cpu_start();
             const PixelRect viewport = win.presentation_rect(output_w, output_h);
             sky_clouds.present(viewport.x, viewport.y, viewport.w, viewport.h, win.width(), win.height());
-            win.swap_buffers();
+            if (offscreen) glFlush();
+            else win.swap_buffers();
             profiler.cpu_end(FlightProfiler::Present, present_start);
         }
         if (profiler.enabled()) {
@@ -1472,6 +1564,7 @@ int main(int argc, char **argv) {
         reg_atmo.set_regime(static_cast<WindRegime>(trace.weather_regime));
         reg_atmo.set_season(trace.season);
         transition_world(dep->lat, dep->lon);
+        reg_atmo.update_field(sky_clouds.atmo().sun_dir, 0.0, true, wx_advance);
 
         ScopedTempDir replay_tmp("opensky-gpu-replay-XXXXXX");
         if (replay_tmp.dir.empty()) return 1;
@@ -1505,6 +1598,7 @@ int main(int argc, char **argv) {
 
         profiler.set_scene("crossing_replay");
         const double target_frame_s = 1.0 / std::clamp(win.refresh_hz(), 30.0, 60.0);
+        double next_wx_t = 45.0;
 
         for (size_t i = 0; i < trace.steps.size() && !win.should_close(); ++i) {
             const ReplayStep &rs = trace.steps[i];
@@ -1512,7 +1606,9 @@ int main(int argc, char **argv) {
             win.poll_events();
 
             sim_time += rs.dt;
-            update_environment();
+            const bool due_wx = sim_time >= next_wx_t;
+            if (due_wx) next_wx_t = sim_time + 45.0;
+            if (due_wx || (i & 15ULL) == 0) update_environment(due_wx);
             const double phys_t0 = profiler.cpu_start();
             apply_replay_step(ac_hud, replay_session, rs, sky_clouds.atmo(), reg_atmo, sim_time);
             profiler.cpu_end(FlightProfiler::InputPhysics, phys_t0);
@@ -1535,6 +1631,7 @@ int main(int argc, char **argv) {
             const double tr_t0 = PlatformWindow::now_sec();
             const bool did_commit = step_flight_world_transition(
                 flight.lat_deg, flight.lon_deg, flight.vel_east_mps, flight.vel_north_mps);
+            if (did_commit) next_wx_t = sim_time + 45.0;
             const double tr_ms = (PlatformWindow::now_sec() - tr_t0) * 1000.0;
             if (did_commit && boundary.crossed_region && boundary.commit_wall_ms < 0.0 &&
                 pack.find_region_at(pack.anchor_lat(), pack.anchor_lon()) == cur_reg) {
@@ -1599,7 +1696,7 @@ int main(int argc, char **argv) {
 
             const double pace_budget = pace_realtime
                 ? std::max(target_frame_s, 1.0 / thermal_fps_cap)
-                : ((render_step && thermal_fps_cap < 55.0) ? std::min(0.016, 1.0 / thermal_fps_cap) : 0.0);
+                : ((render_step && thermal_fps_cap < 55.0) ? (1.0 / thermal_fps_cap) : 0.0);
             const double spare = pace_budget - (PlatformWindow::now_sec() - loop_t0);
             if (spare > 0.0005) std::this_thread::sleep_for(std::chrono::duration<double>(spare));
         }
@@ -2650,7 +2747,10 @@ int main(int argc, char **argv) {
             step_flight_world_transition(rs.lat_deg, rs.lon_deg, rs.vel_east_mps, rs.vel_north_mps);
             render_one_frame(false, 1, "", 50.0f, true);
             push_audio_state(dt, true);
-            const double eff_period = std::max(frame_period, 1.0 / thermal_fps_cap);
+            const int lim = ac_hud.graphics_settings().fps_limit;
+            const double user_p = lim > 0 ? (1.0 / static_cast<double>(lim)) : 0.0;
+            const double thermal_p = (thermal_fps_cap < 59.5) ? (1.0 / thermal_fps_cap) : 0.0;
+            const double eff_period = std::max(user_p, thermal_p);
             const double spare = eff_period - (PlatformWindow::now_sec() - now);
             if (spare > 0.0005) std::this_thread::sleep_for(std::chrono::duration<double>(spare));
             continue;
@@ -2686,6 +2786,10 @@ int main(int argc, char **argv) {
             }
             frontend.draw_menu(ac_hud, sky_clouds, win, !airfield_pages.empty(), tod_slot, &reg_atmo, sim_time);
             quality = ac_hud.graphics_settings().quality_preset;
+            if (ac_hud.graphics_settings().vsync != active_vsync) {
+                active_vsync = ac_hud.graphics_settings().vsync;
+                win.set_vsync(active_vsync);
+            }
             const auto viewport = win.presentation_rect(output_w, output_h);
             sky_clouds.present(viewport.x, viewport.y, viewport.w, viewport.h, win.width(), win.height());
             win.swap_buffers();
@@ -2694,7 +2798,10 @@ int main(int argc, char **argv) {
                 pack.set_online_provider(provider);
                 streamer.invalidate_close_pages();
             }
-            const double menu_period = std::max(1.0 / 45.0, 1.0 / thermal_fps_cap);
+            const int lim = ac_hud.graphics_settings().fps_limit;
+            const double user_p = lim > 0 ? (1.0 / static_cast<double>(lim)) : 0.0;
+            const double thermal_p = (thermal_fps_cap < 59.5) ? (1.0 / thermal_fps_cap) : 0.0;
+            const double menu_period = std::max({user_p, thermal_p, 1.0 / 60.0});
             const double spare = menu_period - (PlatformWindow::now_sec() - now);
             push_audio_state(dt, true);
             if (spare > 0.0005) std::this_thread::sleep_for(std::chrono::duration<double>(spare));
@@ -2706,7 +2813,10 @@ int main(int argc, char **argv) {
             update_environment();
             render_one_frame(true);
             push_audio_state(dt, false);
-            const double walk_period = std::max(frame_period, 1.0 / thermal_fps_cap);
+            const int lim = ac_hud.graphics_settings().fps_limit;
+            const double user_p = lim > 0 ? (1.0 / static_cast<double>(lim)) : 0.0;
+            const double thermal_p = (thermal_fps_cap < 59.5) ? (1.0 / thermal_fps_cap) : 0.0;
+            const double walk_period = std::max(user_p, thermal_p);
             const double spare = walk_period - (PlatformWindow::now_sec() - now);
             if (spare > 0.0005) std::this_thread::sleep_for(std::chrono::duration<double>(spare));
             continue;
@@ -2806,8 +2916,11 @@ int main(int argc, char **argv) {
             ac_hud.graphics_settings().show_flight_hud || frontend.tutorial_open();
         render_one_frame(show_flight_overlays);
         push_audio_state(dt, ac_hud.state().paused || ac_hud.state().menu_open);
-        // Closed-loop frame pacing caps GPU/CPU load so long flights remain cool (<80 C).
-        const double eff_period = std::max(frame_period, 1.0 / thermal_fps_cap);
+        // Closed-loop frame pacing respects user FPS limit and thermal guard (<80 C).
+        const int lim = ac_hud.graphics_settings().fps_limit;
+        const double user_p = lim > 0 ? (1.0 / static_cast<double>(lim)) : 0.0;
+        const double thermal_p = (thermal_fps_cap < 59.5) ? (1.0 / thermal_fps_cap) : 0.0;
+        const double eff_period = std::max(user_p, thermal_p);
         const double spare = eff_period - (PlatformWindow::now_sec() - now);
         if (spare > 0.0005) std::this_thread::sleep_for(std::chrono::duration<double>(spare));
     }

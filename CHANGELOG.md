@@ -4,6 +4,11 @@ This file records user-visible changes. No GitHub release version has been assig
 
 ## Unreleased
 
+- Fixed acoustic CFL instability, Davies nested boundary coupling, and debug pathline visualization in local weather refinement (`192×192` / `384×384`), added dividing-streamline orographic terrain flow deflection, and updated the 9:16 vertical weather promo videos.
+- Replaced World map wind arrows with an animated, zoom-adaptive GPU streamline flowmap across all installed `.nswx` regions.
+- Replaced scrolling raindrop LUTs on cockpit glass with procedural optical convex-lens water beads and meandering stick-slip rivulets.
+- Added live VSync and FPS limiter controls in **Settings** (`graphics.ini`).
+- Added plug-and-play Linux `evdev` USB flight yoke, rudder pedal (with differential toe brakes), and throttle/mixture quadrant support with Direct/Assisted mode, deadzone, S-curve, axis invert, and Center calibration in **Settings** and **Controls**.
 - Added folder-based aircraft packages with a manifest, package-local JSBSim data, exterior/cockpit GLB assets, configurable two-tank capacities, oil capacity, flap travel, electrical bus, and GLTF node mappings.
 - Added aircraft discovery with `--list-aircraft`, selection with `--aircraft <id>`, and fleet profile v4 persistence while retaining v1-v3 readers.
 - Generalized the shared light-piston systems class while preserving the factory C172S profile and saves.

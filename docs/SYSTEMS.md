@@ -29,7 +29,7 @@ The game also models a walkaround with service points, chocks/tie-downs/pitot co
 | City/world objects | Streams baked city chunks, buildings, landmarks and OSM scenery | `sim_engine/src/world_objects.*` |
 | Airfield vegetation | Draws close airport foliage and local ground vegetation | `sim_engine/src/airfield_vegetation.*` |
 | Traffic | Updates regional aircraft and maritime traffic | `sim_engine/src/living_traffic.*` |
-| Map relief | Loads `.relief.png` region sidecars once, creates mipmaps and composites a shared relief palette | `sim_engine/src/game_frontend.cpp`, `sim_engine/shaders/frontend.frag` |
+| Map relief & flowmap | Loads `.relief.png` region sidecars once, creates mipmaps, and renders an animated GPU weather flowmap across installed regions | `sim_engine/src/game_frontend.cpp`, `sim_engine/shaders/frontend.frag` |
 
 Pack readers and terrain jobs share immutable `PackReader::WorldFrame` data. Region transitions are centralized. Completed work carries its world generation and is rejected if it belongs to an older region. Keep cache and staging limits bounded; generated packs and caches are not source artifacts.
 
@@ -41,13 +41,13 @@ The World screen shows input provenance and reports when an airport is outside a
 
 ## Rendering and input
 
-`PlatformWindow` owns X11/GLX on the active Linux runtime. It supports decorated windowed mode, desktop fullscreen, and borderless fullscreen-windowed mode; display mode changes apply after restart. `gl_loader` resolves OpenGL functions. `main.cpp` orders the sky, terrain, world, clouds, aircraft, cockpit and interface passes. `volumetric_clouds.*` includes cloud rendering and post processing. `game_frontend.*` renders menus and map overlays; `aircraft_hud.*` renders flight-state, cockpit interaction and in-flight interface overlays. Flight overlays are hidden by default for an immersive view; the player can enable them in Settings or toggle the controls guide with `T`.
+`PlatformWindow` owns X11/GLX on the active Linux runtime. It supports decorated windowed mode, desktop fullscreen, and borderless fullscreen-windowed mode (applied after restart), plus live VSync and frame-rate limiting in Settings. `gl_loader` resolves OpenGL functions. `main.cpp` orders the sky, terrain, world, clouds, aircraft, cockpit and interface passes. `volumetric_clouds.*` includes cloud rendering and post processing. `game_frontend.*` renders menus and map overlays; `aircraft_hud.*` renders flight-state, cockpit interaction, procedural optical cockpit rain, and in-flight interface overlays. Flight overlays are hidden by default for an immersive view; the player can enable them in Settings or toggle the controls guide with `T`.
 
 The first-flight guide appears for a new profile, explains map browsing, walkaround, basic flight and saved-base parking, and can be reopened from the World screen. Its completion marker is stored separately from the fleet profile.
 
-Graphics settings persist in the user's config directory. Internal scene resolution follows quality settings. Avoid full-resolution depth copies and SSAO on low tiers, throttle expensive atmosphere/reflection work, and keep CPU/GPU uploads within per-frame budgets. These constraints target 60 FPS or better on AMD Renoir, although the published benchmark still records gaps.
+Graphics settings persist in the user's config directory (`graphics.ini`). Internal scene resolution follows quality settings. Avoid full-resolution depth copies and SSAO on low tiers, throttle expensive atmosphere/reflection work, and keep CPU/GPU uploads within per-frame budgets targeting 60 FPS or better on AMD Renoir.
 
-Input translation lives in `PlatformWindow`. The frontend handles clicks and screen-space interface. Aircraft input is applied to the physical simulation at the next fixed step. OpenTrack receives head-tracking input through UDP in its own adapter.
+Input translation lives in `PlatformWindow`, with multi-device plug-and-play USB flight yoke, rudder pedal, and throttle quadrant input handled via Linux `evdev` in `engine/src/flight_yoke.*`. Hardware deadzone, S-curve sensitivity, inversion, Direct vs Assisted mode, and center calibration live in `Settings`. Aircraft input is applied to the physical simulation at the next fixed step. OpenTrack receives head-tracking input through UDP in its own adapter.
 
 ## Audio
 

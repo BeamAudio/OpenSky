@@ -4,13 +4,117 @@ layout(location = 0) out vec4 frag_color;
 layout(binding = 0) uniform sampler2D u_land;
 layout(binding = 1) uniform sampler2DArray u_relief;
 layout(binding = 2) uniform sampler2DArray u_wx_field;
+layout(binding = 3) uniform sampler2DArray u_region_wx;
 layout(std430, binding = 0) readonly buffer InstalledBounds { vec4 bounds[]; };
 uniform vec3 u_globe; // centre latitude, longitude, and radius / viewport height
 uniform float u_aspect;
 uniform int u_region_count;
-uniform vec4 u_wx_geo;     // lon_min, lat_min, inv_lon_span, inv_lat_span
-uniform float u_wx_overlay; // >0.5 draws live weather model cloud/rain/wind radar over map
+uniform vec4 u_wx_geo;        // lon_min, lat_min, inv_lon_span, inv_lat_span (active live model)
+uniform float u_wx_overlay;   // >0.5 draws animated wind flowmap, clouds, and precipitation
+uniform float u_wx_base_cloud;
 uniform float u_wx_time;
+
+vec2 hash22(vec2 p) {
+    vec3 p3 = fract(vec3(p.xyx) * vec3(0.1031, 0.1030, 0.0973));
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.xx + p3.yz) * p3.zy);
+}
+
+bool sample_flow_wx(vec2 deg, out vec2 wind, out float cloud, out float rain) {
+    wind = vec2(0.0);
+    cloud = 0.0;
+    rain = 0.0;
+    if (u_wx_geo.z > 0.0 && u_wx_geo.w > 0.0) {
+        vec2 wuv = (deg - u_wx_geo.xy) * u_wx_geo.zw;
+        if (all(greaterThanEqual(wuv, vec2(0.0))) && all(lessThanEqual(wuv, vec2(1.0)))) {
+            // Surface/valley layer (L0) exposes full topographic flow deflection, ridges, and channeling.
+            vec4 mf0 = textureLod(u_wx_field, vec3(wuv, 0.0), 0.0);
+            vec2 off = vec2(0.012, 0.016);
+            float cw_avg = 0.25 * (
+                textureLod(u_wx_field, vec3(wuv + vec2(off.x, 0.0), 1.0), 0.0).w +
+                textureLod(u_wx_field, vec3(wuv - vec2(off.x, 0.0), 1.0), 0.0).w +
+                textureLod(u_wx_field, vec3(wuv + vec2(0.0, off.y), 1.0), 0.0).w +
+                textureLod(u_wx_field, vec3(wuv - vec2(0.0, off.y), 1.0), 0.0).w);
+            wind = mf0.xy;
+            cloud = clamp(u_wx_base_cloud + cw_avg, 0.0, 1.0);
+            rain = textureLod(u_wx_field, vec3(wuv, 4.0), 0.0).g;
+            return true;
+        }
+    }
+    for (int i = 0; i < u_region_count; ++i) {
+        vec4 b = bounds[2 * i];
+        int wlayer = int(bounds[2 * i + 1].y);
+        if (wlayer < 0 || any(lessThan(deg, b.xy)) || any(greaterThan(deg, b.zw))) continue;
+        vec2 uv = (deg - b.xy) / max(vec2(1e-5), b.zw - b.xy);
+        vec4 rf = textureLod(u_region_wx, vec3(uv, float(wlayer)), 0.0);
+        wind = rf.xy;
+        rain = rf.z;
+        cloud = clamp(rf.w, 0.0, 1.0);
+        return true;
+    }
+    return false;
+}
+
+vec3 wind_palette(float spd) {
+    vec3 c0 = vec3(0.38, 0.78, 0.98); // light (<8 kt)
+    vec3 c1 = vec3(0.32, 0.94, 0.86); // moderate (~18 kt)
+    vec3 c2 = vec3(0.95, 0.88, 0.34); // fresh/strong (~30 kt)
+    vec3 c3 = vec3(1.00, 0.46, 0.28); // gale (40+ kt)
+    vec3 col = mix(c0, c1, smoothstep(3.0, 9.0, spd));
+    col = mix(col, c2, smoothstep(9.0, 15.5, spd));
+    return mix(col, c3, smoothstep(15.5, 22.0, spd));
+}
+
+// One zoom-octave of animated multi-segment curved streamlines wrapping around ridges and valleys.
+float flow_streaks(vec2 mpos, float cos_lat, float cell_size, float time_s, out float best_spd) {
+    vec2 base_id = floor(mpos / cell_size);
+    float best = 0.0;
+    best_spd = 0.0;
+    for (int oy = -1; oy <= 1; ++oy) {
+        for (int ox = -1; ox <= 1; ++ox) {
+            vec2 cid = base_id + vec2(float(ox), float(oy));
+            vec2 h = hash22(cid);
+            vec2 p0 = (cid + 0.14 + 0.72 * h) * cell_size;
+            vec2 cw; float cc, cr;
+            if (!sample_flow_wx(vec2(p0.x / cos_lat, p0.y), cw, cc, cr)) continue;
+            float spd = length(cw);
+            if (spd < 0.25) continue;
+            vec2 d0 = cw / spd;
+            float rate = clamp(0.24 + spd * 0.044, 0.28, 1.45);
+            float phase = fract(h.x * 1.73 + h.y * 2.41 + time_s * rate);
+            float life = sin(phase * 3.14159265);
+            // Advect head forward along curved field, then trace 3-segment curved tail backward.
+            vec2 head = p0 + d0 * ((phase - 0.35) * cell_size * 1.25);
+            float seg_len = cell_size * clamp(0.24 + spd * 0.020, 0.24, 0.48);
+            vec2 cur = head;
+            vec2 dir = d0;
+            float best_s = 0.0;
+            for (int s = 0; s < 3; ++s) {
+                vec2 sw; float sc, sr;
+                if (sample_flow_wx(vec2(cur.x / cos_lat, cur.y), sw, sc, sr) && length(sw) > 0.25)
+                    dir = normalize(sw);
+                vec2 prev = cur - dir * seg_len;
+                vec2 ba = prev - cur;
+                float denom = max(1e-7, dot(ba, ba));
+                float u = clamp(dot(mpos - cur, ba) / denom, 0.0, 1.0);
+                float dist = length((mpos - cur) - ba * u) / cell_size;
+                float t_tail = (float(s) + u) / 3.0;
+                float half_w = mix(0.048, 0.011, t_tail);
+                float seg_mask = 1.0 - smoothstep(half_w * 0.42, half_w + 0.022, dist);
+                float fade = mix(1.0, 0.12, pow(t_tail, 0.72));
+                best_s = max(best_s, seg_mask * fade);
+                cur = prev;
+            }
+            float val = best_s * (0.28 + 0.72 * life);
+            if (val > best) {
+                best = val;
+                best_spd = spd;
+            }
+        }
+    }
+    return best;
+}
+
 void main() {
     vec2 p = (v_uv - .5) * vec2(u_aspect, 1.0) / u_globe.z;
     float r2 = dot(p, p);
@@ -50,28 +154,35 @@ void main() {
                                           geo_dx * texture_scale, geo_dy * texture_scale);
                 color = mix(color, relief.rgb, relief.a * land);
             }
-            if (u_wx_overlay > 0.5 && u_wx_geo.z > 0.0 && u_wx_geo.w > 0.0) {
-                vec2 wuv = (degrees - u_wx_geo.xy) * u_wx_geo.zw;
-                if (all(greaterThanEqual(wuv, vec2(0.0))) && all(lessThanEqual(wuv, vec2(1.0)))) {
-                    vec4 mf = textureLod(u_wx_field, vec3(wuv, 1.0), 0.0);
-                    float rain = textureLod(u_wx_field, vec3(wuv, 4.0), 0.0).g;
-                    float cloud = clamp(mf.w, 0.0, 1.0);
-                    float wspd = length(mf.xy);
-                    // Animated streamlines flowing along the mesoscale wind vector field
-                    vec2 wdir = (wspd > 0.3) ? (mf.xy / wspd) : vec2(1.0, 0.0);
-                    vec2 wperp = vec2(-wdir.y, wdir.x);
-                    float along = dot(degrees, wdir) * 26.0 - u_wx_time * clamp(wspd * 0.14, 0.2, 2.2);
-                    float across = dot(degrees, wperp) * 42.0;
-                    float stream = smoothstep(0.65, 0.98, 0.5 + 0.5 * sin(across) * cos(along));
-                    color += vec3(0.32, 0.58, 0.78) * (stream * smoothstep(2.0, 16.0, wspd) * 0.22);
-                    // Translucent solved cloud veil + hillside updraft highlight
-                    color = mix(color, vec3(0.84, 0.90, 0.96), smoothstep(0.18, 0.92, cloud) * 0.36);
-                    // Meteorological precipitation radar palette (cyan/green -> amber -> crimson)
+            if (u_wx_overlay > 0.5) {
+                vec2 wind; float cloud, rain;
+                if (sample_flow_wx(degrees, wind, cloud, rain)) {
+                    float wspd = length(wind);
+                    vec3 flow_hue = wind_palette(wspd);
+                    // Subtle speed-coded wind wash keeps relief readable while showing jet corridors.
+                    color = mix(color, flow_hue, smoothstep(1.5, 22.0, wspd) * 0.16);
+                    // Translucent cloud veil and precipitation radar underneath streamlines.
+                    color = mix(color, vec3(0.84, 0.90, 0.96), smoothstep(0.22, 0.94, cloud) * 0.28);
                     if (rain > 0.25) {
                         vec3 rad = mix(vec3(0.14, 0.78, 0.42), vec3(0.95, 0.76, 0.15), smoothstep(0.4, 6.0, rain));
                         rad = mix(rad, vec3(0.92, 0.18, 0.28), smoothstep(8.0, 22.0, rain));
-                        color = mix(color, rad, smoothstep(0.25, 3.5, rain) * 0.65);
+                        color = mix(color, rad, smoothstep(0.25, 3.5, rain) * 0.58);
                     }
+                    // Dual-octave zoom-adaptive flowmap streamlines stay crisp from globe to valley zoom.
+                    float cos_lat = max(0.25, cos(lat));
+                    vec2 mpos = vec2(degrees.x * cos_lat, degrees.y);
+                    float target_cell = clamp(2.2 / max(0.45, u_globe.z), 0.018, 0.48);
+                    float oct_f = log2(target_cell);
+                    float oct0 = floor(oct_f);
+                    float blend = fract(oct_f);
+                    float cell0 = exp2(oct0);
+                    float s0 = 0.0, s1 = 0.0;
+                    float f0 = flow_streaks(mpos, cos_lat, cell0, u_wx_time, s0);
+                    float f1 = flow_streaks(mpos, cos_lat, cell0 * 2.0, u_wx_time * 0.72, s1);
+                    float flow = mix(f0, f1, blend);
+                    float flow_spd = mix(s0, s1, blend);
+                    vec3 streak_col = mix(wind_palette(flow_spd), vec3(0.96, 0.99, 1.0), 0.40);
+                    color = mix(color, streak_col, clamp(flow * 0.94, 0.0, 0.96));
                 }
             }
         }

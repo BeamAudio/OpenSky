@@ -73,7 +73,7 @@ On a new save the aircraft is based at Castejón de Sos. Open **World** to explo
 
 The optional live weather boundary feed can be disabled with `./run_sim.sh --no-live-weather`. Online PNOA imagery is controlled separately in Settings or with `./run_sim.sh --online-ortho off`.
 
-A first-flight guide introduces these steps. During flight the interface overlays are hidden by default; turn them back on in **Settings → In-flight overlays**, or press `T` to show the controls guide. Display mode can be set to windowed, fullscreen, or fullscreen windowed in Settings and takes effect after restarting.
+A first-flight guide introduces these steps. During flight the interface overlays are hidden by default; turn them back on in **Settings → In-flight overlays**, or press `T` to show the controls guide. Display mode can be set to windowed, fullscreen, or fullscreen windowed in Settings (applied on restart), while **VSync**, **FPS limit**, and **Flight Yoke & Pedals** settings apply live.
 
 ## Architecture
 
@@ -110,7 +110,7 @@ See [system descriptions](docs/SYSTEMS.md) for aircraft ownership, terrain strea
 
 ## Weather system
 
-Weather displayed as current or historical comes from a published in-game model snapshot. When live input is available, Open-Meteo supplies boundary conditions; the local model then evolves wind, cloud, turbulence and precipitation through four terrain-following vertical layers. The World screen identifies the input source and shows when an airport lies outside model coverage. Outlook runs project the current model at +1, +3 and +5 simulation minutes under fixed inputs.
+Weather displayed as current or historical comes from a published in-game model snapshot. When live input is available, Open-Meteo supplies boundary conditions; the local model then evolves wind, cloud, turbulence and precipitation through four terrain-following vertical layers with orographic terrain deflection and valley channeling. The World screen renders an animated GPU flowmap across all installed `.nswx` regions, identifies the input source, and shows when an airport lies outside active regional model coverage. Outlook runs project the current model at +1, +3 and +5 simulation minutes under fixed inputs.
 
 The regional CPU solver uses a 384 × 288 × 4 grid, roughly 400 m per horizontal cell in the default corridor. Settings can add an 8 km aircraft-following terrain refinement tile at about 42 m or 21 m spacing. The debug animation's accumulated lines are pathlines traced through published wind values; line placement and flow markers do not imply centimetre-scale physics. Resolution limits, snapshot publication and data provenance are covered in [weather system](docs/WEATHER.md).
 
@@ -153,6 +153,15 @@ OpenSky is based in Spain, with Aragón and Catalunya together in the baseline r
 | `F1`–`F4` | Change graphics quality tier |
 
 The in-game **Controls** page lists additional cockpit, camera and system keys.
+
+### USB flight yokes, pedals, and throttles
+
+OpenSky supports plug-and-play USB HID flight yokes, joysticks, rudder pedals (including differential toe brakes), and throttle quadrants on Linux via `evdev` (`/dev/input/event*`):
+
+- **Multi-device support:** use a flight yoke together with separate USB rudder pedals and throttle/mixture quadrants simultaneously.
+- **Settings & calibration:** configure **Mode (`Direct Yoke` vs `Flight Assist`)**, **Deadzone**, **S-Curve**, axis **Invert** toggles, **Rescan**, and one-click **Center Yoke** zero-point tare calibration in **Settings**.
+- **Buttons & POV hat:** trigger/south grip applies wheel brakes, thumb button toggles parking brake, rocker switches adjust elevator trim and flaps, and the POV hat pans the view.
+- **Cursor yoke (`Y`):** available anytime when flying with a mouse or trackpad.
 
 ## Data and licenses
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the desktop app and optional Catalonia region Debian/Ubuntu packages."""
+"""Build one Debian/Ubuntu desktop package with Aragón and both Catalunya regions."""
 
 from __future__ import annotations
 
@@ -59,10 +59,11 @@ def copy_runtime(stage: Path, packs_dir: Path) -> None:
 
     destination = app / "packs"
     destination.mkdir()
-    missing = [name for name in ARAGON_FILES if not (packs_dir / name).is_file()]
+    baseline_files = ARAGON_FILES + CATALONIA_FILES
+    missing = [name for name in baseline_files if not (packs_dir / name).is_file()]
     if missing:
-        raise SystemExit("Missing required Aragón release data: " + ", ".join(missing))
-    for name in ARAGON_FILES:
+        raise SystemExit("Missing required baseline region data: " + ", ".join(missing))
+    for name in baseline_files:
         shutil.copy2(packs_dir / name, destination / name)
 
     doc = stage / "usr/share/doc/opensky-vfr"
@@ -82,25 +83,11 @@ def copy_runtime(stage: Path, packs_dir: Path) -> None:
     shutil.copy2(ROOT / "packaging/linux/opensky-vfr.svg", icon)
 
 
-def copy_catalonia(stage: Path, packs_dir: Path) -> None:
-    destination = stage / APP_ROOT / "packs"
-    destination.mkdir(parents=True)
-    missing = [name for name in CATALONIA_FILES if not (packs_dir / name).is_file()]
-    if missing:
-        raise SystemExit("Missing required Catalonia release data: " + ", ".join(missing))
-    for name in CATALONIA_FILES:
-        shutil.copy2(packs_dir / name, destination / name)
-    doc = stage / "usr/share/doc/opensky-vfr-catalonia"
-    doc.mkdir(parents=True)
-    for name in ("README.md", "THIRD_PARTY_LICENSES.md"):
-        shutil.copy2(ROOT / name, doc / name)
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--version", required=True, help="release version, for example 0.3.0")
     parser.add_argument("--packs-dir", type=Path, default=ROOT / "packs",
-                        help="folder containing the reviewed Aragón region pack files")
+                        help="folder containing the reviewed Aragón and Catalunya baseline region files")
     parser.add_argument("--output-dir", type=Path, default=ROOT / "dist")
     parser.add_argument("--maintainer", required=True,
                         help='package contact in "Name <email>" format')
@@ -131,12 +118,9 @@ def main() -> int:
     packs_dir = args.packs_dir.resolve()
     if not packs_dir.is_dir():
         parser.error(f"regional pack directory does not exist: {packs_dir}")
-    missing = [name for name in ARAGON_FILES if not (packs_dir / name).is_file()]
+    missing = [name for name in ARAGON_FILES + CATALONIA_FILES if not (packs_dir / name).is_file()]
     if missing:
-        parser.error("required Aragón release data is missing: " + ", ".join(missing))
-    missing = [name for name in CATALONIA_FILES if not (packs_dir / name).is_file()]
-    if missing:
-        parser.error("required Catalonia release data is missing: " + ", ".join(missing))
+        parser.error("required baseline region data is missing: " + ", ".join(missing))
 
     # A redistributable build avoids host-specific CPU tuning and auto-detected AVX2.
     run(["make", "-C", "sim_engine", "clean"])
@@ -147,7 +131,6 @@ def main() -> int:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     output_dir = args.output_dir.resolve()
     app_output = output_dir / f"opensky-vfr_{args.version}_amd64.deb"
-    catalonia_output = output_dir / f"opensky-vfr-catalonia_{args.version}_all.deb"
     with tempfile.TemporaryDirectory(prefix="opensky-vfr-deb-") as tmp:
         temporary = Path(tmp)
         stage = Path(tmp) / "app"
@@ -169,39 +152,17 @@ def main() -> int:
         )
         run(["dpkg-deb", "--root-owner-group", "--uniform-compression", "--compression=xz",
              "--build", str(stage), str(temporary / app_output.name)], cwd=ROOT)
+        temporary_asset = temporary / app_output.name
+        size = temporary_asset.stat().st_size
+        if size >= MAX_RELEASE_ASSET_BYTES:
+            parser.error(f"{app_output.name} is {size} bytes; split every GitHub release asset below 2 GiB")
+        shutil.move(temporary_asset, app_output)
 
-        stage = Path(tmp) / "catalonia"
-        copy_catalonia(stage, packs_dir)
-        control = stage / "DEBIAN/control"
-        control.parent.mkdir(parents=True)
-        control.write_text(
-            "Package: opensky-vfr-catalonia\n"
-            f"Version: {args.version}\n"
-            "Section: games\n"
-            "Priority: optional\n"
-            "Architecture: all\n"
-            f"Depends: opensky-vfr (= {args.version})\n"
-            f"Maintainer: {args.maintainer}\n"
-            "Description: Catalonia region data for OpenSky VFR\n"
-            " Adds the Catalonia coast and Pyrenees region packs.\n",
-            encoding="utf-8",
-        )
-        run(["dpkg-deb", "--root-owner-group", "--uniform-compression", "--compression=xz",
-             "--build", str(stage), str(temporary / catalonia_output.name)], cwd=ROOT)
-
-        temporary_assets = (temporary / app_output.name, temporary / catalonia_output.name)
-        for artifact in temporary_assets:
-            size = artifact.stat().st_size
-            if size >= MAX_RELEASE_ASSET_BYTES:
-                parser.error(f"{artifact.name} is {size} bytes; split every GitHub release asset below 2 GiB")
-        for source, destination in zip(temporary_assets, (app_output, catalonia_output)):
-            shutil.move(source, destination)
-
-    for artifact in (app_output, catalonia_output):
-        size = artifact.stat().st_size
-        print(f"Built {artifact} ({size / 1024**3:.2f} GiB)")
-    print("Install both packages with Software, or run:")
-    print(f"sudo apt install ./{app_output.name} ./{catalonia_output.name}")
+    size = app_output.stat().st_size
+    print(f"Built {app_output} ({size / 1024**3:.2f} GiB)")
+    print("The package includes Aragón, Catalunya coast, and Catalunya Pyrenees.")
+    print("Install the package with Software, or run:")
+    print(f"sudo apt install ./{app_output.name}")
     print("Then launch OpenSky VFR from the desktop application menu.")
     return 0
 

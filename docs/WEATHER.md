@@ -35,6 +35,8 @@ When live mode is enabled, the weather client requests current conditions from O
 
 The model evolves wind, temperature, moisture/cloud, turbulence and precipitation fields. Terrain exposure affects orographic uplift and sheltering. The renderer uploads a weather field to a 2D-array texture and samples it for clouds, wind, rain and related effects. Smaller texture or shader details improve visual sampling; they do not increase the CPU model's true spatial resolution.
 
+The **Weather grid resolution** setting keeps that regional field intact and can add an aircraft-following local solver tile over an 8 × 8 km area. Standard detail uses 192 × 192 cells (about 42 m per cell); Fine uses 384 × 384 cells (about 21 m). The tile samples elevation from the current immutable `WorldFrame`, derives local slopes and valley exposure, and advances against the regional field as its boundary condition. The aircraft physics and cloud renderer blend back to the regional values near the tile edge. Local refinement is off by default; the two modes add approximately 33% and 133% of the regional solver work, respectively. The tile recenters as the aircraft travels, so memory and solve work stay bounded.
+
 The worker writes private solve buffers. Consumers read a published snapshot that includes its domain, input source, generation and solved simulation time. A domain change increments the generation; results from an old region are discarded before publication. This keeps the aircraft, renderer and World menu on a coherent weather state.
 
 ## Player-facing weather
@@ -49,9 +51,11 @@ When live conditions are not available, UI labels identify the baked, manual or 
 
 ### 3D model debug visualization
 
-Use `--weather-model-debug` to project samples from the published local model into the flight scene at all four terrain-following heights. Wind direction and magnitude appear as 3D arrows; marker size represents cloud fraction, and blue color indicates precipitation. The legend identifies the input source and snapshot generation. The visualization samples the solved field while volumetric clouds render from the same weather state.
+Use `--weather-model-debug` to project samples from the published local model into the flight scene at all four terrain-following heights. Wind direction comes from the field; arrow length is deliberately scaled for legibility. Marker size represents cloud fraction, and blue color indicates precipitation. When local refinement is active, the debug slice samples the finer tile and labels its grid. Accumulated flow trails are pathlines: particles are advected over simulation time using the published wind vectors, with older segments faded. The legend identifies the input source and snapshot generation. Volumetric clouds render from the same published weather state.
 
-Use `--weather-model-video --portrait-promo --autotest <output-dir>` to capture a 15-second, vertical top-down time-lapse. It advances the regional solver at 22.5× playback speed, drawing four and a half simulated minutes of the published four-layer field and simulation clock over the flight scene. `--promo-video --portrait-promo --autotest <output-dir>` captures a 15-second vertical location montage with orbiting exterior cameras and cockpit audio. Both modes write PNG frames plus `cockpit_audio.wav`; encode them as 1080×1920 H.264/AAC for social video.
+The 3D debug view samples a 13 × 13 window for each layer, using every fourth solver cell; it does not draw the entire grid. Marker spacing is about 1.7 km on the regional grid, 168 m in Standard local mode, and 84 m in Fine mode. The wind samples themselves are unscaled; only the drawn arrow length is scaled to keep slow winds visible. The overlay labels the current sample spacing, and its accumulated pathlines trace the published wind between snapshots.
+
+Use `--weather-model-video --portrait-promo --autotest <output-dir>` to capture a vertical top-down weather time-lapse. The default is 30 seconds at 24 FPS, showing 9 simulated minutes of the published four-layer field and accumulated flow paths. Select a site with `--weather-video-location pyrenees|mediano|barcelona|costa-brava|catalan-pyrenees|zaragoza`, set 10–120 output seconds with `--weather-video-seconds`, and select `--weather-refinement off|standard|fine` for the local tile. The default site is the Pyrenees; the default refinement mode comes from Graphics settings. The capture writes PNG frames and `cockpit_audio.wav`; encode as 1080×1920 H.264/AAC for social video. `--promo-video --portrait-promo --autotest <output-dir>` remains the separate scenery montage with orbiting exterior cameras and cockpit audio.
 
 ## Weather and aircraft behavior
 
@@ -65,7 +69,7 @@ Rain may affect a parked aircraft's condition during exposure. Opening a walkaro
 
 ## Resolution and known limits
 
-The 384 × 288 × 4 field is a mesoscale model for a regional corridor, not a high-resolution weather radar. A default cell spans hundreds of metres; narrow valley gusts and sharp boundaries can therefore be smoothed. Cloud-noise detail can make the sky look more intricate than the physical wind field actually is.
+The 384 × 288 × 4 field is a mesoscale model for a regional corridor, not a high-resolution weather radar. A default cell spans hundreds of metres; narrow valley gusts and sharp boundaries can therefore be smoothed unless the optional aircraft-local tile is enabled. Cloud-noise detail can make the sky look more intricate than the physical wind field actually is.
 
 The model currently has a small number of vertical levels and simplified exchanges, pressure balance and precipitation. Its live regional boundary may miss fronts or differences across the Pyrenees. Baked precipitation is an estimate. Use the dated [flight/weather audit](2026-11-23_flight-weather-audit.md) for the current validation gaps and measurement history.
 

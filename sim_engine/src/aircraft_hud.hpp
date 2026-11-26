@@ -173,11 +173,16 @@ private:
         float u, v;
         float r, g, b, a;
     };
+    struct WeatherFlowTrace {
+        double east_m = 0.0, north_m = 0.0;
+        int level = 0;
+        std::vector<Vec3> points;
+    };
 
     void hud_rect(float x, float y, float w, float h, float r, float g, float b, float a);
     void hud_border(float x, float y, float w, float h, float t, float r, float g, float b, float a);
     void hud_text(float x, float y, float font_h, const char *text, float r, float g, float b, float a);
-    void hud_line(Vec2 a, Vec2 b, float width, Vec3 color);
+    void hud_line(Vec2 a, Vec2 b, float width, Vec3 color, float alpha = 0.94f);
     void hud_arrow(Vec2 a, Vec2 b, float width, Vec3 color);
     void render_debug_overlays(float w, float h, float top, const RegionalAtmosphere &atmo, const DebugOverlayView &view);
     void draw_glb(
@@ -255,6 +260,9 @@ private:
     GLuint hud_vao_ = 0;
     GLuint hud_vbo_ = 0;
     std::vector<HudVert> hud_verts_;
+    std::vector<WeatherFlowTrace> weather_flow_traces_;
+    double weather_flow_last_time_s_ = -1.0;
+    double weather_flow_origin_e_ = 0.0, weather_flow_origin_n_ = 0.0;
 };
 
 } // namespace nsim

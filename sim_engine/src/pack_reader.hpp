@@ -4,6 +4,7 @@
 #include "../../protocol/pack_format.h"
 #include "math3d.hpp"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -218,6 +219,9 @@ public:
 
     // Thread-safe sampling (callable from async worker threads & flight physics simultaneously!)
     double sample_elevation(double lat_deg, double lon_deg) const;
+    void fill_elevation_grid(const WorldFrame &frame, double center_east_m, double center_north_m,
+                            double half_span_m, int width, int height,
+                            std::vector<float> &out_height) const;
     float sample_canopy_height(double lat_deg, double lon_deg) const;
     Vec3 sample_surface(double lat_deg, double lon_deg) const;
     Vec3 sample_imagery_rgb(double lat_deg, double lon_deg) const;

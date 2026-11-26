@@ -10,6 +10,8 @@ layout(binding = 3) uniform sampler2D u_terrain_depth; // Opaque terrain depth c
 layout(binding = 4) uniform sampler2DArray u_atmo_field; // Four weather levels plus local rain rates
 layout(binding = 5) uniform sampler2D u_atmo_terrain;     // Terrain elevation for terrain-following AGL layer selection
 layout(binding = 6) uniform sampler3D u_cloud_detail;     // Mip-filtered meter-scale 3D cellular detail
+layout(binding = 7) uniform sampler2DArray u_atmo_local_field; // Aircraft-following fine 16 km patch
+layout(binding = 8) uniform sampler2D u_atmo_local_terrain;
 
 uniform mat4 u_inv_vp;
 uniform mat4 u_prev_vp;
@@ -31,6 +33,7 @@ uniform vec3 u_cloud_shadow;
 uniform vec3 u_haze_cool;
 uniform vec3 u_haze_warm;
 uniform vec4 u_atmo_domain; // xy = min_e, min_n; zw = 1/span_e, 1/span_n
+uniform vec4 u_atmo_local_domain; // same mapping; zw=0 disables the local patch
 uniform vec4 u_wx_fx;       // x = valley_fog01, y = snow_factor01, z = lightning_flash01, w = storm_int01
 
 const float R_EARTH = 6378137.0;
@@ -66,13 +69,51 @@ float weather_level(float agl) {
     return 2.0 + clamp((agl - 1800.0) / 2700.0, 0.0, 1.0);
 }
 
+float local_weather_weight(vec2 p_en, out vec2 local_uv) {
+    local_uv = vec2(0.5);
+    if (u_atmo_local_domain.z <= 0.0 || u_atmo_local_domain.w <= 0.0) return 0.0;
+    vec2 q = (p_en - u_atmo_local_domain.xy) * u_atmo_local_domain.zw;
+    if (any(lessThan(q, vec2(0.0))) || any(greaterThan(q, vec2(1.0)))) return 0.0;
+    vec2 size = vec2(textureSize(u_atmo_local_terrain, 0));
+    local_uv = (q * (size - 1.0) + 0.5) / size;
+    float edge = min(min(q.x, q.y), min(1.0 - q.x, 1.0 - q.y));
+    return smoothstep(0.0, 0.14, edge);
+}
+
+float sample_regional_ground(vec2 p_en) {
+    vec2 global_uv = weather_uv(p_en);
+    float coarse = textureLod(u_atmo_terrain, global_uv, 0.0).r;
+    vec2 local_uv;
+    float weight = local_weather_weight(p_en, local_uv);
+    if (weight <= 0.0) return coarse;
+    return mix(coarse, textureLod(u_atmo_local_terrain, local_uv, 0.0).r, weight);
+}
+
+vec4 sample_regional_layer(vec2 p_en, float layer) {
+    vec2 global_uv = weather_uv(p_en);
+    vec4 coarse = textureLod(u_atmo_field, vec3(global_uv, layer), 0.0);
+    vec2 local_uv;
+    float weight = local_weather_weight(p_en, local_uv);
+    if (weight <= 0.0) return coarse;
+    return mix(coarse, textureLod(u_atmo_local_field, vec3(local_uv, layer), 0.0), weight);
+}
+
 vec4 sample_regional_atmo(vec2 p_en, float altitude_msl) {
-    vec2 auv = weather_uv(p_en);
-    float ground_msl = textureLod(u_atmo_terrain, auv, 0.0).r;
-    float level = weather_level(altitude_msl - ground_msl);
-    float l0 = min(floor(level), 2.0);
-    return mix(textureLod(u_atmo_field, vec3(auv, l0), 0.0),
-               textureLod(u_atmo_field, vec3(auv, l0 + 1.0), 0.0), level - l0);
+    vec2 global_uv = weather_uv(p_en);
+    float coarse_ground = textureLod(u_atmo_terrain, global_uv, 0.0).r;
+    float coarse_level = weather_level(altitude_msl - coarse_ground);
+    float coarse_l0 = min(floor(coarse_level), 2.0);
+    vec4 coarse = mix(textureLod(u_atmo_field, vec3(global_uv, coarse_l0), 0.0),
+                      textureLod(u_atmo_field, vec3(global_uv, coarse_l0 + 1.0), 0.0), coarse_level - coarse_l0);
+    vec2 local_uv;
+    float weight = local_weather_weight(p_en, local_uv);
+    if (weight <= 0.0) return coarse;
+    float local_ground = textureLod(u_atmo_local_terrain, local_uv, 0.0).r;
+    float local_level = weather_level(altitude_msl - local_ground);
+    float local_l0 = min(floor(local_level), 2.0);
+    vec4 fine = mix(textureLod(u_atmo_local_field, vec3(local_uv, local_l0), 0.0),
+                    textureLod(u_atmo_local_field, vec3(local_uv, local_l0 + 1.0), 0.0), local_level - local_l0);
+    return mix(coarse, fine, weight);
 }
 
 vec4 cloud_cells(vec2 pos_en, float altitude, vec3 flow, float distance_m, float step_m) {
@@ -94,14 +135,26 @@ float erode_cloud(float shape, vec4 cells, float strength) {
 
 float rain_extinction(vec2 p_en, float altitude, float depth_below_base) {
     vec2 uv = weather_uv(p_en);
-    float ground = textureLod(u_atmo_terrain, uv, 0.0).r;
+    float ground = sample_regional_ground(p_en);
     if (altitude < ground) return 0.0;
-    vec4 rain = textureLod(u_atmo_field, vec3(uv, 4.0), 0.0);
-    float level = weather_level(altitude - ground);
-    int low = min(int(level), 2);
-    float rate = mix(rain[low], rain[low + 1], level - float(low));
+    vec4 coarse_rain = textureLod(u_atmo_field, vec3(uv, 4.0), 0.0);
+    float coarse_ground = textureLod(u_atmo_terrain, uv, 0.0).r;
+    float coarse_level = weather_level(altitude - coarse_ground);
+    int coarse_low = min(int(coarse_level), 2);
+    float coarse_rate = mix(coarse_rain[coarse_low], coarse_rain[coarse_low + 1], coarse_level - float(coarse_low));
+    vec2 local_uv;
+    float local_weight = local_weather_weight(p_en, local_uv);
+    float rate = coarse_rate;
+    if (local_weight > 0.0) {
+        vec4 local_rain = textureLod(u_atmo_local_field, vec3(local_uv, 4.0), 0.0);
+        float local_ground = textureLod(u_atmo_local_terrain, local_uv, 0.0).r;
+        float local_level = weather_level(altitude - local_ground);
+        int local_low = min(int(local_level), 2);
+        float local_rate = mix(local_rain[local_low], local_rain[local_low + 1], local_level - float(local_low));
+        rate = mix(coarse_rate, local_rate, local_weight);
+    }
     if (rate < 0.15) return 0.0;
-    vec2 wind = textureLod(u_atmo_field, vec3(uv, 1.0), 0.0).xy;
+    vec2 wind = sample_regional_layer(p_en, 1.0).xy;
     // Backtrace falling rain/snow to its parent storm cell; streaks slant with wind shear!
     float fall_spd = mix(7.5, 1.8, u_wx_fx.y);
     vec2 source = p_en - wind * (depth_below_base / fall_spd + u_time * 1.45);
@@ -116,19 +169,21 @@ float rain_extinction(vec2 p_en, float altitude, float depth_below_base) {
 
 float valley_fog_extinction(vec2 p_en, float altitude) {
     vec2 uv = weather_uv(p_en);
-    float ground = textureLod(u_atmo_terrain, uv, 0.0).r;
+    float ground = sample_regional_ground(p_en);
     float agl = altitude - ground;
     if (agl < -15.0 || agl > 460.0) return 0.0;
-    float mist_cell = textureLod(u_atmo_field, vec3(uv, 0.0), 0.0).w;
+    float mist_cell = sample_regional_layer(p_en, 0.0).w;
     float h_falloff = exp(-max(0.0, agl) / 145.0) * (1.0 - smoothstep(260.0, 460.0, agl));
-    vec3 fog_n = textureLod(u_cloud_vol3d, vec3(p_en * 0.00032 + vec2(u_time * 0.004, 0.0), max(0.0, agl) * 0.0022), 0.0).rgb;
+    vec2 wind = sample_regional_atmo(p_en, altitude).xy;
+    vec2 advected_en = p_en - wind * u_time;
+    vec3 fog_n = textureLod(u_cloud_vol3d, vec3(advected_en * 0.00032, max(0.0, agl) * 0.0022), 0.0).rgb;
     float patch_d = smoothstep(0.24, 0.78, fog_n.r * 0.68 + fog_n.g * 0.32 + mist_cell * 0.85);
     return u_wx_fx.x * h_falloff * patch_d * 0.00115;
 }
 
 // Cheap macro envelope (2D taps only) so empty-air raymarch steps skip 3D Worley & sun cone taps!
 float sample_cloud_macro(vec2 p_en, float h01, vec2 wind_base, vec2 shear_en, float eff_cov, vec4 mf, out vec2 out_p, out vec3 out_ma, out vec3 out_mb, out float out_heff) {
-    // Coherent rigid advection + gentle vertical wind-shear lean (zero localized terrain UV pinching).
+    // Backtraced local model wind keeps the texture moving with the regional vector field.
     out_p = p_en + wind_base + shear_en * (h01 - 0.35);
     out_ma = textureLod(u_cloud_noise, out_p * MACRO_FREQ, 0.25).rgb;
     out_mb = textureLod(u_cloud_noise, out_p * 0.000085 + vec2(0.31, 0.67), 0.35).rgb;
@@ -167,8 +222,10 @@ float sample_cloud_shadow(vec2 p_en, float h01, vec2 wind_base, vec2 shear_en, f
 }
 
 // Modern Schneider Perlin-Worley 3D cumulus sampler with crisp cauliflower turrets.
-float sample_cloud_modern(vec2 p_en, float h01, float altitude_msl, vec2 wind_base, vec2 shear_en, float eff_cov, float dist_m,
+float sample_cloud_modern(vec2 p_en, float h01, float altitude_msl, vec2 shear_en, float eff_cov, float dist_m,
+                          out vec2 out_wind_base,
                           out float out_ero, out float out_billow, out vec3 out_wcoord, out float out_wlod, out float out_base) {
+    out_wind_base = vec2(0.0);
     out_ero = 0.5;
     out_billow = 0.5;
     out_wcoord = vec3(0.0);
@@ -176,8 +233,11 @@ float sample_cloud_modern(vec2 p_en, float h01, float altitude_msl, vec2 wind_ba
     out_base = 0.0;
     if (h01 <= 0.0 || h01 >= 1.0) return 0.0;
     vec4 mf = sample_regional_atmo(p_en, altitude_msl);
+    // Backtrace the cloud texture by the solved ENU flow so the visible pattern
+    // advances with the wind arrows instead of against them.
+    out_wind_base = -mf.xy * u_time;
     vec2 p; vec3 macro_a, macro_b; float h_eff;
-    float base_shape = sample_cloud_macro(p_en, h01, wind_base, shear_en, eff_cov, mf, p, macro_a, macro_b, h_eff);
+    float base_shape = sample_cloud_macro(p_en, h01, out_wind_base, shear_en, eff_cov, mf, p, macro_a, macro_b, h_eff);
     out_base = base_shape;
     if (base_shape <= 0.015) return 0.0;
 
@@ -339,9 +399,8 @@ void main() {
     }
 
     if (valid && t1 > t0 && t0 < 74000.0) {
-        vec2 wind_base = vec2(u_time * 9.5, u_time * 4.2);
         // Smooth synoptic upper-level shear across the slab (immune to pitch/ridge artifacts).
-        vec2 shear_en = textureLod(u_atmo_field, vec3(weather_uv(u_cam_en), 2.0), 1.5).xy * 2.2;
+        vec2 shear_en = sample_regional_layer(u_cam_en, 2.0).xy * 2.2;
         float eff_cov = clamp(u_coverage, 0.06, 0.96);
         float max_m = in_slab ? 12000.0 : 18000.0;
         float march_len = min(t1 - t0, max_m);
@@ -367,9 +426,11 @@ void main() {
                 float sample_alt_msl = u_cam_alt_m + rp.y + curv_rise;
                 float h01 = (sample_alt_msl - u_cloud_base_m) * inv_thick;
                 vec2 p_en = u_cam_en + ray_en * t;
+                vec2 wind_base = vec2(0.0);
                 float ero = 0.5, billow = 0.5, w_lod = 0.0, base_g = 0.0;
                 vec3 w_coord = vec3(0.0);
-                float d = sample_cloud_modern(p_en, h01, sample_alt_msl, wind_base, shear_en, eff_cov, t, ero, billow, w_coord, w_lod, base_g);
+                float d = sample_cloud_modern(p_en, h01, sample_alt_msl, shear_en, eff_cov, t,
+                                              wind_base, ero, billow, w_coord, w_lod, base_g);
                 if (d > 0.012) {
                     // Fast 3-step logarithmic sun cone raymarch:
                     // Step 0 uses local 3D Worley gradient (1 tap) for crisp cauliflower ridge self-shadowing!

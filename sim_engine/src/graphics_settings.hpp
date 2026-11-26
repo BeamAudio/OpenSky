@@ -21,6 +21,7 @@ struct GraphicsSettings {
     bool terrain_streaming = true;
     int aircraft_detail = 1; // Standard, High
     int weather_detail = 0; // Follow preset, Low, Medium, High
+    int weather_grid_detail = 0; // 0: regional only, 1: 192^2 local tile, 2: 384^2 local tile
     int time_of_day = -1; // -1 = advancing five-hour cycle, 0..10 = fixed solar preset
     int cockpit_fov_deg = 50; // 42..64 deg vertical cockpit POV
     int head_motion_mode = 2; // 0 = Off, 1 = Subtle, 2 = Realistic (G-inertia, turn-look, touchdown jolt)
@@ -48,6 +49,7 @@ inline GraphicsSettings load_graphics_settings() {
         else if (key == "terrain_streaming") settings.terrain_streaming = value != 0;
         else if (key == "aircraft_detail") settings.aircraft_detail = std::clamp(value, 0, 1);
         else if (key == "weather_detail") settings.weather_detail = std::clamp(value, 0, 3);
+        else if (key == "weather_grid_detail") settings.weather_grid_detail = std::clamp(value, 0, 2);
         else if (key == "time_of_day") settings.time_of_day = std::clamp(value, -1, 10);
         else if (key == "cockpit_fov_deg") settings.cockpit_fov_deg = std::clamp(value, 42, 64);
         else if (key == "head_motion_mode") settings.head_motion_mode = std::clamp(value, 0, 2);
@@ -66,6 +68,7 @@ inline GraphicsSettings load_graphics_settings() {
     settings.atmosphere_clarity = std::clamp(settings.atmosphere_clarity, 0, 2);
     settings.quality_preset = std::clamp(settings.quality_preset, 0, 3);
     settings.display_mode = std::clamp(settings.display_mode, 0, 2);
+    settings.weather_grid_detail = std::clamp(settings.weather_grid_detail, 0, 2);
     return settings;
 }
 
@@ -80,6 +83,7 @@ inline void save_graphics_settings(const GraphicsSettings &input) {
     settings.atmosphere_clarity = std::clamp(settings.atmosphere_clarity, 0, 2);
     settings.quality_preset = std::clamp(settings.quality_preset, 0, 3);
     settings.display_mode = std::clamp(settings.display_mode, 0, 2);
+    settings.weather_grid_detail = std::clamp(settings.weather_grid_detail, 0, 2);
     const auto path = graphics_settings_path();
     std::error_code ec;
     std::filesystem::create_directories(path.parent_path(), ec);
@@ -94,6 +98,7 @@ inline void save_graphics_settings(const GraphicsSettings &input) {
             << "terrain_streaming " << settings.terrain_streaming << '\n'
             << "aircraft_detail " << settings.aircraft_detail << '\n'
             << "weather_detail " << settings.weather_detail << '\n'
+            << "weather_grid_detail " << settings.weather_grid_detail << '\n'
             << "time_of_day " << settings.time_of_day << '\n'
             << "cockpit_fov_deg " << settings.cockpit_fov_deg << '\n'
             << "head_motion_mode " << settings.head_motion_mode << '\n'

@@ -50,6 +50,12 @@ These scenes use preset inputs to the regional weather model. The first view exp
 
 [Watch the 15-second top-down weather-model time-lapse](docs/videos/opensky-weather-model-topdown-vertical.mp4). It shows all four published weather layers from above as wind, cloud and precipitation fields evolve over four and a half simulated minutes, with the model clock, bright layer markers and snapshot generation visible in the debug overlay.
 
+The following 20-second vertical clips each cover six simulated minutes at 24 fps. They show the aircraft-centered 8 km local refinement over terrain in Aragón and Catalunya; the debug panel reports displayed marker spacing separately from the solver's finer cell spacing.
+
+- [Pyrenees valley](docs/videos/opensky-weather-pyrenees-local-20s.mp4)
+- [Embalse de Mediano](docs/videos/opensky-weather-mediano-local-20s.mp4)
+- [Costa Brava](docs/videos/opensky-weather-costa-brava-local-20s.mp4)
+
 Scenery imagery in these captures: © Instituto Geográfico Nacional de España (IGN), [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/); PNOA imagery has been cropped and rendered in the simulator. Source: [IGN Spain PNOA](https://pnoa.ign.es/pnoa-imagen/visualizadores-y-servicios-web). City and building data © [OpenStreetMap contributors](https://www.openstreetmap.org/copyright), ODbL 1.0.
 
 ## Getting started
@@ -106,7 +112,7 @@ See [system descriptions](docs/SYSTEMS.md) for aircraft ownership, terrain strea
 
 Weather displayed as current or historical comes from a published in-game model snapshot. When live input is available, Open-Meteo supplies boundary conditions; the local model then evolves wind, cloud, turbulence and precipitation through four terrain-following vertical layers. The World screen identifies the input source and shows when an airport lies outside model coverage. Outlook runs project the current model at +1, +3 and +5 simulation minutes under fixed inputs.
 
-The current CPU solver uses a 384 × 288 × 4 grid. In the default corridor this is roughly 400 m per horizontal cell; the smaller visual flow marks do not imply metre-scale atmospheric physics. Resolution limits, snapshot publication and data provenance are covered in [weather system](docs/WEATHER.md).
+The regional CPU solver uses a 384 × 288 × 4 grid, roughly 400 m per horizontal cell in the default corridor. Settings can add an 8 km aircraft-following terrain refinement tile at about 42 m or 21 m spacing. The debug animation's accumulated lines are pathlines traced through published wind values; line placement and flow markers do not imply centimetre-scale physics. Resolution limits, snapshot publication and data provenance are covered in [weather system](docs/WEATHER.md).
 
 ## Make and install mods
 

@@ -306,6 +306,9 @@ int main(int argc, char **argv) {
     bool promo_video = false;
     bool weather_model_video = false;
     bool portrait_promo = false;
+    int weather_refinement_override = -1;
+    int weather_video_seconds = 30;
+    std::string weather_video_location = "pyrenees";
     bool season_qa = false;
     std::string req_region;
     std::string req_airport;
@@ -344,6 +347,24 @@ int main(int argc, char **argv) {
         else if (a == "--promo-only") promo_only = true;
         else if (a == "--promo-video") promo_video = true;
         else if (a == "--weather-model-video") weather_model_video = true;
+        else if (a == "--weather-refinement" && i + 1 < argc) {
+            const std::string value = argv[++i];
+            if (value == "off") weather_refinement_override = 0;
+            else if (value == "standard") weather_refinement_override = 1;
+            else if (value == "fine") weather_refinement_override = 2;
+            else {
+                std::fprintf(stderr, "[WEATHER] --weather-refinement expects off, standard, or fine\n");
+                return 2;
+            }
+        }
+        else if (a == "--weather-video-location" && i + 1 < argc) weather_video_location = argv[++i];
+        else if (a == "--weather-video-seconds" && i + 1 < argc) {
+            weather_video_seconds = std::atoi(argv[++i]);
+            if (weather_video_seconds < 10 || weather_video_seconds > 120) {
+                std::fprintf(stderr, "[WEATHER-VIDEO] --weather-video-seconds expects 10 through 120\n");
+                return 2;
+            }
+        }
         else if (a == "--portrait-promo") portrait_promo = true;
         else if (a == "--debug-overlays") debug_overlays = true;
         else if (a == "--weather-model-debug") weather_model_debug = true;
@@ -436,6 +457,8 @@ int main(int argc, char **argv) {
         return 1;
     }
     GraphicsSettings graphics_settings = load_graphics_settings();
+    if (weather_refinement_override >= 0)
+        graphics_settings.weather_grid_detail = weather_refinement_override;
     if (promo_only) {
         // Promotional captures use Ultra quality and the 200% terrain radius
         // without changing the user's saved settings.
@@ -654,6 +677,8 @@ int main(int argc, char **argv) {
         ac_hud.reset_flight(lat, lon, pack.sample_elevation(lat, lon) + 1200.0, 0.0, 80.0, false);
         std::printf("[OPENSKY] Region '%s' has no runway; starting at its center.\n", req_region.c_str());
     }
+    reg_atmo.set_grid_detail(graphics_settings.weather_grid_detail,
+                             ac_hud.state().lat_deg, ac_hud.state().lon_deg);
     profiler.startup_stage("initialize_flight");
     const auto &spawn = ac_hud.state();
     const WeatherSnapshot *baked0 = reg_atmo.has_weather() ? &reg_atmo.weather() : nullptr;
@@ -823,6 +848,7 @@ int main(int argc, char **argv) {
         const double lon = walking ? walker.lon : aircraft.lon_deg;
         const double cam_ground = walking ? walker.alt - 1.68 : aircraft.ground_m;
         if ((frame_idx % 180) == 0) reg_atmo.sync_region(lat, lon);
+        if (!walking) reg_atmo.update_refinement_center(aircraft.lat_deg, aircraft.lon_deg);
         reg_atmo.update_field(sky_clouds.atmo().sun_dir, sim_time, false, wx_advance);
         const WeatherSnapshot *bakedw = reg_atmo.has_weather() ? &reg_atmo.weather() : nullptr;
         sky_clouds.update_solar_and_weather(lat, lon, cam_ground, tod_slot, sim_time,
@@ -1089,6 +1115,7 @@ int main(int argc, char **argv) {
             vp, inv_vp, Vec3{cam_rot.m[8], cam_rot.m[9], cam_rot.m[10]}, cam_e, cam_n, cam_alt,
             terrain.cloud_noise_tex(), terrain.cloud_vol_tex(), terrain.cloud_detail_tex(), terrain.lut_tex(),
             reg_atmo.field_tex(), reg_atmo.terrain_field_tex(), reg_atmo.domain_bounds(),
+            reg_atmo.local_field_tex(), reg_atmo.local_terrain_tex(), reg_atmo.local_domain_bounds(),
             static_cast<float>(sim_time), static_cast<int>(frame_idx), cloud_wx_fx
         );
         profiler.end(FlightProfiler::CloudsPost);
@@ -1918,21 +1945,44 @@ int main(int argc, char **argv) {
 
         if (promo_only) {
             if (weather_model_video) {
+                struct WeatherVideoLocation {
+                    const char *id;
+                    double lat, lon;
+                    WindRegime regime;
+                    float weather;
+                    int season;
+                };
                 static constexpr int kVideoFps = 24;
-                static constexpr int kWeatherFrames = 360;
-                const double lat = 42.53131, lon = 0.47676;
+                static constexpr WeatherVideoLocation kLocations[] = {
+                    {"pyrenees", 42.53131, 0.47676, WindRegime::CONVECTIVE_STORM, 0.94f, 2},
+                    {"mediano", 42.31200, 0.19400, WindRegime::FOEHN_SUR, 0.62f, 2},
+                    {"barcelona", 41.36400, 2.19900, WindRegime::CIERZO_NW, 0.48f, 2},
+                    {"costa-brava", 41.95450, 3.24200, WindRegime::PYRENEAN_THERMAL, 0.48f, 2},
+                    {"catalan-pyrenees", 42.33870, 1.40920, WindRegime::WINTER_ICING, 0.80f, 0},
+                    {"zaragoza", 41.65000, -0.88000, WindRegime::CIERZO_NW, 0.52f, 2}
+                };
+                const auto location = std::find_if(std::begin(kLocations), std::end(kLocations),
+                    [&](const WeatherVideoLocation &candidate) { return weather_video_location == candidate.id; });
+                if (location == std::end(kLocations)) {
+                    std::fprintf(stderr, "[WEATHER-VIDEO] Unknown location '%s'; choose pyrenees, mediano, barcelona, costa-brava, catalan-pyrenees, or zaragoza\n",
+                                 weather_video_location.c_str());
+                    return 2;
+                }
+                const int kWeatherFrames = weather_video_seconds * kVideoFps;
+                const double lat = location->lat, lon = location->lon;
                 const double ground = pack.sample_elevation(lat, lon);
                 transition_world(lat, lon);
                 pack.set_online_camera(lat, lon);
-                season_override = 2;
+                season_override = location->season;
                 reg_atmo.set_season(season_override);
                 reg_atmo.set_manual_weather_override(true);
-                reg_atmo.set_regime(WindRegime::CONVECTIVE_STORM);
+                reg_atmo.set_regime(location->regime);
                 reg_atmo.set_solver_seed(0x4F50534Bu, true);
-                wx_advance = 0.94f;
+                wx_advance = location->weather;
+                reg_atmo.set_grid_detail(graphics_settings.weather_grid_detail, lat, lon);
 
                 FlightSimState &state = ac_hud.state();
-                ac_hud.reset_flight(lat, lon, ground + 15000.0, 0.0, 0.0, false);
+                ac_hud.reset_flight(lat, lon, ground + 6500.0, 0.0, 0.0, false);
                 state.paused = true;
                 state.slew_fast = false;
                 state.view_mode = 2;
@@ -1952,8 +2002,8 @@ int main(int argc, char **argv) {
 
                 const auto frames_dir = std::filesystem::path(autotest_dir) / "frames";
                 std::filesystem::create_directories(frames_dir);
-                profiler.set_scene("top-down weather-model time-lapse");
-                for (int i = 0; i < 24 && !win.should_close(); ++i) {
+                profiler.set_scene(std::string("top-down weather-model time-lapse ") + location->id);
+                for (int i = 0; i < 120 && !win.should_close(); ++i) {
                     win.poll_events();
                     step_flight(1.0 / 60.0);
                     capture_frame(1.0 / 60.0, false, 128, "", 50.0f, true);
@@ -2000,8 +2050,10 @@ int main(int argc, char **argv) {
                     (lon - pack.anchor_lon()) * pack.anchor_m_lon(),
                     (lat - pack.anchor_lat()) * pack.anchor_m_lat(), 1, 2);
                 profiler.finish();
-                std::printf("[WEATHER-VIDEO] Captured %zu frames at %d FPS; model time advanced %.0f s, snapshot %llu -> %s/frames\n",
+                std::printf("[WEATHER-VIDEO] %s | %zu frames at %d FPS (%d s); model time advanced %.0f s, snapshot %llu -> %s/frames\n",
+                            location->id,
                             audio_timeline.size(), kVideoFps,
+                            weather_video_seconds,
                             audio_timeline.size() * 0.75,
                             static_cast<unsigned long long>(center_slice.generation), autotest_dir.c_str());
                 return win.should_close() ? 1 : 0;

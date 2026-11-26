@@ -50,6 +50,7 @@ bool SkyAndClouds::init(const std::string &shader_root, int win_w, int win_h, in
     u_cld_cool_    = glGetUniformLocation(cloud_prog_, "u_haze_cool");
     u_cld_warm_    = glGetUniformLocation(cloud_prog_, "u_haze_warm");
     u_cld_dom_     = glGetUniformLocation(cloud_prog_, "u_atmo_domain");
+    u_cld_local_dom_ = glGetUniformLocation(cloud_prog_, "u_atmo_local_domain");
     u_cld_wx_fx_   = glGetUniformLocation(cloud_prog_, "u_wx_fx");
     u_post_exp_    = glGetUniformLocation(post_prog_, "u_exposure");
     u_post_sun_uv_ = glGetUniformLocation(post_prog_, "u_sun_uv_vis");
@@ -476,6 +477,7 @@ void SkyAndClouds::render_clouds_and_post(
     double cam_east_m, double cam_north_m, double cam_alt_m,
     GLuint cloud_noise_tex, GLuint cloud_vol_tex, GLuint cloud_detail_tex, GLuint lut_tex,
     GLuint atmo_field_tex, GLuint atmo_terrain_tex, const Vec4 &atmo_domain,
+    GLuint local_atmo_field_tex, GLuint local_atmo_terrain_tex, const Vec4 &local_atmo_domain,
     float time_sec, int frame_idx, const Vec4 &wx_fx
 ) {
     Vec3 camera_delta{0.0f, 0.0f, 0.0f};
@@ -533,6 +535,8 @@ void SkyAndClouds::render_clouds_and_post(
     glUniform3f(u_cld_cool_, atmo_.haze_cool.x, atmo_.haze_cool.y, atmo_.haze_cool.z);
     glUniform3f(u_cld_warm_, atmo_.haze_warm.x, atmo_.haze_warm.y, atmo_.haze_warm.z);
     glUniform4f(u_cld_dom_, atmo_domain.x, atmo_domain.y, atmo_domain.z, atmo_domain.w);
+    glUniform4f(u_cld_local_dom_, local_atmo_domain.x, local_atmo_domain.y,
+                local_atmo_domain.z, local_atmo_domain.w);
     glUniform4f(u_cld_wx_fx_, wx_fx.x, wx_fx.y, wx_fx.z, wx_fx.w);
 
     glBindTextureUnit(0, cloud_noise_tex);
@@ -542,6 +546,8 @@ void SkyAndClouds::render_clouds_and_post(
     glBindTextureUnit(4, atmo_field_tex);
     glBindTextureUnit(5, atmo_terrain_tex);
     glBindTextureUnit(6, cloud_detail_tex);
+    glBindTextureUnit(7, local_atmo_field_tex);
+    glBindTextureUnit(8, local_atmo_terrain_tex);
     glBindVertexArray(dummy_vao_);
     glDrawArrays(GL_TRIANGLES, 0, 3);
 

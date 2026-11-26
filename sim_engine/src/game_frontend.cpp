@@ -1281,8 +1281,24 @@ void GameFrontend::draw_settings(AircraftAndHud &ui, int &time_of_day, RegionalA
             }
         }
         label(ui, 1284, 750, 17, kWxModes[mode_idx]);
-        label(ui, 1218, 804, 16, "Press M in flight to cycle weather; U mutes audio.", true);
-        label(ui, 1218, 836, 16, "Output: 1920x1080 | F1-F4 switch preset live.", true);
+        label(ui, 1218, 792, 20, "Weather grid resolution");
+        static constexpr const char *kGridModes[3] = {
+            "Regional only",
+            "Local 192 x 192 | 42 m cells",
+            "Local 384 x 384 | 21 m cells"
+        };
+        int grid_delta = 0;
+        if (button(ui, {1218, 824, 48, 44}, "<")) grid_delta = -1;
+        if (button(ui, {1782, 824, 48, 44}, ">")) grid_delta = +1;
+        if (grid_delta != 0) {
+            s.weather_grid_detail = (s.weather_grid_detail + grid_delta + 3) % 3;
+            reg_atmo->set_grid_detail(s.weather_grid_detail, ui.state().lat_deg, ui.state().lon_deg);
+            changed = true;
+        }
+        label(ui, 1284, 837, 18, kGridModes[s.weather_grid_detail]);
+        label(ui, 1218, 884, 14, "8 km aircraft-following valley tile; regional coverage stays active.", true);
+        label(ui, 1218, 905, 14, "Added solver work: about 33% / 133% of regional mode.", true);
+        label(ui, 1218, 927, 14, "Press M to cycle weather; F1-F4 change graphics.", true);
     }
     if (changed) save_graphics_settings(s);
 }

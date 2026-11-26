@@ -90,10 +90,11 @@ struct WeatherDebugCell {
 };
 
 struct WeatherDebugSlice {
-    static constexpr int width = 9;
+    static constexpr int width = 13;
     std::array<WeatherDebugCell, width * width> cells{};
     uint64_t generation = 0;
     float agl_m = 0.0f, step_e_m = 0.0f, step_n_m = 0.0f;
+    bool locally_refined = false;
 };
 
 struct WeatherWorkStats {
@@ -150,6 +151,16 @@ public:
 
     bool init(const PackReader *pack, bool create_gpu_tex = true,
               const std::string &weather_path = "", bool enable_live_weather = true);
+    void set_grid_detail(int detail, double aircraft_lat, double aircraft_lon);
+    void update_refinement_center(double aircraft_lat, double aircraft_lon);
+    int grid_detail() const { return weather_grid_detail_; }
+    int grid_width() const { return grid_w_; }
+    int grid_height() const { return grid_h_; }
+    int local_grid_width() const { return frame_weather_.local_grid_w; }
+    int local_grid_height() const { return frame_weather_.local_grid_h; }
+    GLuint local_field_tex() const { return local_field_tex_; }
+    GLuint local_terrain_tex() const { return local_terrain_tex_; }
+    Vec4 local_domain_bounds() const;
     void sync_region(double lat_deg, double lon_deg);
     void shutdown();
 
@@ -230,6 +241,8 @@ private:
     };
 
     struct WeatherSolver {
+        int grid_w_ = GRID_W, grid_h_ = GRID_H;
+        bool suppress_dynamic_advance_ = false;
         std::vector<SimWeatherCell> weather_grid_, weather_next_;
         std::vector<float> weather_rain_flux_, terrain_height_, terrain_slope_e_, terrain_slope_n_;
         std::vector<float> terrain_ridge_exposure_, terrain_valley_basin_, weather_worker_climate_field_;
@@ -251,8 +264,14 @@ private:
     };
 
     struct WeatherPublication {
+        int grid_w = GRID_W, grid_h = GRID_H;
         std::vector<SimWeatherCell> grid;
         std::vector<float> field;
+        std::vector<float> terrain;
+        int local_grid_w = 0, local_grid_h = 0;
+        std::vector<SimWeatherCell> local_grid;
+        std::vector<float> local_field, local_terrain;
+        std::vector<float> local_ridge_exposure, local_valley_basin;
         std::array<DynamicCell, 6> cells{};
         int cell_count = 0;
         WeatherSnapshot summary, forcing;
@@ -262,6 +281,7 @@ private:
         double solved_time = 0;
         double anchor_lat = 0, anchor_lon = 0, metres_lat = 1, metres_lon = 1;
         double min_e = 0, min_n = 0, span_e = 1, span_n = 1;
+        double local_min_e = 0, local_min_n = 0, local_span_e = 0, local_span_n = 0;
         std::string region_id;
     };
 
@@ -272,6 +292,12 @@ private:
     }
     WindRegime frame_regime() const { return has_model() ? frame_weather_.regime : regime_; }
     void upload_field();
+    void allocate_weather_textures();
+    void allocate_local_weather_textures();
+    void initialize_local_weather_model();
+    void update_local_refinement_climate();
+    void advance_weather_with_refinement(float dt, const Vec3 &sun, const WeatherSnapshot &forcing);
+    void build_weather_texture_field(const WeatherSolver &solver, std::vector<float> &out) const;
     void live_weather_worker();
     void initialize_weather_model();
     void weather_worker_loop();
@@ -287,6 +313,11 @@ private:
     const PackReader *pack_ = nullptr;
     WindRegime regime_ = WindRegime::PYRENEAN_THERMAL;
     bool gpu_enabled_ = false;
+    int weather_grid_detail_ = 0; // 0: off, 1: 192^2 local tile, 2: 384^2 local tile
+    int grid_w_ = GRID_W, grid_h_ = GRID_H;
+    int texture_grid_w_ = 0, texture_grid_h_ = 0;
+    GLuint local_field_tex_ = 0, local_terrain_tex_ = 0;
+    int local_texture_grid_w_ = 0, local_texture_grid_h_ = 0;
     GLuint field_tex_ = 0;
     GLuint terrain_field_tex_ = 0;
 
@@ -314,10 +345,15 @@ private:
     std::vector<float> terrain_upload_;
     std::vector<float> climate_field_;
     WeatherSolver solver_; // Mutated by the weather worker, or with that worker stopped.
+    WeatherSolver local_solver_; // Fine tile around the aircraft; advanced with the regional boundary field.
+    bool local_refinement_pending_ = false;
+    double refinement_center_lat_ = 42.53131, refinement_center_lon_ = 0.47676;
+    double local_center_e_ = 0.0, local_center_n_ = 0.0;
     WeatherPublication frame_weather_, pending_weather_, staging_weather_;
     mutable std::mutex weather_publish_mtx_;
     uint64_t weather_generation_ = 0;
     uint64_t uploaded_weather_generation_ = 0;
+    uint64_t uploaded_local_weather_generation_ = 0;
     uint64_t field_uploads_ = 0;
     std::atomic<uint64_t> weather_steps_{0}, weather_solve_us_{0}, weather_publish_us_{0};
     std::optional<uint32_t> solver_seed_;

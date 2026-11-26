@@ -5,13 +5,13 @@
 
 namespace nsim {
 
-void AircraftAndHud::hud_line(Vec2 a, Vec2 b, float width, Vec3 color) {
+void AircraftAndHud::hud_line(Vec2 a, Vec2 b, float width, Vec3 color, float alpha) {
     Vec2 delta = b - a;
     const float d = std::hypot(delta.x, delta.y);
     if (d < 0.5f) return;
     const Vec2 n{-delta.y * width / (2.0f * d), delta.x * width / (2.0f * d)};
     auto vert = [&](Vec2 p) {
-        return HudVert{p.x, p.y, -1.0f, -1.0f, color.x, color.y, color.z, 0.94f};
+        return HudVert{p.x, p.y, -1.0f, -1.0f, color.x, color.y, color.z, std::clamp(alpha, 0.0f, 1.0f)};
     };
     const auto p0 = vert(a - n), p1 = vert(b - n), p2 = vert(b + n), p3 = vert(a + n);
     hud_verts_.insert(hud_verts_.end(), {p0, p1, p2, p0, p2, p3});
@@ -67,7 +67,8 @@ void AircraftAndHud::render_debug_overlays(float w, float h, float top, const Re
         int visible_markers = 0;
         for (int level = 0; level < 4; ++level) {
             auto &slice = slices[static_cast<size_t>(level)];
-            slice = atmo.debug_slice(view.east_m, view.north_m, level, 2);
+            // Show a readable 13 x 13 sample window; the solver retains every cell.
+            slice = atmo.debug_slice(view.east_m, view.north_m, level, 4);
             level_agl[static_cast<size_t>(level)] = slice.agl_m;
             generation = std::max(generation, slice.generation);
             for (int row = 0; row < slice.width; ++row) {
@@ -87,7 +88,7 @@ void AircraftAndHud::render_debug_overlays(float w, float h, float top, const Re
                     const float cloud = std::clamp(cell.cloud_fraction, 0.0f, 1.0f);
                     const float rain = std::clamp(cell.rain_mm_hr / 12.0f, 0.0f, 1.0f);
                     const Vec3 marker = mix(kLayerColors[level], kRainColor, rain * 0.82f);
-                    const float marker_size = (8.0f + cloud * 10.0f) * wx_scale;
+                    const float marker_size = (6.0f + cloud * 7.0f) * wx_scale;
                     hud_rect(a.x - marker_size * 0.5f, a.y - marker_size * 0.5f,
                              marker_size, marker_size, marker.x, marker.y, marker.z, 1.0f);
                     hud_border(a.x - marker_size * 0.5f, a.y - marker_size * 0.5f,
@@ -95,9 +96,13 @@ void AircraftAndHud::render_debug_overlays(float w, float h, float top, const Re
 
                     const Vec3 wind = cell.wind_enu_mps;
                     const float speed = length(wind);
-                    if (speed > 0.20f) {
+                    const bool show_wind_arrow = !slice.locally_refined || ((row & 1) == 0 && (col & 1) == 0);
+                    if (speed > 0.20f && show_wind_arrow) {
                         const Vec3 wind_world{wind.x, wind.z, -wind.y};
-                        const float arrow_len = std::clamp(speed * 24.0f, 110.0f, 560.0f);
+                        const float max_arrow = std::min(560.0f,
+                            std::min(slice.step_e_m, slice.step_n_m) * 0.75f);
+                        const float min_arrow = std::min(110.0f, max_arrow);
+                        const float arrow_len = std::clamp(speed * 24.0f, min_arrow, max_arrow);
                         Vec2 b;
                         if (project(base + wind_world * (arrow_len / speed), b))
                             hud_arrow(a, b, 3.2f * wx_scale, kLayerColors[level]);
@@ -135,7 +140,7 @@ void AircraftAndHud::render_debug_overlays(float w, float h, float top, const Re
                 model_line(slice.cells[right], slice.cells[right + slice.width], kLayerColors[level]);
             }
         }
-        static constexpr size_t kVerticalColumns[5] = {0, 8, 72, 80, 40};
+        static constexpr size_t kVerticalColumns[5] = {0, 12, 156, 168, 84};
         for (int level = 0; level < 3; ++level) {
             for (size_t index : kVerticalColumns) {
                 model_line(slices[static_cast<size_t>(level)].cells[index],
@@ -143,11 +148,96 @@ void AircraftAndHud::render_debug_overlays(float w, float h, float top, const Re
             }
         }
 
-        const float x = wx_pad, y = wx_pad, pw = 700.0f * wx_scale, ph = 5.05f * wx_row;
+        // Advected pathlines leave a visible history of where the published wind field has carried air.
+        constexpr size_t kTracesPerLayer = 8;
+        constexpr size_t kTraceCount = kTracesPerLayer * 4;
+        static const std::array<Vec2, kTracesPerLayer> kTraceSeeds{{
+            {-2500.0f, -2500.0f}, {0.0f, -2500.0f}, {2500.0f, -2500.0f},
+            {-2500.0f, 0.0f}, {2500.0f, 0.0f},
+            {-2500.0f, 2500.0f}, {0.0f, 2500.0f}, {2500.0f, 2500.0f}
+        }};
+        const bool reset_traces = weather_flow_traces_.size() != kTraceCount ||
+            (weather_flow_last_time_s_ >= 0.0 && view.simulation_time_s + 0.1 < weather_flow_last_time_s_) ||
+            std::hypot(view.east_m - weather_flow_origin_e_, view.north_m - weather_flow_origin_n_) > 25000.0;
+        if (reset_traces) {
+            weather_flow_traces_.clear();
+            weather_flow_traces_.resize(kTraceCount);
+            weather_flow_origin_e_ = view.east_m;
+            weather_flow_origin_n_ = view.north_m;
+            for (int level = 0; level < 4; ++level) {
+                for (size_t seed = 0; seed < kTracesPerLayer; ++seed) {
+                    auto &trace = weather_flow_traces_[static_cast<size_t>(level) * kTracesPerLayer + seed];
+                    trace.level = level;
+                    trace.east_m = view.east_m + kTraceSeeds[seed].x;
+                    trace.north_m = view.north_m + kTraceSeeds[seed].y;
+                }
+            }
+            weather_flow_last_time_s_ = view.simulation_time_s;
+        }
+        const double flow_dt = weather_flow_last_time_s_ < 0.0 ? 0.0 :
+            std::clamp(view.simulation_time_s - weather_flow_last_time_s_, 0.0, 2.0);
+        weather_flow_last_time_s_ = view.simulation_time_s;
+        for (auto &trace : weather_flow_traces_) {
+            const size_t trace_index = static_cast<size_t>(&trace - weather_flow_traces_.data());
+            auto slice = atmo.debug_slice(trace.east_m, trace.north_m, trace.level, 1);
+            const auto &center = slice.cells[slice.cells.size() / 2];
+            if (!center.valid) {
+                trace.points.clear();
+                const auto &seed = kTraceSeeds[trace_index % kTracesPerLayer];
+                trace.east_m = view.east_m + seed.x;
+                trace.north_m = view.north_m + seed.y;
+                continue;
+            }
+            if (trace.points.empty()) trace.points.push_back(center.position_enu_m);
+            if (flow_dt > 0.0) {
+                const Vec3 wind = center.wind_enu_mps;
+                trace.east_m += wind.x * flow_dt;
+                trace.north_m += wind.y * flow_dt;
+                auto next_slice = atmo.debug_slice(trace.east_m, trace.north_m, trace.level, 1);
+                const auto &next_center = next_slice.cells[next_slice.cells.size() / 2];
+                if (next_center.valid) {
+                    const Vec3 next_point{next_center.position_enu_m.x, next_center.position_enu_m.y,
+                                          static_cast<float>(next_center.position_enu_m.z + wind.z * flow_dt)};
+                    if (length(next_point - trace.points.back()) > 24.0f) trace.points.push_back(next_point);
+                }
+            }
+            if (trace.points.size() > 144) trace.points.erase(trace.points.begin(), trace.points.begin() + 24);
+        }
+        for (const auto &trace : weather_flow_traces_) {
+            const size_t count = trace.points.size();
+            if (count < 2) continue;
+            for (size_t i = 1; i < count; ++i) {
+                const auto &a_world = trace.points[i - 1];
+                const auto &b_world = trace.points[i];
+                Vec2 a_screen, b_screen;
+                const Vec3 a{static_cast<float>(a_world.x - view.east_m),
+                             static_cast<float>(a_world.z - st_.alt_msl_m),
+                             static_cast<float>(view.north_m - a_world.y)};
+                const Vec3 b{static_cast<float>(b_world.x - view.east_m),
+                             static_cast<float>(b_world.z - st_.alt_msl_m),
+                             static_cast<float>(view.north_m - b_world.y)};
+                if (!project(a, a_screen) || !project(b, b_screen)) continue;
+                const float age = static_cast<float>(i) / static_cast<float>(count - 1);
+                const Vec3 flow_color = mix(kLayerColors[trace.level], white, 0.42f);
+                hud_line(a_screen, b_screen, 7.0f * wx_scale, {0.012f, 0.020f, 0.030f}, 0.82f);
+                hud_line(a_screen, b_screen, 5.2f * wx_scale, flow_color, 0.42f + age * 0.58f);
+                if (i + 1 == count) hud_arrow(a_screen, b_screen, 5.0f * wx_scale, flow_color);
+            }
+        }
+
+        const float x = wx_pad, y = wx_pad, pw = 700.0f * wx_scale, ph = 5.95f * wx_row;
         hud_rect(x, y, pw, ph, 0.012f, 0.027f, 0.046f, 0.97f);
         hud_border(x, y, pw, ph, 2.0f * wx_scale, 0.35f, 0.78f, 1.0f, 0.92f);
-        wx_text(x + wx_pad, y + wx_row * 0.35f, "REGIONAL WEATHER MODEL  |  384 x 288 x 4", white);
-        wx_text(x + wx_pad, y + wx_row * 1.25f, "Arrows: wind   Dot size: cloud   Blue: rain", white);
+        if (slices[0].locally_refined) {
+            std::snprintf(line, sizeof(line), "REGIONAL %d x %d x 4  +  LOCAL %d x %d / 8 km",
+                          atmo.grid_width(), atmo.grid_height(), atmo.local_grid_width(), atmo.local_grid_height());
+            wx_text(x + wx_pad, y + wx_row * 0.35f, line, white);
+        } else {
+            std::snprintf(line, sizeof(line), "REGIONAL WEATHER MODEL  |  %d x %d x 4  |  local tile off",
+                          atmo.grid_width(), atmo.grid_height());
+            wx_text(x + wx_pad, y + wx_row * 0.35f, line, white);
+        }
+        wx_text(x + wx_pad, y + wx_row * 1.25f, "Arrows: model wind (scaled)   Dot: cloud fraction   Blue: rain", white);
         for (int level = 0; level < 4; ++level) {
             const float col_x = x + wx_pad + level * 150.0f * wx_scale;
             const float swatch = 13.0f * wx_scale;
@@ -167,13 +257,16 @@ void AircraftAndHud::render_debug_overlays(float w, float h, float top, const Re
             case WeatherSource::Manual: source = "MANUAL"; break;
             case WeatherSource::Default: source = "DEFAULT"; break;
         }
-        std::snprintf(line, sizeof(line), "Input: %s   Snapshot: %llu   Samples: %d",
-                      source, static_cast<unsigned long long>(generation), visible_markers);
+        std::snprintf(line, sizeof(line), "Input: %s   Snapshot: %llu   Shown: %d   Step: %.0f m",
+                      source, static_cast<unsigned long long>(generation), visible_markers,
+                      slices[0].step_e_m);
         wx_text(x + wx_pad, y + wx_row * 3.12f, line, white);
+        std::snprintf(line, sizeof(line), "Flow trails: accumulated pathlines advected by model wind");
+        wx_text(x + wx_pad, y + wx_row * 4.12f, line, yellow);
         const int model_minutes = static_cast<int>(std::max(0.0, view.simulation_time_s) / 60.0);
         const int model_seconds = static_cast<int>(std::max(0.0, view.simulation_time_s)) % 60;
         std::snprintf(line, sizeof(line), "MODEL TIME  +%02d:%02d", model_minutes, model_seconds);
-        wx_text(x + wx_pad, y + wx_row * 4.12f, line, yellow);
+        wx_text(x + wx_pad, y + wx_row * 5.12f, line, yellow);
     } else if (view.weather_level >= 0) {
         const auto slice = atmo.debug_slice(view.east_m, view.north_m, view.weather_level);
         const WeatherDebugCell &center = slice.cells[slice.cells.size() / 2];

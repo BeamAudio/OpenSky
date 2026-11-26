@@ -66,6 +66,7 @@ public:
         double cam_east_m, double cam_north_m, double cam_alt_m,
         GLuint cloud_noise_tex, GLuint cloud_vol_tex, GLuint cloud_detail_tex, GLuint lut_tex,
         GLuint atmo_field_tex, GLuint atmo_terrain_tex, const Vec4 &atmo_domain,
+        GLuint local_atmo_field_tex, GLuint local_atmo_terrain_tex, const Vec4 &local_atmo_domain,
         float time_sec, int frame_idx,
         const Vec4 &wx_fx = {0.0f, 0.0f, 0.0f, 0.0f}
     );
@@ -97,7 +98,7 @@ private:
     GLint u_cld_cam_delta_ = -1;
     GLint u_cld_base_ = -1, u_cld_thick_ = -1, u_cld_cov_ = -1, u_cld_precip_ = -1, u_cld_time_ = -1;
     GLint u_cld_frame_ = -1, u_cld_tblend_ = -1, u_cld_steps_ = -1, u_cld_sparse_ = -1;
-    GLint u_cld_lit_ = -1, u_cld_sh_ = -1, u_cld_cool_ = -1, u_cld_warm_ = -1, u_cld_dom_ = -1, u_cld_wx_fx_ = -1;
+    GLint u_cld_lit_ = -1, u_cld_sh_ = -1, u_cld_cool_ = -1, u_cld_warm_ = -1, u_cld_dom_ = -1, u_cld_local_dom_ = -1, u_cld_wx_fx_ = -1;
     GLint u_post_exp_ = -1, u_post_sun_uv_ = -1, u_post_warm_ = -1;
     GLint u_post_inv_vp_ = -1, u_post_prev_vp_ = -1, u_post_camera_delta_ = -1;
     GLint u_post_history_valid_ = -1, u_post_aa_mode_ = -1;

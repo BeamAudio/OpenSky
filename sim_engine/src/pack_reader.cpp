@@ -1782,6 +1782,63 @@ double PackReader::sample_elevation(double lat_deg, double lon_deg) const {
     return 400.0;
 }
 
+void PackReader::fill_elevation_grid(const WorldFrame &frame, double center_east_m, double center_north_m,
+                                    double half_span_m, int width, int height,
+                                    std::vector<float> &out_height) const {
+    if (width < 2 || height < 2 || half_span_m <= 0.0) {
+        out_height.clear();
+        return;
+    }
+    out_height.resize(static_cast<size_t>(width) * height);
+    std::array<uint64_t, 24> tile_keys;
+    std::array<std::shared_ptr<DecodedElevTile>, 24> tiles{};
+    tile_keys.fill(UINT64_MAX);
+    const double step_e = (half_span_m * 2.0) / (width - 1.0);
+    const double step_n = (half_span_m * 2.0) / (height - 1.0);
+    const double inv_m_lon = 1.0 / frame.metres_lon;
+    const double inv_m_lat = 1.0 / frame.metres_lat;
+    for (int y = 0; y < height; ++y) {
+        const double north = center_north_m - half_span_m + y * step_n;
+        const double lat = std::clamp(frame.anchor_lat + north * inv_m_lat, header_.lat_min, header_.lat_max);
+        const double merc_y = (1.0 - std::asinh(std::tan(lat * DEG2RAD_D)) / PI_D) * 0.5;
+        for (int x = 0; x < width; ++x) {
+            const double east = center_east_m - half_span_m + x * step_e;
+            const double lon = std::clamp(frame.anchor_lon + east * inv_m_lon, header_.lon_min, header_.lon_max);
+            const double merc_x = (lon + 180.0) / 360.0;
+            float value = 400.0f;
+            for (int z : elev_zooms_desc_) {
+                const double scale = static_cast<double>(1u << z);
+                const int32_t limit = static_cast<int32_t>(1u << z) - 1;
+                const double txf = merc_x * scale, tyf = merc_y * scale;
+                const int32_t tx = std::clamp(static_cast<int32_t>(std::floor(txf)), 0, limit);
+                const int32_t ty = std::clamp(static_cast<int32_t>(std::floor(tyf)), 0, limit);
+                const uint64_t key = nspain::make_tile_key(nspain::LAYER_ELEVATION, static_cast<uint8_t>(z), tx, ty);
+                const size_t zi = static_cast<size_t>(std::clamp(z, 0, 23));
+                if (tile_keys[zi] != key) {
+                    tile_keys[zi] = key;
+                    tiles[zi] = get_elev_tile(z, tx, ty);
+                }
+                const auto *tile = tiles[zi].get();
+                if (!tile) continue;
+                const double px = std::clamp(txf - tx, 0.0, 1.0) * (tile->width - 1);
+                const double py = std::clamp(tyf - ty, 0.0, 1.0) * (tile->height - 1);
+                const int x0 = std::clamp(static_cast<int>(px), 0, tile->width - 1);
+                const int y0 = std::clamp(static_cast<int>(py), 0, tile->height - 1);
+                const int x1 = std::min(tile->width - 1, x0 + 1);
+                const int y1 = std::min(tile->height - 1, y0 + 1);
+                const float fx = static_cast<float>(px - x0), fy = static_cast<float>(py - y0);
+                const float a = std::lerp(tile->heights[y0 * tile->width + x0],
+                                          tile->heights[y0 * tile->width + x1], fx);
+                const float b = std::lerp(tile->heights[y1 * tile->width + x0],
+                                          tile->heights[y1 * tile->width + x1], fx);
+                value = std::max(0.0f, std::lerp(a, b, fy));
+                break;
+            }
+            out_height[static_cast<size_t>(y) * width + x] = value;
+        }
+    }
+}
+
 float PackReader::sample_canopy_height(double lat, double lon) const {
     for (int z : vegetation_zooms_desc_) {
         const auto p = nspain::latlon_to_tile(lat, lon, z);

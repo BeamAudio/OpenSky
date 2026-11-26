@@ -32,6 +32,8 @@ struct DebugOverlayView {
     Mat4 projection_view;
     Mat4 aircraft_rotation;
     double east_m = 0.0, north_m = 0.0;
+    double simulation_time_s = 0.0;
+    bool weather_volume_3d = false;
 };
 
 // C172S EYEPOINT is 25 inches above its CG in the flight model.
@@ -133,6 +135,9 @@ public:
     FlightSimState &state() { return st_; }
     const FlightSimState &state() const { return st_; }
     const LocalAirSample &last_air() const { return last_air_; }
+    void render_weather_model_overlay(float width, float height, const RegionalAtmosphere &atmo,
+                                      const Mat4 &projection_view, double east_m, double north_m,
+                                      double simulation_time_s = 0.0);
     const nspain::FlightState &jsb_state() const { return fdm_.state(); }
     const GraphicsSettings &graphics_settings() const { return graphics_settings_; }
     void set_graphics_settings(const GraphicsSettings &settings) { graphics_settings_ = settings; }

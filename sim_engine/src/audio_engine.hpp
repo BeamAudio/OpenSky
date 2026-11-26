@@ -3,7 +3,9 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <string>
 #include <thread>
+#include <vector>
 
 namespace nsim {
 
@@ -58,6 +60,9 @@ public:
 
     // Offline deterministic DSP self-check (used by --selftest; requires no audio hardware).
     static bool run_selftest();
+    // Render a timestamp-aligned procedural audio track for scripted promo captures.
+    static bool write_wav(const std::string &path, const std::vector<AudioState> &timeline,
+                          double frame_seconds);
 
 private:
     struct SynthState {

@@ -1014,10 +1014,10 @@ WeatherWorkStats RegionalAtmosphere::work_stats() const {
             weather_publish_us_.load(std::memory_order_relaxed) / 1000.0};
 }
 
-WeatherDebugSlice RegionalAtmosphere::debug_slice(double east_m, double north_m, int level) const {
+WeatherDebugSlice RegionalAtmosphere::debug_slice(double east_m, double north_m, int level, int sample_stride) const {
     WeatherDebugSlice slice;
     if (level < 0 || level >= nspain::NSWX_LEVELS || !weather_model_ready_) return slice;
-    constexpr int stride = 3;
+    const int stride = std::clamp(sample_stride, 1, 8);
     const double de = frame_weather_.span_e / (GRID_W - 1), dn = frame_weather_.span_n / (GRID_H - 1);
     const int x_mid = static_cast<int>(std::round((east_m - frame_weather_.min_e) / de));
     const int y_mid = static_cast<int>(std::round((north_m - frame_weather_.min_n) / dn));
@@ -1515,7 +1515,8 @@ void RegionalAtmosphere::update_field(const Vec3 &sun_dir, double sim_time_sec, 
     if (synchronous_solver_) {
         if (steps > 0) {
             solver_.regime_ = regime_;
-            solver_.source = WeatherSource::Baked;
+            solver_.source = manual_weather_override_ ? WeatherSource::Manual
+                : live_fresh ? WeatherSource::Live : lib_.valid() ? WeatherSource::Baked : WeatherSource::Default;
             if (selected_field) solver_.weather_worker_climate_field_ = climate_field_;
             for (int i = 0; i < steps; ++i) solver_.step(0.25f, sun_dir, synoptic_weather_);
             publish_weather_model();

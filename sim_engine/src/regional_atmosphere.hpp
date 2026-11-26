@@ -191,7 +191,7 @@ public:
     LocalAirSample sample_at(double lat_deg, double lon_deg, double alt_msl_m, const Vec3 &sun_dir,
                              double sim_time_sec, float wx_advance01 = 0.28f,
                              double dt_sec = 0.0, double heading_deg = 0.0, double tas_mps = 50.0) const;
-    WeatherDebugSlice debug_slice(double east_m, double north_m, int level) const;
+    WeatherDebugSlice debug_slice(double east_m, double north_m, int level, int sample_stride = 3) const;
     WeatherWorkStats work_stats() const;
 
     GLuint field_tex() const { return field_tex_; }

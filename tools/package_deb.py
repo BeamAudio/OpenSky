@@ -109,7 +109,7 @@ def main() -> int:
     args = parser.parse_args()
 
     if not args.content_approved:
-        parser.error("commercial/open-source content rights must be reviewed before packaging; pass --content-approved only after that review")
+        parser.error("verify all included model and data redistribution terms before packaging; then pass --content-approved")
     if platform.system() != "Linux" or platform.machine().lower() not in {"x86_64", "amd64"}:
         parser.error("build this amd64 Debian package on an x86_64 Linux host")
     os_release = {}

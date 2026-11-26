@@ -50,7 +50,131 @@ void AircraftAndHud::render_debug_overlays(float w, float h, float top, const Re
         hud_border(x, y, width, height, scale, color.x, color.y, color.z, 0.65f);
     };
 
-    if (view.weather_level >= 0) {
+    if (view.weather_volume_3d) {
+        const float wx_scale = std::clamp(std::min(w / 1024.0f, h / 1024.0f), 0.85f, 1.45f);
+        const float wx_pad = 14.0f * wx_scale, wx_font = 20.0f * wx_scale, wx_row = 27.0f * wx_scale;
+        auto wx_text = [&](float x, float y, const char *msg, Vec3 color) {
+            hud_text(x, y, wx_font, msg, color.x, color.y, color.z, 1.0f);
+        };
+        static const Vec3 kLayerColors[4] = {
+            {0.36f, 0.92f, 0.65f}, {0.28f, 0.84f, 1.00f},
+            {1.00f, 0.74f, 0.34f}, {0.82f, 0.62f, 1.00f}
+        };
+        static const Vec3 kRainColor{0.18f, 0.48f, 1.00f};
+        std::array<WeatherDebugSlice, 4> slices{};
+        std::array<float, 4> level_agl{};
+        uint64_t generation = 0;
+        int visible_markers = 0;
+        for (int level = 0; level < 4; ++level) {
+            auto &slice = slices[static_cast<size_t>(level)];
+            slice = atmo.debug_slice(view.east_m, view.north_m, level, 2);
+            level_agl[static_cast<size_t>(level)] = slice.agl_m;
+            generation = std::max(generation, slice.generation);
+            for (int row = 0; row < slice.width; ++row) {
+                for (int col = 0; col < slice.width; ++col) {
+                    const auto &cell = slice.cells[static_cast<size_t>(row * slice.width + col)];
+                    if (!cell.valid) continue;
+                    const auto &p = cell.position_enu_m;
+                    const Vec3 base{static_cast<float>(p.x - view.east_m),
+                                    static_cast<float>(p.z - st_.alt_msl_m),
+                                    static_cast<float>(view.north_m - p.y)};
+                    const float horizontal_distance_sq = base.x * base.x + base.z * base.z;
+                    if (horizontal_distance_sq < 180.0f * 180.0f ||
+                        horizontal_distance_sq > 6500.0f * 6500.0f) continue;
+                    Vec2 a;
+                    if (!project(base, a)) continue;
+
+                    const float cloud = std::clamp(cell.cloud_fraction, 0.0f, 1.0f);
+                    const float rain = std::clamp(cell.rain_mm_hr / 12.0f, 0.0f, 1.0f);
+                    const Vec3 marker = mix(kLayerColors[level], kRainColor, rain * 0.82f);
+                    const float marker_size = (8.0f + cloud * 10.0f) * wx_scale;
+                    hud_rect(a.x - marker_size * 0.5f, a.y - marker_size * 0.5f,
+                             marker_size, marker_size, marker.x, marker.y, marker.z, 1.0f);
+                    hud_border(a.x - marker_size * 0.5f, a.y - marker_size * 0.5f,
+                               marker_size, marker_size, 1.4f * wx_scale, 0.91f, 0.97f, 1.0f, 0.92f);
+
+                    const Vec3 wind = cell.wind_enu_mps;
+                    const float speed = length(wind);
+                    if (speed > 0.20f) {
+                        const Vec3 wind_world{wind.x, wind.z, -wind.y};
+                        const float arrow_len = std::clamp(speed * 24.0f, 110.0f, 560.0f);
+                        Vec2 b;
+                        if (project(base + wind_world * (arrow_len / speed), b))
+                            hud_arrow(a, b, 3.2f * wx_scale, kLayerColors[level]);
+                    }
+                    ++visible_markers;
+                }
+            }
+        }
+
+        auto world_point = [&](const WeatherDebugCell &cell, Vec3 &point) {
+            if (!cell.valid) return false;
+            const auto &p = cell.position_enu_m;
+            point = {static_cast<float>(p.x - view.east_m),
+                     static_cast<float>(p.z - st_.alt_msl_m),
+                     static_cast<float>(view.north_m - p.y)};
+            return true;
+        };
+        auto model_line = [&](const WeatherDebugCell &a_cell, const WeatherDebugCell &b_cell, Vec3 color) {
+            Vec3 a_world, b_world;
+            Vec2 a_screen, b_screen;
+            if (world_point(a_cell, a_world) && world_point(b_cell, b_world) &&
+                project(a_world, a_screen) && project(b_world, b_screen))
+                hud_line(a_screen, b_screen, 2.6f * wx_scale, color);
+        };
+        const Vec3 cage_color{0.31f, 0.40f, 0.52f};
+        for (int level = 0; level < 4; ++level) {
+            const auto &slice = slices[static_cast<size_t>(level)];
+            for (int i = 0; i < slice.width - 1; ++i) {
+                model_line(slice.cells[static_cast<size_t>(i)], slice.cells[static_cast<size_t>(i + 1)], kLayerColors[level]);
+                const size_t bottom = static_cast<size_t>((slice.width - 1) * slice.width + i);
+                model_line(slice.cells[bottom], slice.cells[bottom + 1], kLayerColors[level]);
+                const size_t left = static_cast<size_t>(i * slice.width);
+                model_line(slice.cells[left], slice.cells[left + slice.width], kLayerColors[level]);
+                const size_t right = static_cast<size_t>(i * slice.width + slice.width - 1);
+                model_line(slice.cells[right], slice.cells[right + slice.width], kLayerColors[level]);
+            }
+        }
+        static constexpr size_t kVerticalColumns[5] = {0, 8, 72, 80, 40};
+        for (int level = 0; level < 3; ++level) {
+            for (size_t index : kVerticalColumns) {
+                model_line(slices[static_cast<size_t>(level)].cells[index],
+                           slices[static_cast<size_t>(level + 1)].cells[index], cage_color);
+            }
+        }
+
+        const float x = wx_pad, y = wx_pad, pw = 700.0f * wx_scale, ph = 5.05f * wx_row;
+        hud_rect(x, y, pw, ph, 0.012f, 0.027f, 0.046f, 0.97f);
+        hud_border(x, y, pw, ph, 2.0f * wx_scale, 0.35f, 0.78f, 1.0f, 0.92f);
+        wx_text(x + wx_pad, y + wx_row * 0.35f, "REGIONAL WEATHER MODEL  |  384 x 288 x 4", white);
+        wx_text(x + wx_pad, y + wx_row * 1.25f, "Arrows: wind   Dot size: cloud   Blue: rain", white);
+        for (int level = 0; level < 4; ++level) {
+            const float col_x = x + wx_pad + level * 150.0f * wx_scale;
+            const float swatch = 13.0f * wx_scale;
+            hud_rect(col_x, y + wx_row * 2.25f, swatch, swatch,
+                     kLayerColors[level].x, kLayerColors[level].y, kLayerColors[level].z, 1.0f);
+            char label[32];
+            if (level_agl[static_cast<size_t>(level)] >= 1000.0f)
+                std::snprintf(label, sizeof(label), "L%d %.1fkm", level, level_agl[static_cast<size_t>(level)] * 0.001f);
+            else
+                std::snprintf(label, sizeof(label), "L%d %.0fm", level, level_agl[static_cast<size_t>(level)]);
+            wx_text(col_x + 18.0f * wx_scale, y + wx_row * 2.12f, label, white);
+        }
+        const char *source = "DEFAULT";
+        switch (atmo.model_source()) {
+            case WeatherSource::Baked: source = "BAKED"; break;
+            case WeatherSource::Live: source = "LIVE"; break;
+            case WeatherSource::Manual: source = "MANUAL"; break;
+            case WeatherSource::Default: source = "DEFAULT"; break;
+        }
+        std::snprintf(line, sizeof(line), "Input: %s   Snapshot: %llu   Samples: %d",
+                      source, static_cast<unsigned long long>(generation), visible_markers);
+        wx_text(x + wx_pad, y + wx_row * 3.12f, line, white);
+        const int model_minutes = static_cast<int>(std::max(0.0, view.simulation_time_s) / 60.0);
+        const int model_seconds = static_cast<int>(std::max(0.0, view.simulation_time_s)) % 60;
+        std::snprintf(line, sizeof(line), "MODEL TIME  +%02d:%02d", model_minutes, model_seconds);
+        wx_text(x + wx_pad, y + wx_row * 4.12f, line, yellow);
+    } else if (view.weather_level >= 0) {
         const auto slice = atmo.debug_slice(view.east_m, view.north_m, view.weather_level);
         const WeatherDebugCell &center = slice.cells[slice.cells.size() / 2];
         auto color = [&](const WeatherDebugCell &cell) {
@@ -224,6 +348,20 @@ void AircraftAndHud::render_debug_overlays(float w, float h, float top, const Re
                       prof->build_ms_per_page(), prof->encode_ms_per_page());
         row_text(7, line, white);
     }
+}
+
+void AircraftAndHud::render_weather_model_overlay(float w, float h, const RegionalAtmosphere &atmo,
+                                                   const Mat4 &projection_view, double east_m, double north_m,
+                                                   double simulation_time_s) {
+    hud_verts_.clear();
+    DebugOverlayView view{};
+    view.projection_view = projection_view;
+    view.east_m = east_m;
+    view.north_m = north_m;
+    view.simulation_time_s = simulation_time_s;
+    view.weather_volume_3d = true;
+    render_debug_overlays(w, h, 0.0f, atmo, view);
+    flush_hud(w, h);
 }
 
 } // namespace nsim

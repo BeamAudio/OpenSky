@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 
 #ifndef _WIN32
 #include <dlfcn.h>
@@ -398,6 +399,44 @@ bool AudioEngine::run_selftest() {
         return false;
     }
     return true;
+}
+
+bool AudioEngine::write_wav(const std::string &path, const std::vector<AudioState> &timeline,
+                            double frame_seconds) {
+    if (timeline.empty() || !std::isfinite(frame_seconds) || frame_seconds <= 0.0) return false;
+    const uint64_t samples_per_frame = static_cast<uint64_t>(std::llround(frame_seconds * kSampleRate));
+    const uint64_t sample_count = samples_per_frame * timeline.size();
+    if (samples_per_frame == 0 || sample_count > (UINT32_MAX - 36u) / 4u) return false;
+    const uint32_t data_bytes = static_cast<uint32_t>(sample_count * 4u);
+
+    std::ofstream wav(path, std::ios::binary | std::ios::trunc);
+    if (!wav) return false;
+    auto u16 = [&](uint16_t value) {
+        const char bytes[2] = {static_cast<char>(value & 0xffu), static_cast<char>((value >> 8u) & 0xffu)};
+        wav.write(bytes, sizeof(bytes));
+    };
+    auto u32 = [&](uint32_t value) {
+        const char bytes[4] = {static_cast<char>(value & 0xffu), static_cast<char>((value >> 8u) & 0xffu),
+                               static_cast<char>((value >> 16u) & 0xffu), static_cast<char>((value >> 24u) & 0xffu)};
+        wav.write(bytes, sizeof(bytes));
+    };
+    wav.write("RIFF", 4); u32(36u + data_bytes); wav.write("WAVEfmt ", 8);
+    u32(16u); u16(1u); u16(2u); u32(kSampleRate); u32(kSampleRate * 4u); u16(4u); u16(16u);
+    wav.write("data", 4); u32(data_bytes);
+
+    SynthState synth;
+    std::array<int16_t, kPeriodFrames * 2> block{};
+    for (const AudioState &state : timeline) {
+        uint64_t remaining = samples_per_frame;
+        while (remaining > 0) {
+            const unsigned int frames = static_cast<unsigned int>(std::min<uint64_t>(remaining, kPeriodFrames));
+            synth.render_stereo(state, block.data(), frames);
+            wav.write(reinterpret_cast<const char *>(block.data()),
+                      static_cast<std::streamsize>(frames * 2u * sizeof(int16_t)));
+            remaining -= frames;
+        }
+    }
+    return static_cast<bool>(wav);
 }
 
 } // namespace nsim

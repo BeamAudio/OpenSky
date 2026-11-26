@@ -1180,7 +1180,7 @@ def build_region(args: argparse.Namespace) -> int:
         "attribution": {
             "imagery": imagery_attribution,
             "elevation": elevation_attribution,
-            "airports": "OurAirports (Public Domain), OpenStreetMap contributors (ODbL), ENAIRE AIP",
+            "airports": "OurAirports (Public Domain), OpenStreetMap contributors (ODbL)",
         },
         "counts": {
             "elevation_tiles": len(elev_tiles),

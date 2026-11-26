@@ -28,4 +28,4 @@
 
 ## Asset and data rules
 
-Use commercially reusable sources and retain attribution. Keep upstream JSBSim dynamically linked under LGPL. Approved sources include IGN Spain PNOA / MDT05 / MDT25 / INSPIRE Hidrografía (CC BY 4.0), OurAirports (public domain), OpenStreetMap (ODbL), Poly Haven (CC0), and Open-Meteo subject to the project's data attribution and feed terms. Follow [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md). Esri imagery, GPL aircraft models/configurations/textures, and unlicensed assets are prohibited.
+Use openly licensed or documented sources and retain attribution. Keep upstream JSBSim dynamically linked under LGPL. Approved sources include IGN Spain PNOA / MDT05 / MDT25 / INSPIRE Hidrografía (CC BY 4.0), OurAirports (public domain), OpenStreetMap (ODbL), Poly Haven (CC0), and Open-Meteo subject to the project's data attribution and feed terms. Follow [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md). Esri imagery, GPL aircraft models/configurations/textures, and assets without documented redistribution terms are prohibited.

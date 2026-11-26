@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fetch official Spanish Hydrography (IGN Spain INSPIRE WMS, CC-BY 4.0 — commercial-safe)
+"""Fetch official Spanish Hydrography (IGN Spain INSPIRE WMS, CC-BY 4.0)
 and bake crisp rivers, streams, lakes & reservoirs into LAYER_SURFACE channel B of .nspack files.
 """
 

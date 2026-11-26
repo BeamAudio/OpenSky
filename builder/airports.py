@@ -1,6 +1,6 @@
 """Fetch, merge, and normalize regional airports & airstrips (OurAirports + OSM).
 
-All sources are commercially safe with attribution:
+Source licenses and attribution:
   - OurAirports: Public Domain
   - OpenStreetMap: ODbL (attribution required; rendered game assets are Produced Works)
 """
@@ -24,7 +24,7 @@ OVERPASS_URLS = [
     "https://overpass.kumi.systems/api/interpreter",
     "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
 ]
-USER_AGENT = "NorthernSpainVFRSim/0.1 (builder; commercial-safe open data)"
+USER_AGENT = "OpenSky/0.1 (regional scenery builder; open data)"
 
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     r = 6371000.0

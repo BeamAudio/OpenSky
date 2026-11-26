@@ -240,7 +240,7 @@ void LivingTraffic::build_meshes() {
     mb.add_box( 0.00f, 1.20f, -3.55f, 0.22f, 0.18f, 0.14f, 6.0f); // Nose landing light
     end_mesh(MeshKind::GA);
 
-    // 1. Commercial Twinjet Airliner (~35 m wingspan, A320/B737 scale, landing gear grounded at Y=0)
+    // 1. Twinjet Airliner (~35 m wingspan, A320/B737 scale, landing gear grounded at Y=0)
     begin_mesh(MeshKind::Airliner);
     mb.add_box(0.0f, 3.6f,  0.0f, 3.9f, 4.0f, 29.0f, 0.0f);
     mb.add_bow(0.0f, 3.4f, -14.5f, -20.0f, 3.7f, 3.6f, 0.0f);

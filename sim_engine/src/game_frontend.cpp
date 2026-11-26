@@ -1368,7 +1368,7 @@ void GameFrontend::draw_credits(AircraftAndHud &ui) {
     label(ui, 976, 328, 17, "Roads, buildings and city data: OpenStreetMap contributors.");
     label(ui, 976, 362, 17, "OSM-derived packs retain ODbL 1.0 attribution and share-alike.");
     label(ui, 976, 396, 17, "OurAirports data is public domain; other feeds keep source terms.");
-    label(ui, 976, 440, 16, "Live weather uses Open-Meteo; commercial access needs an eligible plan.", true);
+    label(ui, 976, 440, 16, "Live weather uses Open-Meteo and follows its current service terms.", true);
     label(ui, 976, 478, 15, "Full notices: THIRD_PARTY_LICENSES.md", true);
 
     panel(ui, {64, 579, 860, 366});

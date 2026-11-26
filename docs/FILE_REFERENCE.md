@@ -27,7 +27,7 @@ In grouped asset rows, filenames following the first path use the same parent di
 | `docs/WEATHER.md` | Weather inputs, worker, snapshots, player-facing views and model limits. |
 | `docs/MODDING.md` | Current aircraft/region package workflow and script-system limitations. |
 | `docs/FILE_REFERENCE.md` | This maintained file catalog. |
-| `docs/RELEASE_READINESS.md` | Release platform, rights and packaging gates. |
+| `docs/OPEN_SOURCE_RELEASE.md` | Open-source release platform, rights, packaging and verification checklist. |
 | `docs/airport-data-sources.md` | Provenance and reuse notes for airport data. |
 | `docs/images/promo_cockpit_barcelona_beaches.png` | Ultra quality cockpit capture above Barcelona's coast. |
 | `docs/images/promo_chase_barcelona_beaches.png` | Ultra quality chase capture above Barcelona and its harbor. |
@@ -252,7 +252,7 @@ The tables above explain subsystem responsibilities. This expanded index names e
 | `docs/ARCHITECTURE.md` | Component boundaries, data flow, thread ownership and change guidance. |
 | `docs/FILE_REFERENCE.md` | This maintained file catalog. |
 | `docs/MODDING.md` | Current aircraft/region package workflow and script-system limitations. |
-| `docs/RELEASE_READINESS.md` | Release platform, rights and packaging gates. |
+| `docs/OPEN_SOURCE_RELEASE.md` | Open-source release platform, rights, packaging and verification checklist. |
 | `docs/SYSTEMS.md` | Runtime system responsibilities and primary implementation files. |
 | `docs/WEATHER.md` | Weather inputs, worker, snapshots, player-facing views and model limits. |
 | `docs/airport-data-sources.md` | Provenance and reuse notes for airport data. |

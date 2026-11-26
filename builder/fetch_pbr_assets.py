@@ -2,7 +2,7 @@
 """Download 100% CC0 (Public Domain) 1K photogrammetry PBR textures from Poly Haven
 into game/assets/pbr/ and composite a photographic Northern Spain botanical tree atlas.
 
-All assets from Poly Haven are CC0 1.0 Public Domain (commercial-safe, zero royalties).
+All assets from Poly Haven are CC0 1.0 Public Domain. See the asset source notes.
 """
 
 from __future__ import annotations

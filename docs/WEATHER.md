@@ -27,7 +27,7 @@ flowchart LR
 
 ### Live boundary input
 
-When live mode is enabled, the weather client requests current conditions from Open-Meteo near the aircraft. The fetched conditions initialize or refresh the model's regional boundary input; they are not copied directly into every airport cell. A successful fetch is refreshed periodically; on failure or stale data the simulator falls back to installed baked weather. See [Open-Meteo documentation](https://open-meteo.com/en/docs) for current feed and attribution terms.
+When live mode is enabled, the weather client requests current conditions from Open-Meteo near the aircraft. The fetched conditions initialize or refresh the model's regional boundary input; they are not copied directly into every airport cell. A successful fetch is refreshed periodically; on failure or stale data the simulator falls back to installed baked weather. Disable the live feed at launch with `./run_sim.sh --no-live-weather`. See [Open-Meteo documentation](https://open-meteo.com/en/docs) for current feed and attribution terms; the [third-party notices](../THIRD_PARTY_LICENSES.md) describe the separate data and API service terms.
 
 ### CPU model and snapshots
 
@@ -46,6 +46,12 @@ The worker writes private solve buffers. Consumers read a published snapshot tha
 - **Coverage:** an airport outside the model domain is labelled as uncovered. Do not silently extrapolate a precise briefing beyond the active domain.
 
 When live conditions are not available, UI labels identify the baked, manual or default source. Attribution and provider terms are in [third-party licenses](../THIRD_PARTY_LICENSES.md).
+
+### 3D model debug visualization
+
+Use `--weather-model-debug` to project samples from the published local model into the flight scene at all four terrain-following heights. Wind direction and magnitude appear as 3D arrows; marker size represents cloud fraction, and blue color indicates precipitation. The legend identifies the input source and snapshot generation. The visualization samples the solved field while volumetric clouds render from the same weather state.
+
+Use `--weather-model-video --portrait-promo --autotest <output-dir>` to capture a 15-second, vertical top-down time-lapse. It advances the regional solver at 22.5× playback speed, drawing four and a half simulated minutes of the published four-layer field and simulation clock over the flight scene. `--promo-video --portrait-promo --autotest <output-dir>` captures a 15-second vertical location montage with orbiting exterior cameras and cockpit audio. Both modes write PNG frames plus `cockpit_audio.wav`; encode them as 1080×1920 H.264/AAC for social video.
 
 ## Weather and aircraft behavior
 

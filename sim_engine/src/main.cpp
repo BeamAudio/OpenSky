@@ -303,6 +303,9 @@ int main(int argc, char **argv) {
     bool cloud_qa = false;
     bool cockpit_qa = false;
     bool promo_only = false;
+    bool promo_video = false;
+    bool weather_model_video = false;
+    bool portrait_promo = false;
     bool season_qa = false;
     std::string req_region;
     std::string req_airport;
@@ -323,7 +326,9 @@ int main(int argc, char **argv) {
     std::string weather_arg = "auto";
     bool quick_profile = false;
     bool debug_overlays = false;
+    bool weather_model_debug = false;
     bool no_audio = false;
+    bool no_live_weather = false;
     // Mode-6 BC7 keeps the same 16-byte blocks while releasing L7-L9 pages
     // about four times faster than the partition-search encoder on Renoir.
     OrthoFormat ortho_format = OrthoFormat::BC7Fast;
@@ -337,8 +342,13 @@ int main(int argc, char **argv) {
         else if (a == "--outlook-check") runtime_check = outlook_check = true;
         else if (a == "--bench-only") bench_only = true;
         else if (a == "--promo-only") promo_only = true;
+        else if (a == "--promo-video") promo_video = true;
+        else if (a == "--weather-model-video") weather_model_video = true;
+        else if (a == "--portrait-promo") portrait_promo = true;
         else if (a == "--debug-overlays") debug_overlays = true;
+        else if (a == "--weather-model-debug") weather_model_debug = true;
         else if (a == "--no-audio") no_audio = true;
+        else if (a == "--no-live-weather") no_live_weather = true;
         else if ((a == "--profile" || a == "--quick-profile") && i + 1 < argc) {
             profile_dir = argv[++i];
             quick_profile = a == "--quick-profile";
@@ -382,8 +392,9 @@ int main(int argc, char **argv) {
             }
         }
     }
+    if (promo_video || weather_model_video) promo_only = true;
     if (promo_only && autotest_dir.empty()) {
-        std::fprintf(stderr, "[PROMO-QA] --promo-only requires --autotest <output-directory>\n");
+        std::fprintf(stderr, "[PROMO-QA] --promo-only and --promo-video require --autotest <output-directory>\n");
         return 2;
     }
     if (quick_profile && (!autotest_dir.empty() || !topdown_dir.empty() || selftest_only)) {
@@ -426,12 +437,12 @@ int main(int argc, char **argv) {
     }
     GraphicsSettings graphics_settings = load_graphics_settings();
     if (promo_only) {
-        // Promotional captures deliberately render the highest quality tier
-        // and a wider terrain radius without changing the user's saved settings.
+        // Promotional captures use Ultra quality and the 200% terrain radius
+        // without changing the user's saved settings.
         graphics_settings.quality_preset = 3;
         graphics_settings.pixel_percent = 100;
         graphics_settings.aa_mode = 2;
-        graphics_settings.terrain_lod_percent = CdlodTerrain::MAX_LOD_DISTANCE_PERCENT;
+        graphics_settings.terrain_lod_percent = 200;
         graphics_settings.weather_detail = 3;
         graphics_settings.aircraft_detail = 1;
     }
@@ -505,8 +516,8 @@ int main(int argc, char **argv) {
     }
     profiler.startup_stage("spawn_anchor");
 
-    const int output_w = !topdown_dir.empty() ? 1024 : GAME_OUTPUT_W;
-    const int output_h = !topdown_dir.empty() ? 1024 : GAME_OUTPUT_H;
+    const int output_w = !topdown_dir.empty() ? 1024 : (portrait_promo ? 1080 : GAME_OUTPUT_W);
+    const int output_h = !topdown_dir.empty() ? 1024 : (portrait_promo ? 1920 : GAME_OUTPUT_H);
     if (!win.create("OpenSky VFR Simulator", output_w, output_h,
                     static_cast<DisplayMode>(graphics_settings.display_mode), !promo_only)) {
         return 1;
@@ -562,7 +573,7 @@ int main(int argc, char **argv) {
                          graphics_settings.pixel_percent, graphics_settings.aa_mode)) return 1;
     profiler.startup_stage("sky_cloud_resources");
     if (!interactive_run) reg_atmo.set_solver_seed(0x1725);
-    if (!reg_atmo.init(&pack, true, "", interactive_run)) return 1;
+    if (!reg_atmo.init(&pack, true, "", interactive_run && !no_live_weather)) return 1;
     if (weather_arg != "auto") {
         reg_atmo.set_manual_weather_override(true);
         if (weather_arg == "thermal" || weather_arg == "clear") {
@@ -825,7 +836,7 @@ int main(int argc, char **argv) {
         profiler.cpu_end(FlightProfiler::Weather, weather_start);
     };
 
-    auto render_one_frame = [&](bool draw_hud, int max_new_tree_cells = 1, const std::string &save_png = "", float fov_deg = 50.0f, bool replay_hud = false) {
+    auto render_one_frame = [&](bool draw_hud, int max_new_tree_cells = 1, const std::string &save_png = "", float fov_deg = 50.0f, bool replay_hud = false, bool weather_model_overlay = false) {
         frame_idx++;
         profiler.start_frame(frame_idx, quality);
         double prepare_start = profiler.cpu_start();
@@ -1055,7 +1066,7 @@ int main(int argc, char **argv) {
                               float((lat - p.lat) * pack.anchor_m_lat())};
             ac_hud.sync_walkaround_damage(frontend.care());
             ac_hud.render_parked_aircraft(vp, offset, float(p.heading), sky_clouds.atmo(), sky_clouds.refl_env_tex());
-        } else if (!native_cockpit)
+        } else if (!native_cockpit && !weather_model_video)
             ac_hud.render_aircraft_3d(vp, cam_off, sky_clouds.atmo(), sky_clouds.refl_env_tex(), static_cast<float>(sim_time));
         // 4b. Lightweight 3D exterior precipitation streaks (rain/snow past cockpit; 0 cost when dry!)
         if (topdown_dir.empty()) {
@@ -1121,6 +1132,8 @@ int main(int argc, char **argv) {
                 route_play.playing, route_play.speed, ac_hud.state().view_mode,
                 &route_play.seek_t);
         }
+        if (weather_model_overlay || weather_model_debug)
+            ac_hud.render_weather_model_overlay(output_w, output_h, reg_atmo, vp, cam_e, cam_n, sim_time);
         profiler.end(FlightProfiler::Hud);
         const double t_p6 = PlatformWindow::now_sec();
         if ((t_p6 - t_p0) * 1000.0 > 45.0) {
@@ -1155,10 +1168,11 @@ int main(int argc, char **argv) {
 
     // Captures can intentionally advance the world clock without accepting player input.
     const auto capture_frame = [&](double elapsed, bool draw_hud, int tree_budget = 1,
-                                   const std::string &png = "", float fov = 50.0f) {
+                                   const std::string &png = "", float fov = 50.0f,
+                                   bool weather_model_overlay = false) {
         sim_time += elapsed;
         update_environment();
-        render_one_frame(draw_hud, tree_budget, png, fov);
+        render_one_frame(draw_hud, tree_budget, png, fov, false, weather_model_overlay);
     };
 
     if (quick_profile) {
@@ -1768,7 +1782,8 @@ int main(int argc, char **argv) {
         if (!bench_only) {
         auto snap = [&](const std::string &fname, double lat, double lon, double agl, double hdg, double pitch, int vmode,
                         double time_advance = 0.0, float look_yaw = 0.0f, float look_pitch = 0.0f,
-                        double roll = 0.0, double ail = 0.0, bool draw_hud = true) {
+                        double roll = 0.0, double ail = 0.0, bool draw_hud = true,
+                        bool weather_model_overlay = false, bool save_capture = true) {
             FlightSimState &s = ac_hud.state();
             profiler.set_scene(promo_only ? fname + " warmup" : fname);
             s.paused = true;
@@ -1816,7 +1831,7 @@ int main(int argc, char **argv) {
             for (int w = 0; !win.should_close() && (promo_only || w < warm_frames); w++) {
                 win.poll_events();
                 step_flight(1.0 / 60.0);
-                capture_frame(1.0 / 60.0, draw_hud, 128);
+                capture_frame(1.0 / 60.0, draw_hud, 128, "", 50.0f, weather_model_overlay);
                 if (cockpit_qa) streamer.flush_pending_sync(4, 0.12);
                 else if (promo_only) streamer.flush_pending_sync(16, 0.035);
                 else streamer.flush_pending_sync(24, 0.25);
@@ -1833,12 +1848,13 @@ int main(int argc, char **argv) {
             }
             if (win.should_close()) return;
             if (promo_only) profiler.set_scene(fname);
-            std::string p = autotest_dir + "/" + fname;
+            const std::string p = save_capture ? autotest_dir + "/" + fname : std::string{};
             const int settle_frames = promo_only ? 30 : 10;
             for (int f = 0; f < settle_frames; f++) {
                 win.poll_events();
                 step_flight(1.0 / 60.0);
-                capture_frame(1.0 / 60.0, draw_hud, 128, (f == settle_frames - 1) ? p : "");
+                capture_frame(1.0 / 60.0, draw_hud, 128, (save_capture && f == settle_frames - 1) ? p : "",
+                              50.0f, weather_model_overlay);
             }
             StreamStats ss = streamer.stats();
             CdlodDrawStats cd = terrain.last_stats();
@@ -1901,12 +1917,210 @@ int main(int argc, char **argv) {
         }
 
         if (promo_only) {
+            if (weather_model_video) {
+                static constexpr int kVideoFps = 24;
+                static constexpr int kWeatherFrames = 360;
+                const double lat = 42.53131, lon = 0.47676;
+                const double ground = pack.sample_elevation(lat, lon);
+                transition_world(lat, lon);
+                pack.set_online_camera(lat, lon);
+                season_override = 2;
+                reg_atmo.set_season(season_override);
+                reg_atmo.set_manual_weather_override(true);
+                reg_atmo.set_regime(WindRegime::CONVECTIVE_STORM);
+                reg_atmo.set_solver_seed(0x4F50534Bu, true);
+                wx_advance = 0.94f;
+
+                FlightSimState &state = ac_hud.state();
+                ac_hud.reset_flight(lat, lon, ground + 15000.0, 0.0, 0.0, false);
+                state.paused = true;
+                state.slew_fast = false;
+                state.view_mode = 2;
+                state.ground_m = ground;
+                state.pitch_deg = -89.95;
+                state.roll_deg = 0.0;
+                state.heading_deg = 0.0;
+                state.look_yaw_deg = 0.0f;
+                state.look_pitch_deg = 0.0f;
+                state.free_cam_off_m = {0.0f, 0.0f, 0.0f};
+                state.speed_mps = 0.0;
+                state.vel_east_mps = state.vel_north_mps = 0.0;
+                sim_time = 0.0;
+                sim_time += 1.0;
+                reg_atmo.update_field(sky_clouds.atmo().sun_dir, sim_time, true, wx_advance);
+                sky_clouds.reset_temporal_history();
+
+                const auto frames_dir = std::filesystem::path(autotest_dir) / "frames";
+                std::filesystem::create_directories(frames_dir);
+                profiler.set_scene("top-down weather-model time-lapse");
+                for (int i = 0; i < 24 && !win.should_close(); ++i) {
+                    win.poll_events();
+                    step_flight(1.0 / 60.0);
+                    capture_frame(1.0 / 60.0, false, 128, "", 50.0f, true);
+                    streamer.flush_pending_sync(16, 0.035);
+                }
+
+                std::vector<AudioState> audio_timeline;
+                audio_timeline.reserve(kWeatherFrames);
+                for (int f = 0; f < kWeatherFrames && !win.should_close(); ++f) {
+                    win.poll_events();
+                    const double t = static_cast<double>(f) / static_cast<double>(kWeatherFrames - 1);
+                    state.heading_deg = 7.0 * std::sin(2.0 * PI_D * t);
+                    // The weather solver advances 0.75 simulation seconds per output frame.
+                    sim_time += 0.75 - (1.0 / static_cast<double>(kVideoFps));
+                    step_flight(1.0 / static_cast<double>(kVideoFps));
+                    char frame_path[512];
+                    std::snprintf(frame_path, sizeof(frame_path), "%s/frame_%05d.png",
+                                  frames_dir.c_str(), f);
+                    capture_frame(1.0 / static_cast<double>(kVideoFps), false, 128,
+                                  frame_path, 50.0f, true);
+
+                    const LocalAirSample &air = ac_hud.last_air();
+                    AudioState sound{};
+                    sound.paused = false;
+                    sound.engine_running = true;
+                    sound.in_cockpit = true;
+                    sound.on_ground = false;
+                    sound.master_volume = 0.78f;
+                    sound.rpm = 2380.0f + 90.0f * static_cast<float>(std::sin(2.0 * PI_D * t));
+                    sound.throttle = 0.70f + 0.08f * static_cast<float>(std::sin(2.0 * PI_D * t));
+                    sound.ias_kt = 78.0f;
+                    sound.wind_speed_mps = static_cast<float>(std::hypot(air.wind_east_mps, air.wind_north_mps));
+                    sound.turb_rms = air.turb_rms;
+                    sound.precip_mm_hr = air.precipitation_mm_hr;
+                    sound.snow_factor = air.snow_factor;
+                    sound.lightning_flash = air.lightning_flash;
+                    audio_timeline.push_back(sound);
+                }
+                const std::string audio_path = (std::filesystem::path(autotest_dir) / "cockpit_audio.wav").string();
+                if (!audio_timeline.empty() && !AudioEngine::write_wav(audio_path, audio_timeline,
+                                                                       1.0 / static_cast<double>(kVideoFps)))
+                    std::fprintf(stderr, "[WEATHER-VIDEO] Failed to write cockpit audio: %s\n", audio_path.c_str());
+                const auto center_slice = reg_atmo.debug_slice(
+                    (lon - pack.anchor_lon()) * pack.anchor_m_lon(),
+                    (lat - pack.anchor_lat()) * pack.anchor_m_lat(), 1, 2);
+                profiler.finish();
+                std::printf("[WEATHER-VIDEO] Captured %zu frames at %d FPS; model time advanced %.0f s, snapshot %llu -> %s/frames\n",
+                            audio_timeline.size(), kVideoFps,
+                            audio_timeline.size() * 0.75,
+                            static_cast<unsigned long long>(center_slice.generation), autotest_dir.c_str());
+                return win.should_close() ? 1 : 0;
+            }
+            if (promo_video) {
+                struct PromoVideoScene {
+                    const char *name;
+                    double lat0, lon0, lat1, lon1, agl_m, heading_deg;
+                    int view_mode;
+                    float look_yaw_deg, look_pitch_deg;
+                    WindRegime regime;
+                    float weather;
+                    int season;
+                    double warm_advance_s;
+                    bool model_overlay;
+                };
+                static constexpr int kVideoFps = 30;
+                static constexpr int kFramesPerScene = 75;
+                const std::array<PromoVideoScene, 6> scenes{{
+                    {"pyrenees_cockpit", 42.53131, 0.47676, 42.53280, 0.47490, 350.0, 315.0, 0, 0.0f, -5.0f,
+                     WindRegime::PYRENEAN_THERMAL, 0.54f, 2, 8.0, false},
+                    {"mediano_chase", 42.31200, 0.19400, 42.31370, 0.19550, 650.0, 24.0, 1, 38.0f, -10.0f,
+                     WindRegime::FOEHN_SUR, 0.50f, 2, 10.0, false},
+                    {"barcelona_beaches_chase", 41.36400, 2.19900, 41.36520, 2.19750, 900.0, 305.0, 1, -22.0f, -8.0f,
+                     WindRegime::PYRENEAN_THERMAL, 0.48f, 2, 12.0, false},
+                    {"costa_brava_chase", 41.95450, 3.24200, 41.95580, 3.24360, 560.0, 305.0, 1, -2.0f, -6.0f,
+                     WindRegime::CIERZO_NW, 0.38f, 2, 10.0, false},
+                    {"catalan_pyrenees_cockpit", 42.33870, 1.40920, 42.34020, 1.40750, 950.0, 350.0, 0, -18.0f, -9.0f,
+                     WindRegime::WINTER_ICING, 0.80f, 0, 16.0, false},
+                    {"storm_cockpit", 42.53131, 0.47676, 42.53230, 0.47540, 140.0, 160.0, 0, 0.0f, -6.0f,
+                     WindRegime::CONVECTIVE_STORM, 0.94f, 2, 75.0, false}
+                }};
+                const auto frames_dir = std::filesystem::path(autotest_dir) / "frames";
+                std::filesystem::create_directories(frames_dir);
+                reg_atmo.set_manual_weather_override(true);
+                std::vector<AudioState> audio_timeline;
+                audio_timeline.reserve(scenes.size() * kFramesPerScene);
+                int video_frame = 0;
+                for (const auto &scene : scenes) {
+                    profiler.set_scene(std::string("promo video ") + scene.name);
+                    season_override = scene.season;
+                    reg_atmo.set_season(scene.season);
+                    reg_atmo.set_regime(scene.regime);
+                    wx_advance = scene.weather;
+                    const float aircraft_pitch = -2.5f;
+                    const bool debug_model = scene.model_overlay;
+                    const std::string preview_name = std::string("video_preview_") + scene.name + ".png";
+                    snap(preview_name, scene.lat0, scene.lon0, scene.agl_m, scene.heading_deg,
+                         aircraft_pitch, scene.view_mode, scene.warm_advance_s,
+                         scene.look_yaw_deg, scene.look_pitch_deg, 0.0, 0.0, false,
+                         debug_model, false);
+                    FlightSimState &state = ac_hud.state();
+                    state.paused = true;
+                    state.speed_mps = 38.0;
+                    state.look_yaw_deg = scene.look_yaw_deg;
+                    state.look_pitch_deg = scene.look_pitch_deg;
+                    for (int f = 0; f < kFramesPerScene && !win.should_close(); ++f) {
+                        const double t = static_cast<double>(f) / static_cast<double>(kFramesPerScene - 1);
+                        const double eased = t * t * (3.0 - 2.0 * t);
+                        state.lat_deg = std::lerp(scene.lat0, scene.lat1, eased);
+                        state.lon_deg = std::lerp(scene.lon0, scene.lon1, eased);
+                        state.ground_m = pack.sample_elevation(state.lat_deg, state.lon_deg);
+                        state.alt_msl_m = state.ground_m + scene.agl_m + 12.0 * std::sin(PI_D * t);
+                        state.heading_deg = scene.heading_deg + 2.2 * std::sin(PI_D * t);
+                        state.pitch_deg = aircraft_pitch + 0.8 * std::sin(2.0 * PI_D * t);
+                        state.roll_deg = 5.5 * std::sin(2.0 * PI_D * t);
+                        const double orbit_ease = t * t * (3.0 - 2.0 * t);
+                        const float orbit_yaw = scene.view_mode == 1
+                            ? static_cast<float>(std::lerp(-52.0, 52.0, orbit_ease)) : 0.0f;
+                        state.look_yaw_deg = scene.look_yaw_deg + orbit_yaw +
+                            2.0f * static_cast<float>(std::sin(PI_D * t));
+                        state.look_pitch_deg = scene.look_pitch_deg + 1.0f * static_cast<float>(std::sin(PI_D * t));
+                        state.aileron = 0.12 * std::sin(2.0 * PI_D * t);
+                        state.rudder = -state.aileron * 0.45;
+                        state.vel_east_mps = state.speed_mps * std::sin(state.heading_deg * DEG2RAD_D);
+                        state.vel_north_mps = state.speed_mps * std::cos(state.heading_deg * DEG2RAD_D);
+                        step_flight(1.0 / static_cast<double>(kVideoFps));
+                        char frame_path[512];
+                        std::snprintf(frame_path, sizeof(frame_path), "%s/frame_%05d.png",
+                                      frames_dir.c_str(), video_frame++);
+                        capture_frame(1.0 / static_cast<double>(kVideoFps), false, 128,
+                                      frame_path, 50.0f, debug_model);
+
+                        const LocalAirSample &air = ac_hud.last_air();
+                        AudioState sound{};
+                        sound.paused = false;
+                        sound.engine_running = true;
+                        sound.in_cockpit = true; // Keep a consistent cockpit perspective under the exterior montage.
+                        sound.on_ground = false;
+                        sound.master_volume = 0.78f;
+                        sound.rpm = 2320.0f + 120.0f * static_cast<float>(std::sin(2.0 * PI_D * t));
+                        sound.throttle = 0.68f + 0.10f * static_cast<float>(std::sin(2.0 * PI_D * t));
+                        sound.ias_kt = 76.0f + 4.0f * static_cast<float>(std::sin(PI_D * t));
+                        sound.wind_speed_mps = static_cast<float>(std::hypot(air.wind_east_mps, air.wind_north_mps));
+                        sound.turb_rms = air.turb_rms;
+                        sound.precip_mm_hr = air.precipitation_mm_hr;
+                        sound.snow_factor = air.snow_factor;
+                        sound.lightning_flash = air.lightning_flash;
+                        audio_timeline.push_back(sound);
+                    }
+                    std::printf("[PROMO-VIDEO] %s | %d frames | %s view | weather=%s\n",
+                                scene.name, kFramesPerScene, scene.view_mode == 0 ? "cockpit" : "exterior",
+                                reg_atmo.regime_short());
+                }
+                const std::string audio_path = (std::filesystem::path(autotest_dir) / "cockpit_audio.wav").string();
+                if (!audio_timeline.empty() && !AudioEngine::write_wav(audio_path, audio_timeline,
+                                                                       1.0 / static_cast<double>(kVideoFps)))
+                    std::fprintf(stderr, "[PROMO-VIDEO] Failed to write cockpit audio: %s\n", audio_path.c_str());
+                profiler.finish();
+                std::printf("[PROMO-VIDEO] Captured %d frames at %d FPS -> %s/frames\n",
+                            video_frame, kVideoFps, autotest_dir.c_str());
+                return win.should_close() ? 1 : 0;
+            }
             if (cloud_qa) {
                 reg_atmo.set_manual_weather_override(true);
                 reg_atmo.set_regime(WindRegime::PYRENEAN_THERMAL);
-                wx_advance = 0.62f;
+                wx_advance = 0.60f;
                 snap("promo_weather_clouds.png", 42.36000, 0.23500, 2620.0, 32.0, -5.0, 1,
-                     50.0, -28.0f, -14.0f, 5.0, 0.0, false);
+                     50.0, -28.0f, -14.0f, 5.0, 0.0, false, true);
                 reg_atmo.set_regime(WindRegime::CONVECTIVE_STORM);
                 wx_advance = 0.94f;
                 snap("promo_weather_rain.png", 42.53131, 0.47676, 140.0, 160.0, -4.0, 0,

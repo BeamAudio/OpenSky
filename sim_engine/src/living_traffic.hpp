@@ -12,7 +12,7 @@
 namespace nsim {
 
 // Living Aerial + Maritime Traffic Simulator (iGPU-first, 100% individual point-to-point routes):
-//  - Aerial: individual GA VFR & Commercial IFR flights between real PackReader airports
+//  - Aerial: individual GA VFR and airline IFR flights between real PackReader airports
 //    (verified ramp turnaround -> runway takeoff -> climb/bank -> terrain-cleared cruise ->
 //     3 deg runway final approach -> rollout -> new destination), plus parked ramp GA planes!
 //  - Maritime: individual port-to-port vessels (cargo/container ships, ferries, coastal yachts)

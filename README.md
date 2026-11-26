@@ -60,9 +60,29 @@ Scenery imagery in these captures: © Instituto Geográfico Nacional de España 
 
 ## Installation
 
-There is no prebuilt desktop installer or GitHub release archive yet. Build OpenSky and install regional scenery from the repository using the steps below.
+### Linux (Ubuntu / Debian `.deb` packages)
 
-### Linux (Ubuntu / Debian)
+Prebuilt `.deb` installers are published on [GitHub Releases](https://github.com/BeamAudio/OpenSky/releases) (`opensky-vfr` main simulator + individual regional pack `.deb`s for Aragón, Catalunya, and Northern Spain).
+
+1. Download `opensky-vfr_<version>_amd64.deb` (includes the simulator, JSBSim, and Aragón baseline) plus any desired regional `.deb` add-ons:
+   - `opensky-vfr-catalonia-coast` — Barcelona, Girona, Tarragona & Costa Brava
+   - `opensky-vfr-catalonia-pyrenees` — Lleida, Andorra & Catalan Pyrenees
+   - `opensky-vfr-navarra-basque` — Navarra, Rioja & Basque Coast
+   - `opensky-vfr-asturias-cantabria` — Picos de Europa, Asturias & Cantabria
+   - `opensky-vfr-galicia` — Galicia & Atlantic Coast
+   - `opensky-vfr-aragon-south` — Southern Aragón & Teruel
+   - `opensky-vfr-castilla-y-leon` — Castilla y León (Meseta Norte & Duero)
+2. Install the downloaded `.deb` files:
+
+   ```bash
+   sudo apt install ./opensky-vfr*.deb
+   ```
+
+3. Launch **OpenSky VFR** from your application menu or run `opensky-vfr`.
+
+> Note: The published `.deb` builds target Debian 13+ / Ubuntu 24.04+ (`libc6 >= 2.38`, `libstdc++6 >= 14`). On Ubuntu 22.04, Debian 12, Fedora, or Arch, build from source below.
+
+### Linux (build from source)
 
 1. **Install build, runtime, and scenery-builder dependencies:**
 
@@ -114,7 +134,7 @@ There is no native Windows `.exe` or installer yet (OpenSky uses Linux X11/GLX, 
    ```
 
    Reboot if prompted, then open **Ubuntu** from the Start menu and create your Linux username and password.
-3. Inside the **Ubuntu** terminal, follow steps 1–4 of **Linux (Ubuntu / Debian)** above (`sudo apt update ...`, `git clone ...`, `make -C sim_engine -j"$(nproc)"`, `./install_region.sh ...`, and `./run_sim.sh`).
+3. Inside the **Ubuntu** terminal, follow steps 1–4 of **Linux (build from source)** above (`sudo apt update ...`, `git clone ...`, `make -C sim_engine -j"$(nproc)"`, `./install_region.sh ...`, and `./run_sim.sh`).
 
 **WSL2 caveats:**
 - **OpenGL 4.6 required:** if your GPU driver / WSLg Mesa version exposes an older OpenGL version or software rendering (`llvmpipe`), startup may fail or performance may be low (check inside Ubuntu with `glxinfo -B | grep "OpenGL"`, from `sudo apt install mesa-utils`).

@@ -55,10 +55,16 @@ def region_file_tuple(region_id: str) -> tuple[str, ...]:
 
 OPTIONAL_ADDONS: tuple[tuple[str, str, tuple[str, ...], str], ...] = (
     (
-        "opensky-vfr-catalonia",
-        "Catalunya Coast and Pyrenees scenery pack for OpenSky VFR",
-        CATALONIA_FILES,
-        "Adds Barcelona, Costa Brava, Girona, Tarragona, Lleida, and Catalan Pyrenees.",
+        "opensky-vfr-catalonia-coast",
+        "Barcelona, Costa Brava, Girona & Tarragona scenery pack for OpenSky VFR",
+        region_file_tuple("es_catalonia_coast"),
+        "Adds Barcelona, Tarragona, Girona, Montserrat, and the Costa Brava.",
+    ),
+    (
+        "opensky-vfr-catalonia-pyrenees",
+        "Catalan Pyrenees, Lleida & Andorra scenery pack for OpenSky VFR",
+        region_file_tuple("es_catalonia_pyrenees"),
+        "Adds Lleida, Seu d'Urgell, Cerdanya, Andorra, and the Catalan Pyrenees.",
     ),
     (
         "opensky-vfr-navarra-basque",

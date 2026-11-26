@@ -382,6 +382,7 @@ int main(int argc, char **argv) {
     bool cockpit_qa = false;
     bool promo_only = false;
     bool promo_video = false;
+    std::string promo_clip;
     bool weather_model_video = false;
     bool portrait_promo = false;
     int weather_refinement_override = -1;
@@ -425,6 +426,7 @@ int main(int argc, char **argv) {
         else if (a == "--bench-only") bench_only = true;
         else if (a == "--promo-only") promo_only = true;
         else if (a == "--promo-video") promo_video = true;
+        else if (a == "--promo-clip" && i + 1 < argc) promo_clip = argv[++i];
         else if (a == "--weather-model-video") weather_model_video = true;
         else if (a == "--weather-refinement" && i + 1 < argc) {
             const std::string value = argv[++i];
@@ -493,7 +495,7 @@ int main(int argc, char **argv) {
             }
         }
     }
-    if (promo_video || weather_model_video) promo_only = true;
+    if (promo_video || !promo_clip.empty() || weather_model_video) promo_only = true;
     if (promo_only && autotest_dir.empty()) {
         std::fprintf(stderr, "[PROMO-QA] --promo-only and --promo-video require --autotest <output-directory>\n");
         return 2;
@@ -578,7 +580,10 @@ int main(int argc, char **argv) {
         return 1;
     }
     const AircraftPackage aircraft_package = *selected_aircraft;
-    if (promo_only && !ortho_explicit) graphics_settings.terrain_streaming = true;
+    if ((promo_only || !promo_clip.empty()) && !ortho_explicit) {
+        init_online = OnlineOrthoProvider::PNOA;
+        graphics_settings.terrain_streaming = true;
+    }
     if (ortho_explicit) graphics_settings.terrain_streaming = init_online == OnlineOrthoProvider::PNOA;
     else if (!graphics_settings.terrain_streaming) init_online = OnlineOrthoProvider::OFF;
     pack.set_online_provider(init_online);
@@ -619,8 +624,9 @@ int main(int argc, char **argv) {
     }
     profiler.startup_stage("spawn_anchor");
 
-    const int output_w = !topdown_dir.empty() ? 1024 : (portrait_promo ? 1080 : GAME_OUTPUT_W);
-    const int output_h = !topdown_dir.empty() ? 1024 : (portrait_promo ? 1920 : GAME_OUTPUT_H);
+    const bool landscape_ui_promo = (promo_clip == "world_menu_ui");
+    const int output_w = !topdown_dir.empty() ? 1024 : (portrait_promo && !landscape_ui_promo ? 1080 : GAME_OUTPUT_W);
+    const int output_h = !topdown_dir.empty() ? 1024 : (portrait_promo && !landscape_ui_promo ? 1920 : GAME_OUTPUT_H);
     if (!win.create("OpenSky VFR Simulator", output_w, output_h,
                     static_cast<DisplayMode>(graphics_settings.display_mode), !(promo_only || offscreen))) {
         return 1;
@@ -720,7 +726,7 @@ int main(int argc, char **argv) {
     const bool interactive = interactive_run;
     audio.init(interactive && !no_audio);
     // An empty path gives scripted runs an in-memory profile with no read/write access.
-    if ((interactive || !airport_qa_dir.empty() || !world_qa_png.empty()) &&
+    if ((interactive || !airport_qa_dir.empty() || !world_qa_png.empty() || !promo_clip.empty()) &&
         !frontend.init(pack, root + "/sim_engine/shaders", root + "/game/assets", profile_file,
                        aircraft_package)) return 1;
     auto show_loading = [&](const char *title, const char *stage, float progress01) {
@@ -1243,6 +1249,15 @@ int main(int argc, char **argv) {
                 show_diagnostics, debug_active ? &debug : nullptr
             );
             frontend.draw_navigation(ac_hud, win);
+        }
+        if (!walking && st.view_mode == 0 && !st.menu_open && !route_play.active) {
+            const PixelRect pr = win.presentation_rect(GAME_OUTPUT_W, GAME_OUTPUT_H);
+            const float ux = (static_cast<float>(win.mouse_x() - pr.x)) * (static_cast<float>(GAME_OUTPUT_W) / std::max(1, pr.w));
+            const float uy = (static_cast<float>(win.mouse_y() - pr.y)) * (static_cast<float>(GAME_OUTPUT_H) / std::max(1, pr.h));
+            const bool ui_blk = (frontend.kneeboard_open() && ux >= 24 && ux <= 670 && uy >= 168 && uy <= 900) ||
+                                (frontend.tutorial_open() && ux >= 1340 && ux <= 1900 && uy >= 24 && uy <= 400) ||
+                                (uy >= 940 && ux >= 1030);
+            ac_hud.render_cockpit_interaction(output_w, output_h, win, static_cast<float>(sim_time), draw_hud, ui_blk);
         } else if (replay_hud && route_play.active) {
             route_play.last_action = frontend.draw_replay_bar(
                 ac_hud, win, route_play.active_rec.title,
@@ -2154,6 +2169,479 @@ int main(int argc, char **argv) {
                             weather_video_seconds,
                             audio_timeline.size() * 0.75,
                             static_cast<unsigned long long>(center_slice.generation), autotest_dir.c_str());
+                return win.should_close() ? 1 : 0;
+            }
+            if (!promo_clip.empty()) {
+                static constexpr int kVideoFps = 60;
+                static constexpr double kFrameDt = 1.0 / static_cast<double>(kVideoFps);
+                static constexpr int kSubsteps = 2; // Exact 120 Hz JSBSim physics at silky-smooth 60 FPS!
+                const auto frames_dir = std::filesystem::path(autotest_dir) / "frames";
+                std::filesystem::create_directories(frames_dir);
+                std::vector<AudioState> audio_timeline;
+                int video_frame = 0;
+
+                auto push_audio = [&](bool in_ckpt) {
+                    const auto &fs = ac_hud.jsb_state();
+                    const auto &sys = ac_hud.systems();
+                    const LocalAirSample &air = ac_hud.last_air();
+                    AudioState sound{};
+                    sound.paused = false;
+                    sound.engine_running = sys.is_engine_running();
+                    sound.starter_cranking = sys.is_starter_cranking();
+                    sound.sputtering = sys.is_sputtering();
+                    sound.in_cockpit = in_ckpt;
+                    sound.on_ground = fs.on_ground;
+                    sound.master_volume = 0.80f;
+                    sound.rpm = static_cast<float>(fs.rpm);
+                    sound.throttle = static_cast<float>(ac_hud.state().throttle);
+                    sound.ias_kt = static_cast<float>(fs.ias_kt);
+                    sound.ground_speed_mps = static_cast<float>(fs.ground_speed_mps);
+                    sound.wind_speed_mps = static_cast<float>(std::hypot(air.wind_east_mps, air.wind_north_mps));
+                    sound.turb_rms = air.turb_rms;
+                    sound.precip_mm_hr = air.precipitation_mm_hr;
+                    sound.snow_factor = air.snow_factor;
+                    sound.lightning_flash = air.lightning_flash;
+                    audio_timeline.push_back(sound);
+                };
+
+                auto warm_scene = [&](double lat, double lon, double alt_agl = 400.0,
+                                      double hdg_deg = 0.0, double leg_dist_m = 1800.0) {
+                    const bool wants_online = (pack.online_provider() == OnlineOrthoProvider::PNOA);
+                    double mlat = 111132.0, mlon = 82000.0;
+                    nspain::meters_per_degree(lat, mlat, mlon);
+                    const double hr = hdg_deg * DEG2RAD_D;
+                    const double mid_lat = lat + std::cos(hr) * (leg_dist_m * 0.45) / mlat;
+                    const double mid_lon = lon + std::sin(hr) * (leg_dist_m * 0.45) / mlon;
+                    const double end_lat = lat + std::cos(hr) * (leg_dist_m * 0.85) / mlat;
+                    const double end_lon = lon + std::sin(hr) * (leg_dist_m * 0.85) / mlon;
+
+                    // Pre-fetch multi-tier IGN PNOA corridor tiles BEFORE building terrain pages so 100% of frames render sharp PNOA ortho with zero pop-in.
+                    if (wants_online) {
+                        pack.prefetch_online_box(mid_lat, mid_lon, 11000.0, 14);
+                        pack.prefetch_online_box(mid_lat, mid_lon,  3600.0, 16);
+                        pack.prefetch_online_box(lat, lon,          1300.0, 18);
+                        pack.prefetch_online_box(mid_lat, mid_lon,  1300.0, 18);
+                        pack.prefetch_online_box(end_lat, end_lon,  1100.0, 18);
+                        if (alt_agl < 420.0) {
+                            pack.prefetch_online_box(lat, lon, 450.0, 19);
+                            pack.prefetch_online_box(lat, lon, 240.0, 20);
+                        }
+                    }
+
+                    transition_world(lat, lon);
+                    pack.set_online_camera(lat, lon);
+                    ac_hud.reset_flight(lat, lon, pack.sample_elevation(lat, lon) + alt_agl, hdg_deg, 95.0, false);
+                    ac_hud.state().paused = true;
+                    sky_clouds.reset_temporal_history();
+                    if (wants_online) streamer.invalidate_close_pages();
+
+                    const double t0 = PlatformWindow::now_sec();
+                    for (int w = 0; !win.should_close(); ++w) {
+                        win.poll_events();
+                        if (wants_online) {
+                            const double u_fwd = (w & 1) ? 0.45 : 0.0;
+                            pack.set_online_camera(lat + std::cos(hr) * (leg_dist_m * u_fwd) / mlat,
+                                                   lon + std::sin(hr) * (leg_dist_m * u_fwd) / mlon);
+                        }
+                        capture_frame(1.0 / 60.0, false, 128, "", 56.0f, false);
+                        streamer.flush_pending_sync(24, 0.08);
+                        const StreamStats st_s = streamer.stats();
+                        const int ztot = st_s.z20_tiles_ready + st_s.z20_tiles_missing;
+                        const bool z_ok = !wants_online || (alt_agl > 420.0 && st_s.queued_jobs == 0) ||
+                                          (ztot > 0 && st_s.z20_tiles_ready * 100 >= ztot * 95);
+                        const double elapsed = PlatformWindow::now_sec() - t0;
+                        if (elapsed >= 22.0 || (w >= 26 && z_ok && st_s.queued_jobs == 0 && terrain.last_stats().max_active_lod >= 8)) break;
+                    }
+                    std::printf("[PROMO-WARM] pnoa=%s used=%d fetched=%d max_lod=%d\n",
+                                pack.online_provider_name(), pack.online_tiles_used(),
+                                pack.online_tiles_fetched(), terrain.last_stats().max_active_lod);
+                };
+
+                auto save_sim_frame = [&](bool draw_hud_flag = false) {
+                    char fp[512];
+                    std::snprintf(fp, sizeof(fp), "%s/frame_%05d.ppm", frames_dir.c_str(), video_frame++);
+                    const float fov = (ac_hud.state().view_mode == 0 && portrait_promo) ? 62.0f
+                                    : (ac_hud.state().view_mode == 0 ? 54.0f : 50.0f);
+                    capture_frame(kFrameDt, draw_hud_flag, 96, fp, fov, false);
+                };
+
+                auto step_physics_frame = [&](double roll_c, double pitch_c, double thr_t, double brk_c) {
+                    const double sdt = kFrameDt / static_cast<double>(kSubsteps);
+                    for (int k = 0; k < kSubsteps; ++k) {
+                        ac_hud.step_autonomous_assist(sdt, roll_c, pitch_c, thr_t, brk_c,
+                                                      sky_clouds.atmo(), reg_atmo, sim_time + k * sdt);
+                    }
+                    double mlat, mlon;
+                    nspain::meters_per_degree(ac_hud.state().lat_deg, mlat, mlon);
+                    const double hr = ac_hud.state().heading_deg * DEG2RAD_D;
+                    const double ahead = std::max(150.0, ac_hud.state().alt_msl_m - ac_hud.state().ground_m);
+                    pack.set_online_camera(ac_hud.state().lat_deg + std::cos(hr) * ahead / mlat,
+                                           ac_hud.state().lon_deg + std::sin(hr) * ahead / mlon);
+                    streamer.flush_pending_sync(8, 0.015);
+                };
+
+                reg_atmo.set_manual_weather_override(true);
+
+                if (promo_clip == "galicia_coast") {
+                    season_override = 2; tod_slot = 2; wx_advance = 0.04f;
+                    reg_atmo.set_season(2); reg_atmo.set_regime(WindRegime::PYRENEAN_THERMAL);
+                    const double lat0 = 43.3860, lon0 = -8.4060; // A Coruna Peninsula, Tower of Hercules & Coast
+                    warm_scene(lat0, lon0, 260.0, 158.0, 900.0);
+                    ac_hud.systems().reset_to_running_default();
+                    ac_hud.systems().tune_nav_standby(1, 116.40); ac_hud.systems().swap_nav(1); // STG Santiago VOR
+                    ac_hud.systems().set_nav_obs_deg(1, 158);
+                    ac_hud.reset_flight(lat0, lon0, pack.sample_elevation(lat0, lon0) + 260.0, 158.0, 98.0, false);
+                    auto &st = ac_hud.state();
+                    st.paused = false; st.view_mode = 0; st.throttle = 0.78; st.mixture = 0.90;
+                    st.ap_master = true; st.ap_hdg_hold = true; st.ap_alt_hold = true;
+                    st.ap_hdg_deg = 158.0; st.ap_alt_ft = std::round((st.alt_msl_m * 3.28084) / 100.0) * 100.0;
+                    for (int f = 0; f < 600 && !win.should_close(); ++f) {
+                        win.poll_events();
+                        if (f >= 60 && f <= 210) {
+                            const double t = (f - 60) / 150.0;
+                            st.ap_hdg_deg = std::lerp(158.0, 134.0, t * t * (3.0 - 2.0 * t));
+                        }
+                        if (f == 240) { st.view_mode = 1; st.chase_dist_m = 12.5f; sky_clouds.reset_temporal_history(); }
+                        if (st.view_mode == 0) {
+                            const double t = f / 239.0;
+                            st.look_yaw_deg = static_cast<float>(9.0 * std::sin(PI_D * t));
+                            st.look_pitch_deg = static_cast<float>(std::lerp(-11.5, -7.5, t * t * (3.0 - 2.0 * t)));
+                        } else {
+                            const double u = (f - 240) / 359.0;
+                            const double sm = u * u * (3.0 - 2.0 * u);
+                            st.look_yaw_deg = static_cast<float>(std::lerp(-42.0, 50.0, sm));
+                            st.look_pitch_deg = static_cast<float>(std::lerp(-11.0, -5.0, sm));
+                        }
+                        step_physics_frame(0.0, 0.0, 0.78, 0.0);
+                        save_sim_frame(false);
+                        push_audio(st.view_mode == 0);
+                    }
+                } else if (promo_clip == "picos_weather") {
+                    season_override = 2; tod_slot = 2; wx_advance = 0.78f;
+                    reg_atmo.set_season(2); reg_atmo.set_regime(WindRegime::CONVECTIVE_STORM);
+                    const double lat0 = 43.2260, lon0 = -4.8420; // Picos de Europa Limestone Crags & Valley
+                    sim_time += 45.0;
+                    warm_scene(lat0, lon0, 420.0, 28.0, 900.0);
+                    reg_atmo.update_field(sky_clouds.atmo().sun_dir, sim_time, true, wx_advance);
+                    ac_hud.systems().reset_to_running_default();
+                    ac_hud.systems().set_pitot_heat_switch(true);
+                    ac_hud.systems().set_light_switch(1, true);
+                    ac_hud.systems().tune_nav_standby(1, 112.50); ac_hud.systems().swap_nav(1); // ASN Asturias VOR
+                    ac_hud.reset_flight(lat0, lon0, pack.sample_elevation(lat0, lon0) + 420.0, 28.0, 96.0, false);
+                    auto &st = ac_hud.state();
+                    st.paused = false; st.view_mode = 0; st.throttle = 0.82; st.mixture = 0.85;
+                    st.ap_master = true; st.ap_hdg_hold = true; st.ap_alt_hold = true;
+                    st.ap_hdg_deg = 28.0; st.ap_alt_ft = std::round((st.alt_msl_m * 3.28084) / 100.0) * 100.0;
+                    for (int f = 0; f < 600 && !win.should_close(); ++f) {
+                        win.poll_events();
+                        if (f >= 120 && f <= 260) {
+                            const double t = (f - 120) / 140.0;
+                            st.ap_hdg_deg = std::lerp(28.0, 8.0, t * t * (3.0 - 2.0 * t));
+                        }
+                        if (f == 420) { st.view_mode = 1; st.chase_dist_m = 13.5f; sky_clouds.reset_temporal_history(); }
+                        if (st.view_mode == 0) {
+                            st.look_yaw_deg = static_cast<float>(7.5 * std::sin(2.0 * PI_D * f / 420.0));
+                            st.look_pitch_deg = -6.0f;
+                        } else {
+                            const double u = (f - 420) / 179.0;
+                            const double sm = u * u * (3.0 - 2.0 * u);
+                            st.look_yaw_deg = static_cast<float>(std::lerp(-30.0, 44.0, sm));
+                            st.look_pitch_deg = static_cast<float>(std::lerp(-11.0, -5.5, sm));
+                        }
+                        step_physics_frame(0.0, 0.0, 0.82, 0.0);
+                        save_sim_frame(false);
+                        push_audio(st.view_mode == 0);
+                    }
+                } else if (promo_clip == "basque_takeoff") {
+                    const AirportInfo *lebb = pack.find_airport("LEBB");
+                    if (!lebb) { std::fprintf(stderr, "[PROMO-CLIP] LEBB not found\n"); return 1; }
+                    season_override = 2; tod_slot = 2; wx_advance = 0.22f;
+                    reg_atmo.set_season(2); reg_atmo.set_regime(WindRegime::PYRENEAN_THERMAL);
+                    const double dn = (lebb->rwy_lat_b - lebb->rwy_lat_a) * 111132.0;
+                    const double de = (lebb->rwy_lon_b - lebb->rwy_lon_a) * 111320.0 * std::cos(lebb->lat * DEG2RAD_D);
+                    const double rwy_hdg = std::fmod(std::atan2(de, dn) * RAD2DEG_D + 360.0, 360.0);
+                    warm_scene(lebb->rwy_lat_a, lebb->rwy_lon_a, 80.0, rwy_hdg, 1600.0);
+                    ac_hud.systems().reset_to_running_default();
+                    ac_hud.systems().set_light_switch(1, true);
+                    ac_hud.systems().set_flaps_immediate_deg(10.0);
+                    ac_hud.systems().tune_nav_standby(1, 115.90); ac_hud.systems().swap_nav(1); // BLB Bilbao VOR
+                    auto &st = ac_hud.state();
+                    st.parking_brake = false;
+                    ac_hud.reset_flight(lebb->rwy_lat_a, lebb->rwy_lon_a, pack.sample_elevation(lebb->rwy_lat_a, lebb->rwy_lon_a) + 1.5, rwy_hdg, 46.0, true);
+                    st.paused = false; st.parking_brake = false; st.view_mode = 0; st.throttle = 1.0; st.mixture = 1.0;
+                    for (int f = 0; f < 720 && !win.should_close(); ++f) {
+                        win.poll_events();
+                        const auto &fs = ac_hud.jsb_state();
+                        double pitch_c = 0.0, roll_c = 0.0, thr = 1.0;
+                        if (fs.on_ground) {
+                            thr = 1.0;
+                            if (fs.ias_kt >= 55.0) pitch_c = 0.46;
+                        } else {
+                            if (fs.agl_m > 90.0) ac_hud.systems().set_flaps_target_deg(0.0);
+                            if (f < 500) {
+                                pitch_c = (fs.ias_kt < 74.0) ? 0.36 : 0.46;
+                                thr = 0.96;
+                            } else {
+                                if (!st.ap_master) {
+                                    st.ap_master = true; st.ap_hdg_hold = true; st.ap_nav_hold = false;
+                                    st.ap_hdg_deg = std::fmod(rwy_hdg + 26.0, 360.0);
+                                    st.ap_vs_hold = true; st.ap_alt_hold = false; st.ap_vs_fpm = 500.0;
+                                    st.ap_alt_arm = true; st.ap_alt_ft = std::round((st.ind_alt_ft + 400.0) / 100.0) * 100.0;
+                                }
+                                thr = 0.90;
+                            }
+                        }
+                        if (f == 280) { st.view_mode = 1; st.chase_dist_m = 13.0f; sky_clouds.reset_temporal_history(); }
+                        if (f == 500) { st.view_mode = 0; sky_clouds.reset_temporal_history(); }
+                        if (st.view_mode == 0) {
+                            if (f >= 500) {
+                                const double u = (f - 500) / 219.0;
+                                const double sm = u * u * (3.0 - 2.0 * u);
+                                st.look_yaw_deg = static_cast<float>(std::lerp(-2.0, -11.0, sm));
+                                st.look_pitch_deg = static_cast<float>(std::lerp(-8.0, -14.0, sm));
+                            } else {
+                                st.look_yaw_deg = 0.0f;
+                                st.look_pitch_deg = -7.0f;
+                            }
+                        } else {
+                            const double u = (f - 280) / 219.0;
+                            const double sm = u * u * (3.0 - 2.0 * u);
+                            st.look_yaw_deg = static_cast<float>(std::lerp(-36.0, 44.0, sm));
+                            st.look_pitch_deg = static_cast<float>(std::lerp(-11.0, -7.0, sm));
+                        }
+                        step_physics_frame(roll_c, pitch_c, thr, 0.0);
+                        save_sim_frame(false);
+                        push_audio(st.view_mode == 0);
+                    }
+                } else if (promo_clip == "castilla_autopilot") {
+                    season_override = 3; tod_slot = 6; wx_advance = 0.05f;
+                    reg_atmo.set_season(3); reg_atmo.set_regime(WindRegime::PYRENEAN_THERMAL);
+                    // Part A: Castilla y Leon (Valladolid VOR 117.20 + real VS->ALT ARM capture live on 3D OLED!)
+                    const double lat_a = 41.6100, lon_a = -4.8700;
+                    warm_scene(lat_a, lon_a, 460.0, 345.0, 900.0);
+                    ac_hud.systems().reset_to_running_default();
+                    ac_hud.systems().tune_nav_standby(1, 117.20); ac_hud.systems().swap_nav(1); // VLL VOR
+                    ac_hud.systems().set_nav_obs_deg(1, 10);
+                    ac_hud.reset_flight(lat_a, lon_a, pack.sample_elevation(lat_a, lon_a) + 460.0, 345.0, 98.0, false);
+                    auto &st = ac_hud.state();
+                    st.paused = false; st.view_mode = 0; st.throttle = 0.88; st.mixture = 0.85;
+                    st.ap_master = true; st.ap_nav_hold = true; st.ap_hdg_hold = false; st.ap_nav_source = 1; // VOR1!
+                    st.ap_vs_hold = true; st.ap_alt_hold = false; st.ap_vs_fpm = 600.0;
+                    st.ap_alt_arm = true;
+                    st.ap_alt_ft = std::round((st.alt_msl_m * 3.28084 + 210.0) / 100.0) * 100.0;
+                    for (int f = 0; f < 420 && !win.should_close(); ++f) {
+                        win.poll_events();
+                        const double u = f / 419.0;
+                        const double sm = u * u * (3.0 - 2.0 * u);
+                        st.look_yaw_deg = static_cast<float>(std::lerp(-14.0, -4.0, sm));
+                        st.look_pitch_deg = static_cast<float>(std::lerp(-14.0, -7.0, sm));
+                        step_physics_frame(0.0, 0.0, st.ap_alt_hold ? 0.74 : 0.90, 0.0);
+                        save_sim_frame(false);
+                        push_audio(true);
+                    }
+                    // Part B: Southern Aragon / Teruel golden-hour chase flight (TER 112.70)
+                    const double lat_b = 40.4250, lon_b = -1.2100;
+                    warm_scene(lat_b, lon_b, 430.0, 255.0, 800.0);
+                    ac_hud.systems().tune_nav_standby(1, 112.70); ac_hud.systems().swap_nav(1);
+                    ac_hud.reset_flight(lat_b, lon_b, pack.sample_elevation(lat_b, lon_b) + 430.0, 255.0, 102.0, false);
+                    st.paused = false; st.view_mode = 1; st.chase_dist_m = 13.0f; st.ap_master = false;
+                    for (int f = 0; f < 300 && !win.should_close(); ++f) {
+                        win.poll_events();
+                        const double u = f / 299.0;
+                        const double sm = u * u * (3.0 - 2.0 * u);
+                        const double rcmd = -0.35 * std::cos(PI_D * u);
+                        st.look_yaw_deg = static_cast<float>(std::lerp(-44.0, 52.0, sm));
+                        st.look_pitch_deg = static_cast<float>(std::lerp(-10.0, -4.0, sm));
+                        step_physics_frame(rcmd, 0.02, 0.80, 0.0);
+                        save_sim_frame(false);
+                        push_audio(false);
+                    }
+                } else if (promo_clip == "ownership_loop") {
+                    const AirportInfo *es = pack.find_airport("ES-0205");
+                    const AirportInfo *leci = pack.find_airport("LECI");
+                    if (!es || !leci) { std::fprintf(stderr, "[PROMO-CLIP] ES-0205/LECI missing\n"); return 1; }
+                    season_override = 2; tod_slot = 2; wx_advance = 0.16f;
+                    reg_atmo.set_season(2); reg_atmo.set_regime(WindRegime::PYRENEAN_THERMAL);
+
+                    // Beat 1 (0..180, 3.0s): Live 3D Walkaround around parked EC-VFR at Castejon de Sos
+                    transition_world(es->lat, es->lon);
+                    frontend.open_airport(*es);
+                    vegetation.prepare(pack, *es);
+                    const auto spot = frontend.parking_spot();
+                    double mlat = 111132.0, mlon = 82000.0;
+                    nspain::meters_per_degree(spot.lat, mlat, mlon);
+                    warm_scene(spot.lat, spot.lon, 25.0, spot.heading, 600.0);
+                    frontend.open_airport(*es);
+                    vegetation.prepare(pack, *es);
+                    for (int f = 0; f < 180 && !win.should_close(); ++f) {
+                        win.poll_events();
+                        const double u = f / 179.0;
+                        const double sm = u * u * (3.0 - 2.0 * u);
+                        const double ang = std::lerp(-1.35, 1.05, sm);
+                        const double rad = std::lerp(7.2, 4.8, sm);
+                        const double wl = spot.lat + std::cos(ang) * rad / mlat;
+                        const double wn = spot.lon + std::sin(ang) * rad / mlon;
+                        const double wa = pack.sample_elevation(wl, wn) + 1.68;
+                        const float yaw = static_cast<float>(std::fmod(std::atan2((spot.lon - wn) * mlon, (spot.lat - wl) * mlat) * RAD2DEG_D + 360.0, 360.0));
+                        frontend.set_demo_walk(wl, wn, wa, yaw, -8.0f, false);
+                        save_sim_frame(false);
+                        AudioState silent{}; silent.paused = false; silent.in_cockpit = false; silent.master_volume = 0.35f;
+                        silent.wind_speed_mps = 3.5f;
+                        audio_timeline.push_back(silent);
+                    }
+
+                    // Beat 2 (180..450, 4.5s): Cold-and-Dark Cockpit with Highlighted 3D Startup Sequence Buttons + Real Engine Catch!
+                    frontend.board(ac_hud, 14.0);
+                    ac_hud.systems().reset_cold_and_dark();
+                    ac_hud.systems().set_fuel_selector(nspain::FUEL_SEL_OFF);
+                    auto &st = ac_hud.state();
+                    st.paused = false; st.view_mode = 0; st.throttle = 0.0; st.mixture = 0.0; st.parking_brake = true;
+                    sky_clouds.reset_temporal_history();
+                    for (int f = 0; f < 270 && !win.should_close(); ++f) {
+                        win.poll_events();
+                        if (f == 20) ac_hud.systems().set_fuel_selector(nspain::FUEL_SEL_BOTH);
+                        if (f == 40) ac_hud.systems().set_master_battery(true);
+                        if (f == 60) ac_hud.systems().set_master_alternator(true);
+                        if (f == 80) ac_hud.systems().set_light_switch(0, true);
+                        if (f == 100) st.mixture = 1.0;
+                        if (f == 120) { ac_hud.systems().actuate_primer(); ac_hud.systems().actuate_primer(); }
+                        if (f == 136) st.throttle = 0.14;
+                        if (f >= 150 && f < 225) ac_hud.systems().set_magnetos(4); // Crank starter for 1.25s (>0.85s req!)
+                        if (f == 225) {
+                            ac_hud.systems().set_magnetos(3);
+                            ac_hud.systems().set_avionics_master(true);
+                        }
+                        const double u = f / 269.0;
+                        const double sm = u * u * (3.0 - 2.0 * u);
+                        st.look_yaw_deg = static_cast<float>(std::lerp(14.0, -10.0, sm));
+                        st.look_pitch_deg = static_cast<float>(std::lerp(-20.0, -13.0, sm));
+                        step_physics_frame(0.0, 0.0, st.throttle, 1.0);
+                        save_sim_frame(false);
+                        push_audio(true);
+                    }
+
+                    // Beat 3 (450..690, 4.0s): Real JSBSim Takeoff & Climbout over Castejon de Sos
+                    const double dn1 = (es->rwy_lat_b - es->rwy_lat_a) * 111132.0;
+                    const double de1 = (es->rwy_lon_b - es->rwy_lon_a) * 111320.0 * std::cos(es->lat * DEG2RAD_D);
+                    const double es_hdg = std::fmod(std::atan2(de1, dn1) * RAD2DEG_D + 360.0, 360.0);
+                    warm_scene(es->rwy_lat_a, es->rwy_lon_a, 60.0, es_hdg, 900.0);
+                    ac_hud.systems().reset_to_running_default();
+                    ac_hud.systems().set_flaps_immediate_deg(10.0);
+                    st.parking_brake = false;
+                    ac_hud.reset_flight(es->rwy_lat_a, es->rwy_lon_a, pack.sample_elevation(es->rwy_lat_a, es->rwy_lon_a) + 1.5, es_hdg, 55.0, true);
+                    st.paused = false; st.parking_brake = false; st.view_mode = 1; st.chase_dist_m = 13.0f; st.throttle = 1.0;
+                    sky_clouds.reset_temporal_history();
+                    for (int f = 0; f < 240 && !win.should_close(); ++f) {
+                        win.poll_events();
+                        const auto &fs = ac_hud.jsb_state();
+                        const double pcmd = (fs.ias_kt >= 55.0) ? 0.50 : 0.0;
+                        const double u = f / 239.0;
+                        st.look_yaw_deg = static_cast<float>(std::lerp(-28.0, 36.0, u * u * (3.0 - 2.0 * u)));
+                        st.look_pitch_deg = -9.0f;
+                        step_physics_frame(0.0, pcmd, 1.0, 0.0);
+                        save_sim_frame(false);
+                        push_audio(false);
+                    }
+
+                    // Beat 4 (690..1170, 8.0s): Real JSBSim Trimmed Approach, Closed-Loop VSI Flare, Rollout & Park at LECI
+                    const double dn2 = (leci->rwy_lat_b - leci->rwy_lat_a) * 111132.0;
+                    const double de2 = (leci->rwy_lon_b - leci->rwy_lon_a) * 111320.0 * std::cos(leci->lat * DEG2RAD_D);
+                    const double leci_hdg = std::fmod(std::atan2(de2, dn2) * RAD2DEG_D + 360.0, 360.0);
+                    nspain::meters_per_degree(leci->rwy_lat_a, mlat, mlon);
+                    const double app_lat = leci->rwy_lat_a - std::cos(leci_hdg * DEG2RAD_D) * 90.0 / mlat;
+                    const double app_lon = leci->rwy_lon_a - std::sin(leci_hdg * DEG2RAD_D) * 90.0 / mlon;
+                    warm_scene(app_lat, app_lon, 38.0, leci_hdg, 900.0);
+                    ac_hud.systems().reset_to_running_default();
+                    ac_hud.systems().set_flaps_immediate_deg(0.0);
+                    st.parking_brake = false;
+                    ac_hud.reset_flight(app_lat, app_lon, pack.sample_elevation(app_lat, app_lon) + 38.0, leci_hdg, 80.0, false);
+                    ac_hud.systems().set_flaps_target_deg(20.0);
+                    st.paused = false; st.view_mode = 1; st.chase_dist_m = 12.0f; st.throttle = 0.14;
+                    bool touched_down = false;
+                    bool did_shutdown = false;
+                    for (int f = 0; f < 480 && !win.should_close(); ++f) {
+                        win.poll_events();
+                        const auto &fs = ac_hud.jsb_state();
+                        double thr = 0.08, brk = 0.0, pcmd = 0.0, rcmd = 0.0;
+                        if (fs.on_ground) touched_down = true;
+                        if (!touched_down) {
+                            thr = (fs.agl_m < 9.0) ? 0.02 : 0.12;
+                            const double tgt_vsi = (fs.agl_m < 7.0) ? -0.8 : -2.6;
+                            pcmd = std::clamp((tgt_vsi - fs.vsi_mps) * 0.14, -0.35, 0.45);
+                            const double hdg_err = std::remainder(leci_hdg - fs.heading_deg, 360.0);
+                            rcmd = std::clamp(hdg_err * 0.03, -0.25, 0.25);
+                        } else {
+                            thr = 0.0;
+                            brk = (fs.ground_speed_mps > 2.5) ? 0.72 : 1.0;
+                            const double hdg_err = std::remainder(leci_hdg - fs.heading_deg, 360.0);
+                            rcmd = std::clamp(hdg_err * 0.06, -0.35, 0.35);
+                            if (fs.ground_speed_mps <= 1.5 && !did_shutdown && f > 240) {
+                                ac_hud.quick_start_or_shutdown();
+                                did_shutdown = true;
+                            }
+                        }
+                        const double u = f / 479.0;
+                        st.look_yaw_deg = static_cast<float>(std::lerp(24.0, -34.0, u * u * (3.0 - 2.0 * u)));
+                        st.look_pitch_deg = -10.0f;
+                        step_physics_frame(rcmd, pcmd, thr, brk);
+                        save_sim_frame(false);
+                        push_audio(false);
+                    }
+                    frontend.park(ac_hud, *leci);
+                } else if (promo_clip == "world_menu_ui") {
+                    // Live interactive 1920x1080 Main Menu & World Map UI with animated GPU streamlines across all 8 packs!
+                    season_override = 2; tod_slot = 2; wx_advance = 0.46f;
+                    reg_atmo.set_season(2); reg_atmo.set_regime(WindRegime::PYRENEAN_THERMAL);
+                    reg_atmo.update_field(sky_clouds.atmo().sun_dir, sim_time, true, wx_advance);
+                    struct KeyView { double lat, lon; float zoom; int page; const char *ap; };
+                    const KeyView keys[] = {
+                        {42.85, -8.35, 11.0f, 0, "LEST"}, // Galicia
+                        {43.30, -4.85, 15.0f, 0, "LEXJ"}, // Picos de Europa / Asturias
+                        {43.25, -2.55, 16.0f, 0, "LEBB"}, // Basque Country
+                        {41.90, -4.40, 12.0f, 0, "LEVD"}, // Castilla y Leon
+                        {42.52,  0.48, 22.0f, 0, "ES-0205"}, // Aragon Pyrenees home base
+                        {41.80,  2.15, 14.0f, 0, "LEBL"}, // Catalunya Coast
+                    };
+                    bool added_r1 = false, added_r2 = false, added_r3 = false;
+                    for (int f = 0; f < 720 && !win.should_close(); ++f) {
+                        win.poll_events();
+                        sim_time += kFrameDt;
+                        if (f < 420) {
+                            const double s = (f / 419.0) * 5.0;
+                            const int idx = std::min(4, static_cast<int>(s));
+                            const double u = s - idx;
+                            const double sm = u * u * (3.0 - 2.0 * u);
+                            const double lat = std::lerp(keys[idx].lat, keys[idx + 1].lat, sm);
+                            const double lon = std::lerp(keys[idx].lon, keys[idx + 1].lon, sm);
+                            const float zm = std::lerp(keys[idx].zoom, keys[idx + 1].zoom, static_cast<float>(sm));
+                            frontend.set_demo_view(0, lat, lon, zm, keys[idx + (sm > 0.5 ? 1 : 0)].ap, true);
+                            if (f == 270 && !added_r1) { if (auto *a = pack.find_airport("ES-0205")) frontend.add_demo_route_airport(*a); added_r1 = true; }
+                            if (f == 325 && !added_r2) { if (auto *a = pack.find_airport("LECI")) frontend.add_demo_route_airport(*a); added_r2 = true; }
+                            if (f == 380 && !added_r3) { if (auto *a = pack.find_airport("LEBL")) frontend.add_demo_route_airport(*a); added_r3 = true; }
+                        } else if (f < 560) {
+                            frontend.set_demo_view(1, 42.52, 0.48, 22.0f, "ES-0205", true); // Logbook & Maintenance
+                        } else if (f < 640) {
+                            frontend.set_demo_view(2, 42.52, 0.48, 22.0f, "ES-0205", true); // Settings
+                        } else {
+                            frontend.set_demo_view(4, 42.52, 0.48, 22.0f, "ES-0205", true); // Credits & Licenses
+                        }
+                        frontend.draw_menu(ac_hud, sky_clouds, win, false, tod_slot, &reg_atmo, sim_time);
+                        char fp[512];
+                        std::snprintf(fp, sizeof(fp), "%s/frame_%05d.ppm", frames_dir.c_str(), video_frame++);
+                        PlatformWindow::save_framebuffer_png(fp, output_w, output_h);
+                        glFlush();
+                    }
+                } else {
+                    std::fprintf(stderr, "[PROMO-CLIP] Unknown clip '%s'\n", promo_clip.c_str());
+                    return 2;
+                }
+
+                if (!audio_timeline.empty()) {
+                    const std::string audio_path = (std::filesystem::path(autotest_dir) / "cockpit_audio.wav").string();
+                    AudioEngine::write_wav(audio_path, audio_timeline, kFrameDt);
+                }
+                std::printf("[PROMO-CLIP] %s | captured %d frames at %d FPS -> %s/frames\n",
+                            promo_clip.c_str(), video_frame, kVideoFps, autotest_dir.c_str());
                 return win.should_close() ? 1 : 0;
             }
             if (promo_video) {

@@ -266,7 +266,7 @@ private:
     double egt_f_ = 1340.0;
     double oil_temp_f_ = 185.0;
     double oil_press_psi_ = 74.0;
-    double oil_quarts_ = 7.4;   // Lycoming IO-360: 8 qt max, 6 qt min normal
+    double oil_quarts_ = 7.4;   // Flat-4 360: 8 qt max, 6 qt min normal
     double oil_hours_ = 0.0;    // Hours since last oil & filter change
     double vacuum_inhg_ = 5.0;
     double spark_fouling_ = 0.0;

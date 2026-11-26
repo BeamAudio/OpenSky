@@ -64,23 +64,24 @@ def _convert_specgloss_to_pbr(base_im: Image.Image, mr_im: Image.Image, spec_im:
     base_luma = 0.2126 * base[..., 0] + 0.7152 * base[..., 1] + 0.0722 * base[..., 2]
 
     if is_exterior:
-        # Recover crisp pearl-white & metallic-slate Skyhawk exterior + artist baked AO (zero blotchy UV color hacks!)
-        ao = np.clip(0.58 + 0.42 * np.maximum(spec_luma, base_luma), 0.36, 1.0)
-        alb = np.clip(spec * 0.88 + base * 0.22, 0.05, 0.96)
-        # Subtle warm ivory-white aviation gloss polish & clean slate accents
-        alb[..., 0] = np.clip(alb[..., 0] * 1.01, 0.0, 0.97)
-        alb[..., 1] = np.clip(alb[..., 1] * 1.00, 0.0, 0.96)
-        alb[..., 2] = np.clip(alb[..., 2] * 0.98, 0.0, 0.95)
-        rough = np.clip(0.16 + mr[..., 1] * 0.40, 0.14, 0.65)
-        metal = np.where((spec_luma < 0.35) & (base_luma < 0.25), 0.40, 0.14).astype(np.float32)
+        # Strip blurry low-res WebP decal smudges completely; keep ONLY clean baked artist AO on pure pearl white
+        # so aircraft.frag renders razor-sharp 4K-equivalent object-space livery, panel seams, and rivets!
+        raw_ao = np.maximum(spec_luma, base_luma)
+        # Smooth out small decal contrast dips while keeping true under-wing / wheel-well / tail-root AO
+        ao_im = Image.fromarray((np.clip(raw_ao, 0.0, 1.0) * 255.0).astype(np.uint8), "L").filter(
+            ImageFilter.GaussianBlur(radius=4.5)
+        )
+        ao = np.clip(0.76 + 0.24 * (np.asarray(ao_im, dtype=np.float32) / 255.0), 0.64, 1.0)
+        alb = np.stack([ao * 0.96, ao * 0.965, ao * 0.975], axis=-1)
+        rough = np.full_like(ao, 0.20, dtype=np.float32)
+        metal = np.full_like(ao, 0.08, dtype=np.float32)
     else:
-        # Interior cabin, seats, avionics, propeller, landing gear tires & struts
-        ao = np.clip(0.52 + 0.48 * np.maximum(spec_luma, base_luma), 0.32, 1.0)
-        # Preserve genuine colored instruments/screens in base while lifting metallic/painted surfaces from spec
+        # Interior cabin, seats, avionics, propeller blades, chrome spinner, rubber tires & gear struts
+        ao = np.clip(0.54 + 0.46 * np.maximum(spec_luma, base_luma), 0.34, 1.0)
         chroma = np.max(base, axis=-1) - np.min(base, axis=-1)
-        alb = np.where(chroma[..., None] > 0.12, np.clip(base * 1.15, 0.0, 1.0), np.clip(base * 0.50 + spec * 0.56, 0.03, 0.94))
-        rough = np.clip(0.24 + mr[..., 1] * 0.58, 0.18, 0.86)
-        metal = np.where((spec_luma > 0.72) & (base_luma < 0.48), 0.62, 0.14).astype(np.float32)
+        alb = np.where(chroma[..., None] > 0.14, np.clip(base * 1.12, 0.0, 1.0), np.clip(base * 0.45 + spec * 0.58, 0.04, 0.92))
+        rough = np.clip(0.22 + mr[..., 1] * 0.62, 0.16, 0.88)
+        metal = np.where((spec_luma > 0.72) & (base_luma < 0.48), 0.68, 0.14).astype(np.float32)
 
     alb_img = Image.fromarray((np.clip(alb, 0.0, 1.0) * 255.0).astype(np.uint8), "RGB")
     orm_arr = np.stack([ao, rough, metal], axis=-1)
@@ -89,11 +90,15 @@ def _convert_specgloss_to_pbr(base_im: Image.Image, mr_im: Image.Image, spec_im:
 
 
 def _make_rivet_normal(size: int = 1024) -> Image.Image:
-    """Subtle aluminum airframe micro-grain + panel sheen normal map for crisp aviation sunlight glint."""
+    """Crisp brushed-aluminum skin micro-grain normal map for clean aviation specular highlights."""
     yy, xx = np.mgrid[0:size, 0:size].astype(np.float32)
-    h = 0.015 * np.sin(xx * 0.12) * np.cos(yy * 0.12) + 0.008 * np.sin(xx * 0.45 + yy * 0.31)
-    gx = (np.roll(h, -1, axis=1) - np.roll(h, 1, axis=1)) * 6.0
-    gy = (np.roll(h, -1, axis=0) - np.roll(h, 1, axis=0)) * 6.0
+    h = (
+        0.008 * np.sin(xx * 0.18) * np.cos(yy * 0.18)
+        + 0.004 * np.sin(xx * 0.72 + yy * 0.09)
+        + 0.003 * np.cos(xx * 1.45 - yy * 0.35)
+    )
+    gx = (np.roll(h, -1, axis=1) - np.roll(h, 1, axis=1)) * 5.0
+    gy = (np.roll(h, -1, axis=0) - np.roll(h, 1, axis=0)) * 5.0
     nz = np.ones_like(h)
     inv = 1.0 / np.sqrt(gx * gx + gy * gy + nz * nz)
     n = np.stack([(-gx * inv) * 0.5 + 0.5, (-gy * inv) * 0.5 + 0.5, (nz * inv) * 0.5 + 0.5], axis=-1)
@@ -177,11 +182,11 @@ def main() -> None:
     uv1 = _read_acc(data, g, bin_off, p1_prim["attributes"]["TEXCOORD_0"])
     idx1 = _read_acc(data, g, bin_off, p1_prim["indices"]).reshape(-1, 3).astype(np.int32)
 
-    # Split Mesh 0 into static cabin/gear/details vs animated PropHub (spinner) + PropBlades!
+    # Split BOTH meshes into real structural & breakable nodes with exact hinge/break pivots!
     tri_c0 = pos0[idx0].mean(axis=1)
+    tri_c1 = pos1[idx1].mean(axis=1)
     is_prop = tri_c0[:, 2] < -3.70
     prop_tris = idx0[is_prop]
-    static0_tris = idx0[~is_prop]
 
     # Exact propeller rotation axis center from spinner cone
     prop_verts = pos0[prop_tris].reshape(-1, 3)
@@ -195,12 +200,46 @@ def main() -> None:
     blade_tris = prop_tris[prop_rc >= 0.165]
     assert len(spin_tris) > 10 and len(blade_tris) > 10, f"Unexpected prop split: spin={len(spin_tris)} blades={len(blade_tris)}"
 
-    # Main Fuselage + Airframe node (both artist meshes cleanly merged with their PBR materials!)
-    sub_static0 = _extract_submesh(pos0, nrm0, uv0, static0_tris)
-    sub_static0["mat"] = m_int
-    sub_ext1 = _extract_submesh(pos1, nrm1, uv1, idx1)
-    sub_ext1["mat"] = m_ext
-    gb.add_node("Fuselage", gb.add_mesh("Fuselage", [sub_ext1, sub_static0]))
+    def partition_masks(tc: np.ndarray, exclude_mask: np.ndarray | None = None) -> dict[str, np.ndarray]:
+        avail = np.ones(len(tc), dtype=bool) if exclude_mask is None else (~exclude_mask)
+        m_wl = avail & (tc[:, 0] < -0.78) & (tc[:, 1] > -0.32) & (tc[:, 2] < 2.10)
+        m_wr = avail & (tc[:, 0] >  0.78) & (tc[:, 1] > -0.32) & (tc[:, 2] < 2.10)
+        m_tl = avail & (~m_wl) & (~m_wr) & (tc[:, 2] > 2.05)
+        m_gn = avail & (~m_wl) & (~m_wr) & (~m_tl) & (tc[:, 1] < -0.45) & (tc[:, 2] < -1.95) & (tc[:, 2] > -3.70)
+        m_gl = avail & (~m_wl) & (~m_wr) & (~m_tl) & (~m_gn) & (tc[:, 1] < -0.42) & (tc[:, 0] < -0.42) & (tc[:, 2] <= 0.60)
+        m_gr = avail & (~m_wl) & (~m_wr) & (~m_tl) & (~m_gn) & (tc[:, 1] < -0.42) & (tc[:, 0] >  0.42) & (tc[:, 2] <= 0.60)
+        m_fu = avail & (~m_wl) & (~m_wr) & (~m_tl) & (~m_gn) & (~m_gl) & (~m_gr)
+        return {
+            "Fuselage": m_fu, "Wing_L": m_wl, "Wing_R": m_wr, "Tail": m_tl,
+            "NoseGear": m_gn, "Gear_L": m_gl, "Gear_R": m_gr,
+        }
+
+    p0_masks = partition_masks(tri_c0, is_prop)
+    p1_masks = partition_masks(tri_c1, None)
+    pivots = {
+        "Fuselage": (0.0, 0.0, 0.0),
+        "Wing_L":   (-0.78, 0.55, -1.65),
+        "Wing_R":   ( 0.78, 0.55, -1.65),
+        "Tail":     ( 0.00, 0.12,  2.05),
+        "NoseGear": ( 0.00, -0.52, -2.85),
+        "Gear_L":   (-0.48, -0.52, -1.52),
+        "Gear_R":   ( 0.48, -0.52, -1.52),
+    }
+
+    node_ids: dict[str, int] = {}
+    for part_name in ("Fuselage", "Wing_L", "Wing_R", "Tail", "NoseGear", "Gear_L", "Gear_R"):
+        piv = pivots[part_name]
+        prims = []
+        if np.any(p1_masks[part_name]):
+            s1 = _extract_submesh(pos1, nrm1, uv1, idx1[p1_masks[part_name]], pivot=piv)
+            s1["mat"] = m_ext
+            prims.append(s1)
+        if np.any(p0_masks[part_name]):
+            s0 = _extract_submesh(pos0, nrm0, uv0, idx0[p0_masks[part_name]], pivot=piv)
+            s0["mat"] = m_int
+            prims.append(s0)
+        assert prims, f"Empty structural node {part_name}"
+        node_ids[part_name] = gb.add_node(part_name, gb.add_mesh(part_name, prims), translation=piv)
 
     # Animated PropHub (spinner) + child PropBlades + soft spinning PropBlurDisc!
     sub_spin = _extract_submesh(pos0, nrm0, uv0, spin_tris, pivot=hub_pivot)
@@ -216,26 +255,27 @@ def main() -> None:
     blur_geo.add_quad((-r_blur, -r_blur, 0.0), (r_blur, -r_blur, 0.0), (r_blur, r_blur, 0.0), (-r_blur, r_blur, 0.0), (0, 1), (1, 1), (1, 0), (0, 0), (0, 0, -1))
     gb.add_node("PropBlurDisc", gb.add_mesh("PropBlurDisc", [blur_geo.to_prim(m_blur)]), translation=(hub_cx, hub_cy, hub_cz - 0.03))
 
-    # Exact wingtip, tail-top & leading-edge light positions derived straight from artist mesh!
+    # Exact wingtip, tail-top & leading-edge light positions attached to their parent structural nodes!
     wt_r = pos1[pos1[:, 0] > 5.35].mean(axis=0)
     wt_l = pos1[pos1[:, 0] < -5.35].mean(axis=0)
     tail_top = pos1[np.argmax(pos1[:, 1])]
 
-    def add_light_node(name: str, mat: int, centers: list[tuple[float, float, float]], r: float) -> None:
+    def add_light_node(name: str, mat: int, centers: list[tuple[float, float, float]], r: float, parent_name: str | None = None) -> None:
+        piv = pivots[parent_name] if parent_name else (0.0, 0.0, 0.0)
         g_l = GeoPart()
         for c in centers:
-            g_l.add_box(c, (r, r, r))
-        gb.add_node(name, gb.add_mesh(name, [g_l.to_prim(mat)]))
+            g_l.add_box((c[0] - piv[0], c[1] - piv[1], c[2] - piv[2]), (r, r, r))
+        gb.add_node(name, gb.add_mesh(name, [g_l.to_prim(mat)]), parent=node_ids[parent_name] if parent_name else None)
 
-    add_light_node("NavLightRed",   m_nav_r,  [(float(wt_l[0]) - 0.02, float(wt_l[1]), float(wt_l[2]) - 0.25)], 0.058)
-    add_light_node("NavLightGreen", m_nav_g,  [(float(wt_r[0]) + 0.02, float(wt_r[1]), float(wt_r[2]) - 0.25)], 0.058)
+    add_light_node("NavLightRed",   m_nav_r,  [(float(wt_l[0]) - 0.02, float(wt_l[1]), float(wt_l[2]) - 0.25)], 0.058, "Wing_L")
+    add_light_node("NavLightGreen", m_nav_g,  [(float(wt_r[0]) + 0.02, float(wt_r[1]), float(wt_r[2]) - 0.25)], 0.058, "Wing_R")
     add_light_node("StrobeWhite",   m_strobe, [(float(wt_l[0]) - 0.03, float(wt_l[1]), float(wt_l[2]) - 0.08),
                                                (float(wt_r[0]) + 0.03, float(wt_r[1]), float(wt_r[2]) - 0.08)], 0.064)
-    add_light_node("BeaconRed",     m_beacon, [(float(tail_top[0]), float(tail_top[1]) + 0.025, float(tail_top[2]) + 0.06)], 0.052)
-    add_light_node("LandingLight",  m_land,   [(-2.25, float(wt_l[1]) - 0.04, float(wt_l[2]) - 0.58)], 0.085)
+    add_light_node("BeaconRed",     m_beacon, [(float(tail_top[0]), float(tail_top[1]) + 0.025, float(tail_top[2]) + 0.06)], 0.052, "Tail")
+    add_light_node("LandingLight",  m_land,   [(-2.25, float(wt_l[1]) - 0.04, float(wt_l[2]) - 0.58)], 0.085, "Wing_L")
 
     gb.save(OUT_GLB)
-    nn, nm, npr, nt = verify_glb(OUT_GLB, ["Fuselage", "PropHub", "PropBlades", "PropBlurDisc", "NavLightRed", "NavLightGreen", "StrobeWhite", "BeaconRed", "LandingLight"])
+    nn, nm, npr, nt = verify_glb(OUT_GLB, ["Fuselage", "Wing_L", "Wing_R", "Tail", "NoseGear", "Gear_L", "Gear_R", "PropHub", "PropBlades", "PropBlurDisc", "NavLightRed", "NavLightGreen", "StrobeWhite", "BeaconRed", "LandingLight"])
     print(f"[OK] Rigged CC BY 4.0 Cessna 172 -> {OUT_GLB.relative_to(ROOT)} | {OUT_GLB.stat().st_size // 1024} KB | nodes={nn} surfs={npr} tris={nt}")
     print(f"     PropHub pivot={tuple(round(x,3) for x in hub_pivot)} | spin_tris={len(spin_tris)} blade_tris={len(blade_tris)}")
     print(f"     Wingtips L={tuple(round(float(x),2) for x in wt_l)} R={tuple(round(float(x),2) for x in wt_r)} TailTop={tuple(round(float(x),2) for x in tail_top)}")

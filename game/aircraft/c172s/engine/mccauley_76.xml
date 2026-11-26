@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- SPDX-License-Identifier: CC0-1.0 -->
 <!-- Estimated fixed-pitch coefficients indexed by advance ratio J. -->
-<propeller name="McCauley 76-inch fixed pitch">
+<propeller name="OpenSky 76-inch fixed pitch">
   <diameter unit="IN">76</diameter>
   <ixx unit="SLUG*FT2">1.38</ixx>
   <numblades>2</numblades>

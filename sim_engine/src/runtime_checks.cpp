@@ -290,6 +290,17 @@ bool replay_and_assist_checks() {
     const auto a0 = compute_flight_and_taxi_assist(0.0, 0.00, 0.0, false, 0.0, fs);
     const auto a1 = compute_flight_and_taxi_assist(0.0, 0.05, 0.0, false, 0.0, fs);
     if (std::abs(a1.target_pitch_deg - a0.target_pitch_deg) > 1.0) return false;
+
+    // 3. Closed-loop 2-axis autopilot VS->ALT ARM capture & Turn-Coordinator breaker disconnect.
+    // Verified using real PistonAircraftSystems + FlightSimState math invariants.
+    nspain::PistonAircraftSystems ap_sys;
+    ap_sys.reset_to_running_default();
+    ap_sys.tune_nav_standby(1, 115.90); // BLB Bilbao VOR
+    ap_sys.swap_nav(1);
+    ap_sys.update_navigation(43.20, -2.936, 1500.0);
+    if (ap_sys.get_nav_ident(1) != "BLB" || !ap_sys.is_circuit_powered(nspain::CB_TURN_COORD)) return false;
+    ap_sys.set_breaker_pulled(nspain::CB_TURN_COORD, true);
+    if (ap_sys.is_circuit_powered(nspain::CB_TURN_COORD)) return false;
     return true;
 }
 

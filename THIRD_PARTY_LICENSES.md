@@ -6,6 +6,16 @@ Redistribution follows each component's license, attribution duties, and any
 separate API service terms. Do not treat the project MIT license as a license
 for third-party scenery, models, or live data services.
 
+## Trademark & Non-Affiliation Notice
+OpenSky VFR is an independent open-source project and is not affiliated with,
+endorsed by, or sponsored by any aircraft, engine, or avionics manufacturer.
+The internal package directory id `c172s` is retained solely for saved-fleet
+and scenery test compatibility; player-facing simulator titles use "OpenSky 172S".
+
+Full bundled third-party license texts live under `LICENSES/`
+(`LICENSES/CC-BY-4.0.txt`, `LICENSES/ODbL-1.0.txt`, `LICENSES/OFL-1.1.txt`) and
+`engine/thirdparty/jsbsim/COPYING.LGPL-2.1`.
+
 ## Own Code
 - `sim_engine/`, `engine/src/`, `builder/`, `protocol/`, `tools/`: MIT (see `LICENSE`).
 - `game/aircraft/c172s/*`: OpenSky-authored aircraft manifest/configuration, CC0 1.0.
@@ -17,7 +27,7 @@ for third-party scenery, models, or live data services.
 |---|---|---|
 | JSBSim | LGPL-2.1-or-later | Upstream source pinned in `engine/thirdparty/jsbsim/UPSTREAM.md`, built as a separate `libJSBSim.so.1` by `sim_engine/Makefile`. `nspain_sim` links dynamically with `$ORIGIN` rpath; no static LGPL linking. License text: `engine/thirdparty/jsbsim/COPYING.LGPL-2.1`. |
 | cgltf, stb_image, stb_image_write, stb_easy_font, miniz_tinfl, KHR/glcorearb | MIT / Public Domain | Headers under `sim_engine/third_party/`. |
-| Open-Meteo | CC BY 4.0 (data) | Optional live boundary input; attribution is shown in-game. Data licensing and API service terms are separate. The live feed can be disabled with `./run_sim.sh --no-live-weather`. Check the current [Open-Meteo API terms](https://open-meteo.com/en/terms) and [data license](https://open-meteo.com/en/licence). |
+| Open-Meteo | CC BY 4.0 (data, non-commercial API free tier) | Optional live boundary input; attribution is shown in-game. Data licensing and API service terms are separate (the public free tier is for non-commercial evaluation/personal use; disable live weather with `./run_sim.sh --no-live-weather` for commercial deployments). Check [Open-Meteo API terms](https://open-meteo.com/en/terms) and [data license](https://open-meteo.com/en/licence). |
 
 ## Geospatial Data
 | Source | License | Obligations |
@@ -37,22 +47,22 @@ and build artifacts are gitignored, so no unlicensed imagery is committed.
 The interface bitmap atlas was rendered from Inter Medium by the Inter Project Authors. The source font is distributed under the [SIL Open Font License 1.1](https://github.com/rsms/inter/blob/master/LICENSE.txt).
 
 ## 3D Aircraft Model
-- **Cessna 172 Exterior (`game/assets/models/aircraft/c172s_exterior.glb`)**
-  - Original Work: "Cessna 172" by [e737](https://sketchfab.com/e0057537) on [Sketchfab](https://sketchfab.com/3d-models/cessna-172-64cddaee5aff470682659a8c08525046)
+- **Exterior Aircraft Model (`game/assets/models/aircraft/c172s_exterior.glb`)**
+  - Original Work: "Cessna 172" (creator title on Sketchfab) by [e737](https://sketchfab.com/e0057537) on [Sketchfab](https://sketchfab.com/3d-models/cessna-172-64cddaee5aff470682659a8c08525046)
   - Intermediate Optimization: `c172.glb` from [veyron007/AUREL](https://github.com/veyron007/AUREL/blob/main/public/models/README.md)
-  - Original model license recorded here: [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
+  - Original model license: [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) (full text in `LICENSES/CC-BY-4.0.txt`).
   - Modifications: re-oriented to `-Z` forward / `+X` right / `+Y` up, textures
     converted to standard Metallic-Roughness PNG/JPEG, propeller/spinner split
     into animated `PropHub`/`PropBlades` nodes, navigation/strobe/beacon lights added.
   - The [AUREL model attribution record](https://github.com/veyron007/AUREL/blob/main/public/models/README.md)
-    identifies its `c172.glb` as the e737 Sketchfab Cessna 172 under CC BY 4.0.
+    identifies its `c172.glb` as the e737 Sketchfab model under CC BY 4.0.
     OpenSky reoriented and modified that model; this bundled copy retains the
     creator, source, license and modification notice above.
-- **C172S Cockpit (`game/assets/models/aircraft/c172s_cockpit.glb`)**
-  - Generated from the project-authored procedural Blender source in
+- **172S Cockpit (`game/assets/models/aircraft/c172s_cockpit.glb`)**
+  - Generated from the project-authored procedural source in
     `tools/build_c172s_cockpit.py` and `tools/export_glb_models.py`; the editable
     `.blend` and generated GLB are included. They contain no imported third-party
-    aircraft mesh or texture. The C172 name identifies the simulated aircraft type.
+    aircraft mesh or texture. The internal `c172s` id identifies the airframe class.
 
 ## Online Imagery Policy
 Runtime and offline baking stream **IGN Spain PNOA only** (CC BY 4.0), at

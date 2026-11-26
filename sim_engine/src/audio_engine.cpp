@@ -118,7 +118,7 @@ void AudioEngine::SynthState::render_stereo(const AudioState &st, int16_t *out, 
 
         const float w_noise = next_noise();
 
-        // 1. Lycoming IO-360-L2A 4-cylinder 4-stroke engine + 2-blade McCauley propeller.
+        // 1. Flat-4 360 4-cylinder 4-stroke piston engine + 2-blade fixed-pitch propeller.
         float eng = 0.0f;
         if (sm_rpm > 20.0f) {
             if (st.sputtering) {

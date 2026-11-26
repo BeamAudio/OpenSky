@@ -270,8 +270,8 @@ def inspect_installed_modules(packs_dir: Path | None = None, cache_dir: Path | N
                     "weather": wx_meta,
                 })
 
-    # Inspect Live Online Tile Cache (cache/online_tiles/{prov}_z{z}_{x}_{y}.jpg)
-    online_pat = re.compile(r"^(pnoa|bing|google)_z(\d+)_(\d+)_(\d+)\.jpg$")
+    # Inspect Live Online Tile Cache (cache/online_tiles/pnoa_z{z}_{x}_{y}.jpg)
+    online_pat = re.compile(r"^(pnoa)_z(\d+)_(\d+)_(\d+)\.jpg$")
     onl_coords: dict[int, list[tuple[int, int]]] = {}
     onl_by_pz: dict[tuple[str, int], list[int]] = {}
     onl_total_bytes = 0
@@ -621,7 +621,7 @@ def inspect_point_tiles(
         for z in range(20, 12, -1):
             tx, ty = latlon_to_tile_xy(lat, lon, z)
             found = None
-            for prov in ("pnoa", "bing", "google"):
+            for prov in ("pnoa",):
                 cand = cdir / f"{prov}_z{z}_{tx}_{ty}.jpg"
                 if cand.is_file() and cand.stat().st_size > 400:
                     found = (prov, cand)

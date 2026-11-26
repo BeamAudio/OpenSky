@@ -2,7 +2,7 @@
 Version=1.0
 Type=Application
 Name=OpenSky VFR
-Comment=Explore the Pyrenees in a Cessna 172S
+Comment=Explore the Pyrenees and Northern Spain in the OpenSky 172S
 Exec=/usr/bin/opensky-vfr
 TryExec=/opt/opensky-vfr/sim_engine/nspain_sim
 Path=/opt/opensky-vfr

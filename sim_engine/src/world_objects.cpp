@@ -1204,7 +1204,7 @@ std::vector<float> WorldObjects::build_landmarks_cpu(const PackReader::WorldFram
     std::vector<float> lv;
     lv.reserve(24000 * 12);
 
-    // 1. BASILICA DE NUESTRA SENORA DEL PILAR (Zaragoza, 41.6569, -0.8787, exact Bing Aerial alignment yaw=-27 deg!)
+    // 1. BASILICA DE NUESTRA SENORA DEL PILAR (Zaragoza, 41.6569, -0.8787, exact PNOA aerial alignment yaw=-27 deg)
     //    True linear PBR reflectances (sRGB^2.2) so stone, Aragonese brick & glazed tiles look photographic, NOT pastel!
     {
         LmBuilder b(lv, pack_, frame, 41.6569, -0.8787, -27.0f, 0.0);
@@ -1269,7 +1269,7 @@ std::vector<float> WorldObjects::build_landmarks_cpu(const PackReader::WorldFram
         }
     }
 
-    // 2. PUENTE DE PIEDRA (Historic 15th-century 7-arch stone bridge spanning Rio Ebro, exact Bing Aerial piers!)
+    // 2. PUENTE DE PIEDRA (Historic 15th-century 7-arch stone bridge spanning Rio Ebro, exact PNOA aerial piers)
     {
         LmBuilder b(lv, pack_, frame, 41.6578, -0.8755, 62.0f, 0.0);
         const Vec3 lime{0.34f, 0.29f, 0.22f};

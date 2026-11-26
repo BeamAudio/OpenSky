@@ -1,6 +1,6 @@
 # OpenSky VFR
 
-OpenSky is an open-source, free-roam VFR flying sandbox. Take a Cessna 172S from Castejón de Sos (`ES-0205`), explore the Pyrenees and nearby regions, and make each new airfield your temporary base by landing and parking there.
+OpenSky is an open-source, free-roam VFR flying sandbox. Fly the OpenSky 172S single-piston trainer from Castejón de Sos (`ES-0205`), explore the Pyrenees and Northern Spain, and make each new airfield your temporary base by landing and parking there.
 
 The game is built around unhurried exploration rather than missions or ownership progression. The World map is for browsing and planning: selecting an airport or drawing a route never relocates the aircraft. A successful parking action saves the new base. The save keeps the aircraft's location, heading, condition, fuel and logbook; leaving before parking keeps the previous base.
 
@@ -18,7 +18,7 @@ Captured in OpenSky at 1920×1080 with Ultra quality and a 200% terrain LOD radi
 
 | Castejón de Sos — cockpit | Castejón de Sos — chase view |
 |---|---|
-| ![Cessna cockpit above Castejón de Sos](docs/images/promo_cockpit_castejon.png) | ![Cessna over the Castejón de Sos valley](docs/images/promo_chase_castejon.png) |
+| ![OpenSky 172S cockpit above Castejón de Sos](docs/images/promo_cockpit_castejon.png) | ![OpenSky 172S over the Castejón de Sos valley](docs/images/promo_chase_castejon.png) |
 
 | Barcelona coast — cockpit | Barcelona coast — chase view |
 |---|---|
@@ -26,7 +26,7 @@ Captured in OpenSky at 1920×1080 with Ultra quality and a 200% terrain LOD radi
 
 | Costa Brava, Begur — cockpit | Costa Brava, Begur — chase view |
 |---|---|
-| ![View of the Costa Brava from the Cessna cockpit](docs/images/promo_cockpit_costa_brava.png) | ![Cessna banking above the cliffs and coves near Begur](docs/images/promo_chase_costa_brava.png) |
+| ![View of the Costa Brava from the 172S cockpit](docs/images/promo_cockpit_costa_brava.png) | ![172S banking above the cliffs and coves near Begur](docs/images/promo_chase_costa_brava.png) |
 
 | Catalan Pyrenees — cockpit | Catalan Pyrenees — chase view |
 |---|---|
@@ -34,7 +34,7 @@ Captured in OpenSky at 1920×1080 with Ultra quality and a 200% terrain LOD radi
 
 | Mediano reservoir — cockpit | Mediano reservoir — chase view |
 |---|---|
-| ![Cockpit view over Mediano reservoir in Aragón](docs/images/promo_cockpit_mediano.png) | ![Cessna above Mediano reservoir in Aragón](docs/images/promo_chase_mediano.png) |
+| ![Cockpit view over Mediano reservoir in Aragón](docs/images/promo_cockpit_mediano.png) | ![172S above Mediano reservoir in Aragón](docs/images/promo_chase_mediano.png) |
 
 ### Weather in flight
 
@@ -42,19 +42,26 @@ These scenes use preset inputs to the regional weather model. The first view exp
 
 | 3D weather-model layers over the Pyrenees | Model-driven rain near Castejón de Sos |
 |---|---|
-| ![3D wind vectors across four published weather-model layers around the Cessna over the Pyrenees](docs/images/promo_weather_clouds.png) | ![Rain on the Cessna windshield near Castejón de Sos](docs/images/promo_weather_rain.png) |
+| ![3D wind vectors across four published weather-model layers over the Pyrenees](docs/images/promo_weather_clouds.png) | ![Rain on the 172S windshield near Castejón de Sos](docs/images/promo_weather_rain.png) |
 
-### Promo flight video
+### Promo flight videos
 
-[Watch the 15-second vertical flight promo](docs/videos/opensky-flight-promo-vertical.mp4). The 9:16 Instagram cut combines orbiting exterior shots and cockpit passes over Aragón and Catalunya, thermal, foehn, winter and storm conditions, and procedural cockpit-perspective C172 audio.
+All six 1080×1920 vertical regional promos below were captured at **60 fps** using real 120 Hz JSBSim physics, live streamed IGN PNOA ortho imagery, and in-game audio:
 
-[Watch the 15-second top-down weather-model time-lapse](docs/videos/opensky-weather-model-topdown-vertical.mp4). It shows all four published weather layers from above as wind, cloud and precipitation fields evolve over four and a half simulated minutes, with the model clock, bright layer markers and snapshot generation visible in the debug overlay.
+- [Galicia coast (`STG` VOR — A Coruña harbor & Atlantic coastline)](docs/videos/opensky-promo-galicia-coast.mp4)
+- [Picos de Europa convective weather (`ASN` VOR — animated windshield raindrop impacts & streaks)](docs/videos/opensky-promo-picos-ridge-weather.mp4)
+- [Basque Country departure (`LEBB` Bilbao — rolling takeoff, climbout & 2-axis autopilot engage)](docs/videos/opensky-promo-basque-bilbao-takeoff.mp4)
+- [Castilla y León & Teruel (`VLL` / `TER` — live OLED `VOR1` tracking, `ALT ARM` capture & golden-hour chase)](docs/videos/opensky-promo-castilla-aragon-autopilot.mp4)
+- [Full ownership loop (`ES-0205` -> `LECI` — 3D walkaround, highlighted cold-start sequence, takeoff & landing)](docs/videos/opensky-promo-ownership-loop.mp4)
+- [Main menu & World UI (baked terrain relief, live GPU wind streamlines, route planner, logbook & credits)](docs/videos/opensky-promo-world-menu-ui.mp4)
 
-The following 20-second vertical clips each cover six simulated minutes at 24 fps. They show the aircraft-centered 8 km local refinement over terrain in Aragón and Catalunya; the debug panel reports displayed marker spacing separately from the solver's finer cell spacing.
+Additional clips:
 
-- [Pyrenees valley](docs/videos/opensky-weather-pyrenees-local-20s.mp4)
-- [Embalse de Mediano](docs/videos/opensky-weather-mediano-local-20s.mp4)
-- [Costa Brava](docs/videos/opensky-weather-costa-brava-local-20s.mp4)
+- [Original 15-second vertical flight promo (Aragón & Catalunya)](docs/videos/opensky-flight-promo-vertical.mp4)
+- [15-second top-down weather-model time-lapse](docs/videos/opensky-weather-model-topdown-vertical.mp4)
+- [20-second local refinement: Pyrenees valley](docs/videos/opensky-weather-pyrenees-local-20s.mp4)
+- [20-second local refinement: Embalse de Mediano](docs/videos/opensky-weather-mediano-local-20s.mp4)
+- [20-second local refinement: Costa Brava](docs/videos/opensky-weather-costa-brava-local-20s.mp4)
 
 Scenery imagery in these captures: © Instituto Geográfico Nacional de España (IGN), [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/); PNOA imagery has been cropped and rendered in the simulator. Source: [IGN Spain PNOA](https://pnoa.ign.es/pnoa-imagen/visualizadores-y-servicios-web). City and building data © [OpenStreetMap contributors](https://www.openstreetmap.org/copyright), ODbL 1.0.
 
@@ -240,4 +247,6 @@ OpenSky supports plug-and-play USB HID flight yokes, joysticks, rudder pedals (i
 
 OpenSky uses openly licensed or documented sources and retains required attribution. Inputs include IGN Spain PNOA, MDT05/MDT25 and INSPIRE Hidrografía (CC BY 4.0), OurAirports (public domain), OpenStreetMap (ODbL), Poly Haven (CC0) and Open-Meteo subject to its data and service terms. See [third-party licenses](THIRD_PARTY_LICENSES.md) and the [airport source notes](docs/airport-data-sources.md). Esri imagery, GPL aircraft assets and assets without documented redistribution rights are not allowed in release packages.
 
-Project code and original game assets are MIT licensed. Vendored JSBSim remains under LGPL-2.1; generated OpenStreetMap-derived packs carry ODbL obligations. Each third-party asset and data source keeps its own license and attribution.
+Project code and original game assets are MIT licensed (`LICENSE`). Bundled third-party license texts live in `LICENSES/` (`CC-BY-4.0.txt`, `ODbL-1.0.txt`, `OFL-1.1.txt`) and `engine/thirdparty/jsbsim/COPYING.LGPL-2.1`. Generated OpenStreetMap-derived packs (`.nscity`, `.nsscn`) are offered under ODbL 1.0 Share-Alike.
+
+OpenSky VFR is an independent open-source simulation project and is not affiliated with or endorsed by any aircraft or avionics manufacturer. Live Open-Meteo boundary weather defaults to the non-commercial API tier (disable anytime via `--no-live-weather`).

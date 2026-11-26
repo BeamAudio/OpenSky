@@ -64,10 +64,18 @@ struct FlightSimState {
     bool ap_hdg_hold = true;
     bool ap_alt_hold = true;
     bool ap_nav_hold = false;
+    bool ap_vs_hold = false;
+    bool ap_alt_arm = false;
+    int ap_nav_source = 0;       // 0=GPS Route, 1=VOR1 (OBS/CDI)
     double ap_hdg_deg = 160.0;
     double ap_alt_ft = 4500.0;
+    double ap_vs_fpm = 0.0;
+    double ap_rol_bank_deg = 0.0;
     double ap_nav_brg_deg = 160.0;
     bool ap_nav_valid = false;
+    double ind_alt_ft = 0.0;
+    float ap_disconnect_warn_s = 0.0f;
+    int ap_trim_annunc = 0;      // -1=TRIM DN, 0=none, +1=TRIM UP
     int view_mode = 0;      // 0=Cockpit, 1=Chase, 2=Free Cam
     float look_yaw_deg = 0.0f;
     float look_pitch_deg = 0.0f;
@@ -139,6 +147,8 @@ public:
     void render_weather_model_overlay(float width, float height, const RegionalAtmosphere &atmo,
                                       const Mat4 &projection_view, double east_m, double north_m,
                                       double simulation_time_s = 0.0);
+    void render_cockpit_interaction(int win_w, int win_h, const PlatformWindow &win,
+                                    float sim_time_sec, bool allow_pointer, bool ui_blocks_pointer = false);
     const nspain::FlightState &jsb_state() const { return fdm_.state(); }
     const GraphicsSettings &graphics_settings() const { return graphics_settings_; }
     void set_graphics_settings(const GraphicsSettings &settings) { graphics_settings_ = settings; }
@@ -166,10 +176,15 @@ public:
 
 private:
     friend class GameFrontend;
-    void apply_autopilot(const nspain::FlightState &fs, double &roll_cmd, double &pitch_cmd);
+    void apply_autopilot(const nspain::FlightState &fs, double dt, double &roll_cmd, double &pitch_cmd,
+                         double &ap_ail_out, double &ap_elv_out, double &ap_rud_out);
+    void init_avionics_display_texture();
+    void update_avionics_display_texture(float sim_time_sec);
     void advance_aircraft(double dt, const AtmosphereState &atmo, const RegionalAtmosphere &reg_atmo,
                           double sim_time_sec, double rudder, double brake_left, double brake_right);
     void resolve_world_collisions(double dt);
+    void detach_structural_part(const char *node_name, Vec3 local_vel, Vec3 ang_vel);
+    void trigger_catastrophic_breakup(const char *reason, double impact_spd);
     void apply_damage_rig(std::vector<Mat4> &anim, float flaps_rad, float ail, float elv, float trm, float rud) const;
     std::string visual_node_name(const GlbMeshData &mesh, const char *fallback) const;
     friend class AircraftSession;
@@ -232,6 +247,18 @@ private:
     double tire_wear_ = 0.0, brake_wear_ = 0.0, gear_alignment_ = 0.0, prop_nicks_ = 0.0;
     double windshield_dirt_ = 0.0, windshield_crack_ = 0.0;
     double dmg_nose_ = 0.0, dmg_wing_l_ = 0.0, dmg_wing_r_ = 0.0, dmg_tail_ = 0.0;
+    struct BrokenPart {
+        std::string node;
+        Vec3 pos_off{0.0f, 0.0f, 0.0f};
+        Vec3 vel{0.0f, 0.0f, 0.0f};
+        Vec3 rot{0.0f, 0.0f, 0.0f};
+        Vec3 ang_vel{0.0f, 0.0f, 0.0f};
+        bool detached = false;
+    };
+    std::vector<BrokenPart> broken_parts_;
+    bool broken_wing_l_ = false, broken_wing_r_ = false, broken_tail_ = false, broken_prop_ = false;
+    bool broken_gear_n_ = false, broken_gear_l_ = false, broken_gear_r_ = false;
+    bool airframe_destroyed_ = false;
     float impact_fx_s_ = 0.0f;
     double impact_cooldown_s_ = 0.0;
     bool prev_ground_coll_ = true;
@@ -277,6 +304,19 @@ private:
     std::vector<WeatherFlowTrace> weather_flow_traces_;
     double weather_flow_last_time_s_ = -1.0;
     double weather_flow_origin_e_ = 0.0, weather_flow_origin_n_ = 0.0;
+    double ap_cmd_bank_deg_ = 0.0;
+    GLuint avionics_tex_ = 0;
+    int avionics_tex_w_ = 0, avionics_tex_h_ = 0;
+    std::vector<uint8_t> avionics_base_rgba_;
+    std::vector<uint8_t> avionics_work_rgba_;
+    std::string avionics_last_key_;
+    float avionics_last_upd_s_ = -1.0f;
+    Mat4 last_ckpt_vp_{};
+    Mat4 last_ckpt_root_{};
+    std::vector<Mat4> last_ckpt_world_m_;
+    bool last_ckpt_valid_ = false;
+    bool mouse_starter_cranking_ = false;
+    int vor_cycle_idx_ = 0;
 };
 
 } // namespace nsim

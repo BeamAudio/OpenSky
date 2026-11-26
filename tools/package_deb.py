@@ -198,6 +198,64 @@ def resolve_runtime_depends(binary_path: Path, jsbsim_lib: Path, temp_dir: Path)
     return ", ".join(deps)
 
 
+def write_dep5_copyright(doc_dir: Path, pkg_name: str, is_base: bool) -> None:
+    sections = [
+        "Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/",
+        f"Upstream-Name: {pkg_name}",
+        "Source: https://github.com/BeamAudio/OpenSky",
+        "Disclaimer: Independent open-source VFR flight simulation project.",
+        " Not affiliated with or endorsed by Textron Aviation, Cessna, Garmin,",
+        " BendixKing/Honeywell, Lycoming, or any other third-party brand.",
+        "",
+    ]
+    if is_base:
+        sections.extend([
+            "Files: opt/opensky-vfr/sim_engine/* opt/opensky-vfr/game/aircraft/*",
+            "Copyright: OpenSky VFR contributors",
+            "License: MIT and CC0-1.0",
+            "",
+            "Files: opt/opensky-vfr/game/bin/libJSBSim.so*",
+            "Copyright: JSBSim Development Team",
+            "License: LGPL-2.1-or-later",
+            " See /usr/share/doc/opensky-vfr/JSBSim-LGPL-2.1 and jsbsim-source.",
+            "",
+            "Files: opt/opensky-vfr/game/assets/models/aircraft/c172s_exterior.glb",
+            "Copyright: e737 (Sketchfab), veyron007/AUREL contributors, OpenSky VFR contributors",
+            "License: CC-BY-4.0",
+            " See /usr/share/doc/opensky-vfr/LICENSES/CC-BY-4.0.txt and THIRD_PARTY_LICENSES.md.",
+            "",
+        ])
+    sections.extend([
+        "Files: opt/opensky-vfr/packs/*.nspack opt/opensky-vfr/packs/*.relief.png",
+        "Copyright: Instituto Geografico Nacional de Espana (IGN), OurAirports, Natural Earth",
+        "License: CC-BY-4.0 and Public-Domain",
+        " Scenery terrain/imagery includes data from IGN Spain PNOA / MDT05 / MDT25",
+        " (CC BY 4.0; /usr/share/doc/" + pkg_name + "/LICENSES/CC-BY-4.0.txt).",
+        "",
+        "Files: opt/opensky-vfr/packs/*.nscity opt/opensky-vfr/packs/*.nsscn",
+        "Copyright: OpenStreetMap contributors, Poly Haven",
+        "License: ODbL-1.0 and CC0-1.0",
+        " Derived building/road databases are distributed under ODbL 1.0 Share-Alike.",
+        " Full license text: /usr/share/doc/" + pkg_name + "/LICENSES/ODbL-1.0.txt.",
+        "",
+        "Files: opt/opensky-vfr/*",
+        "Copyright: OpenSky VFR contributors",
+        "License: MIT",
+        " See /usr/share/doc/" + pkg_name + "/LICENSE.",
+        "",
+    ])
+    (doc_dir / "copyright").write_text("\n".join(sections), encoding="utf-8")
+
+
+def copy_license_bundle(doc_dir: Path, pkg_name: str, is_base: bool) -> None:
+    for name in ("README.md", "LICENSE", "THIRD_PARTY_LICENSES.md"):
+        shutil.copy2(ROOT / name, doc_dir / name)
+    lic_src = ROOT / "LICENSES"
+    if lic_src.is_dir():
+        shutil.copytree(lic_src, doc_dir / "LICENSES", dirs_exist_ok=True)
+    write_dep5_copyright(doc_dir, pkg_name, is_base)
+
+
 def copy_app_base(stage: Path, packs_dir: Path) -> None:
     app = stage / APP_ROOT
     (app / "sim_engine").mkdir(parents=True)
@@ -227,8 +285,7 @@ def copy_app_base(stage: Path, packs_dir: Path) -> None:
 
     doc = stage / "usr/share/doc/opensky-vfr"
     doc.mkdir(parents=True)
-    for name in ("README.md", "LICENSE", "THIRD_PARTY_LICENSES.md"):
-        shutil.copy2(ROOT / name, doc / name)
+    copy_license_bundle(doc, "opensky-vfr", is_base=True)
     shutil.copy2(ROOT / "docs/MODDING.md", doc / "MODDING.md")
     shutil.copy2(ROOT / "engine/thirdparty/jsbsim/COPYING.LGPL-2.1", doc / "JSBSim-LGPL-2.1")
     shutil.copytree(
@@ -249,8 +306,7 @@ def copy_region_addon(stage: Path, pkg_name: str, packs_dir: Path, filenames: tu
     copy_pack_files(packs_dir, stage / APP_ROOT / "packs", filenames)
     doc = stage / "usr/share/doc" / pkg_name
     doc.mkdir(parents=True)
-    for name in ("README.md", "LICENSE", "THIRD_PARTY_LICENSES.md"):
-        shutil.copy2(ROOT / name, doc / name)
+    copy_license_bundle(doc, pkg_name, is_base=False)
 
 
 def build_deb_package(
@@ -448,7 +504,7 @@ def main() -> int:
             f"{rec_line}"
             f"Maintainer: {args.maintainer}\n"
             "Description: OpenSky VFR flight exploration simulator\n"
-            " Explore the Pyrenees and Northern Spain in a Cessna 172S. Includes Aragón baseline scenery.\n"
+            " Explore the Pyrenees and Northern Spain in the OpenSky 172S trainer. Includes Aragón baseline scenery.\n"
             " Launch it from the Games menu or with opensky-vfr.\n",
             temp_dir,
             base_out,

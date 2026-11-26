@@ -561,7 +561,7 @@ void GameFrontend::sync_region_weather_previews(const RegionalAtmosphere *reg_at
     }
 }
 
-void GameFrontend::draw_globe(const RegionalAtmosphere *reg_atmo, double /*sim_time_sec*/) {
+void GameFrontend::draw_globe(const RegionalAtmosphere *reg_atmo, double sim_time_sec) {
     const PixelRect a = map_area;
     glViewport(a.x, h - a.y - a.h, a.w, a.h);
     glDisable(GL_DEPTH_TEST);
@@ -590,7 +590,8 @@ void GameFrontend::draw_globe(const RegionalAtmosphere *reg_atmo, double /*sim_t
     if (region_wx_) glBindTextureUnit(3, region_wx_);
     const bool show_flow = weather_overlay_ && (has_wx || region_wx_ != 0);
     static const double anim_t0 = PlatformWindow::now_sec();
-    const float flow_time = static_cast<float>(PlatformWindow::now_sec() - anim_t0);
+    const float flow_time = (sim_time_sec > 0.01) ? static_cast<float>(sim_time_sec)
+                                                  : static_cast<float>(PlatformWindow::now_sec() - anim_t0);
     if (wx_geo_uniform_ >= 0) glUniform4f(wx_geo_uniform_, wx_geo.x, wx_geo.y, wx_geo.z, wx_geo.w);
     if (wx_overlay_uniform_ >= 0) glUniform1f(wx_overlay_uniform_, show_flow ? 1.0f : 0.0f);
     if (wx_base_cloud_uniform_ >= 0) glUniform1f(wx_base_cloud_uniform_, has_wx ? reg_atmo->weather().cloud_cov : 0.35f);
@@ -700,7 +701,7 @@ void GameFrontend::draw_first_flight_tutorial(AircraftAndHud &ui) {
         {"OpenSky is a Spain-based free-roam VFR simulator.",
          "Aragón and Catalunya ship as the baseline world.",
          "The World Editor can add compatible regions worldwide.",
-         "Your Cessna 172S starts at Castejon de Sos (ES-0205)."},
+         "Your OpenSky 172S starts at Castejon de Sos (ES-0205)."},
         {"Drag the globe and use + or - to zoom. Select an airfield or",
          "landmark, then add airfields to a route if you want a plan.",
          "Browsing, selecting and route planning never move the aircraft.", ""},
@@ -791,6 +792,31 @@ bool GameFrontend::capture_world(AircraftAndHud &aircraft, SkyAndClouds &sky, co
                                  int &time_of_day, RegionalAtmosphere *weather, const std::string &path) {
     draw_menu(aircraft, sky, win, false, time_of_day, weather);
     return PlatformWindow::save_framebuffer_png(path, GAME_OUTPUT_W, GAME_OUTPUT_H);
+}
+
+void GameFrontend::set_demo_view(int page_idx, double lat, double lon, float zoom,
+                                 const std::string &selected_ap, bool show_weather) {
+    first_flight_open_ = false;
+    page_ = static_cast<Page>(std::clamp(page_idx, 0, 4));
+    globe_lat_ = lat;
+    globe_lon_ = lon;
+    globe_zoom_ = std::clamp(zoom, 0.7f, 64.0f);
+    weather_overlay_ = show_weather;
+    if (!selected_ap.empty()) selected_id_ = selected_ap;
+}
+
+void GameFrontend::add_demo_route_airport(const AirportInfo &airport) {
+    add_point({airport.id, airport.lat, airport.lon});
+}
+
+void GameFrontend::set_demo_walk(double lat, double lon, double alt, float yaw, float pitch, bool inspecting) {
+    walking_ = true;
+    inspecting_ = inspecting;
+    walker_.lat = lat;
+    walker_.lon = lon;
+    walker_.alt = alt;
+    walker_.heading = yaw;
+    walker_.pitch = pitch;
 }
 
 void GameFrontend::draw_world(AircraftAndHud &ui, const PlatformWindow &win,
@@ -989,7 +1015,7 @@ void GameFrontend::draw_world(AircraftAndHud &ui, const PlatformWindow &win,
         ui.hud_rect(x, 930, 12, 12, r, g, b, 1.0f);
         label(ui, x + 20, 930, 14, text, true);
     };
-    legend_item(98, .96f, .68f, .57f, "YOUR CESSNA");
+    legend_item(98, .96f, .68f, .57f, "YOUR 172S");
     legend_item(260, .32f, .92f, .42f, "VISITED");
     legend_item(383, .40f, .82f, .57f, "AIRFIELD");
     legend_item(525, .98f, .70f, .33f, "PLANNED ROUTE");
@@ -1222,7 +1248,7 @@ void GameFrontend::draw_world(AircraftAndHud &ui, const PlatformWindow &win,
 
 void GameFrontend::draw_logbook(AircraftAndHud &ui) {
     label(ui, 64, 111, 44, "Logbook & Passport");
-    label(ui, 66, 166, 21, "Your Cessna 172S maintenance ledger, flight log, and Aragon airfield stamps.", true);
+    label(ui, 66, 166, 21, "Your OpenSky 172S maintenance ledger, flight log, and airfield stamps.", true);
 
     char line[192];
     // Left panel: Aircraft Maintenance Status + Flight Logbook
@@ -1541,7 +1567,7 @@ void GameFrontend::draw_loading_screen(AircraftAndHud &ui, int win_w, int win_h,
 
 void GameFrontend::draw_controls(AircraftAndHud &ui) {
     label(ui, 64, 111, 44, "Controls");
-    label(ui, 66, 169, 20, "Walk around your Skyhawk to inspect & service it, start up at parking, and taxi to the runway.", true);
+    label(ui, 66, 169, 20, "Walk around your 172S to inspect & service it, start up at parking, and taxi to the runway.", true);
     panel(ui, {64, 220, 846, 760});
     panel(ui, {942, 220, 914, 760});
     label(ui, 90, 245, 28, "Walkaround & Engine Care");
@@ -1602,42 +1628,43 @@ void GameFrontend::draw_credits(AircraftAndHud &ui) {
     label(ui, 64, 132, 38, "About OpenSky");
     label(ui, 66, 174, 17, "Flight sim source, regional content, and the rules each piece travels with.", true);
 
-    panel(ui, {64, 225, 860, 326});
-    label(ui, 90, 250, 24, "Open-source engine");
-    label(ui, 90, 294, 18, "OpenSky source is MIT licensed. See LICENSE.");
-    label(ui, 90, 330, 17, "JSBSim is a separate LGPL-2.1-or-later shared library.");
-    label(ui, 90, 366, 17, "Third-party code and assets keep their own licenses.");
-    label(ui, 90, 422, 16, "Source contributions and source-level mods are welcome.", true);
+    panel(ui, {64, 225, 860, 344});
+    label(ui, 90, 250, 24, "Open-source engine & aircraft assets");
+    label(ui, 90, 294, 17, "OpenSky source code & original assets are MIT licensed (LICENSE).");
+    label(ui, 90, 328, 17, "JSBSim is dynamically linked under LGPL-2.1-or-later (source included).");
+    label(ui, 90, 362, 17, "Exterior aircraft mesh: e737 / veyron007 AUREL (CC BY 4.0, modified).");
+    label(ui, 90, 396, 17, "UI font: Inter Medium (SIL OFL 1.1) | PBR: Poly Haven (CC0).");
+    label(ui, 90, 444, 15, "Full texts in LICENSES/ (CC-BY-4.0, ODbL-1.0, OFL-1.1).", true);
+    label(ui, 90, 476, 15, "Notices: THIRD_PARTY_LICENSES.md", true);
 
-    panel(ui, {950, 225, 906, 326});
-    label(ui, 976, 250, 24, "Scenery, data & attribution");
-    label(ui, 976, 294, 17, "Terrain and imagery: IGN Spain, CC BY 4.0.");
-    label(ui, 976, 328, 17, "Roads, buildings and city data: OpenStreetMap contributors.");
-    label(ui, 976, 362, 17, "OSM-derived packs retain ODbL 1.0 attribution and share-alike.");
-    label(ui, 976, 396, 17, "OurAirports data is public domain; other feeds keep source terms.");
-    label(ui, 976, 440, 16, "Live weather uses Open-Meteo and follows its current service terms.", true);
-    label(ui, 976, 478, 15, "Full notices: THIRD_PARTY_LICENSES.md", true);
+    panel(ui, {950, 225, 906, 344});
+    label(ui, 976, 250, 24, "Scenery, geospatial data & attribution");
+    label(ui, 976, 294, 17, "Terrain and aerial ortho: IGN Spain PNOA / MDT (CC BY 4.0).");
+    label(ui, 976, 328, 17, "Roads, buildings & city geometry: OpenStreetMap contributors.");
+    label(ui, 976, 362, 17, "OSM-derived .nsscn / .nscity packs use ODbL 1.0 Share-Alike.");
+    label(ui, 976, 396, 17, "Natural Earth (Public Domain) | OurAirports (Public Domain).");
+    label(ui, 976, 440, 16, "Weather: Open-Meteo (CC BY 4.0 data, non-commercial free API tier).", true);
+    label(ui, 976, 474, 15, "Disable live feed with --no-live-weather for offline/commercial use.", true);
 
-    panel(ui, {64, 579, 860, 366});
-    label(ui, 90, 604, 24, "Make and install community content");
-    label(ui, 90, 648, 17, "Install regions in ~/.local/share/opensky-vfr/packs.");
-    label(ui, 90, 682, 17, "The simulator discovers region packs from that folder.");
-    label(ui, 90, 716, 17, "Aircraft folders load package data, models, and a JSBSim flight model.");
-    label(ui, 90, 750, 17, "Systems currently support one piston engine and two fuel tanks.");
-    label(ui, 90, 784, 17, "Lua aircraft scripts are planned; complex systems still need engine work.");
-    label(ui, 90, 828, 17, "Mods must include their own source, asset, and data license notes.");
-    label(ui, 90, 874, 16, "Guide: docs/MODDING.md", true);
+    panel(ui, {64, 594, 860, 354});
+    label(ui, 90, 619, 24, "Community regions & packages");
+    label(ui, 90, 663, 17, "Install regions in ~/.local/share/opensky-vfr/packs.");
+    label(ui, 90, 697, 17, "The simulator discovers region packs automatically from that folder.");
+    label(ui, 90, 731, 17, "Aircraft folders supply package manifests, GLBs, and a JSBSim FDM.");
+    label(ui, 90, 765, 17, "Single-piston systems include 12 breakers, dual NAV/COM & 2-axis AP.");
+    label(ui, 90, 815, 16, "Community mods must include source, asset, and data license notices.", true);
+    label(ui, 90, 862, 16, "Guide: docs/MODDING.md", true);
 
-    panel(ui, {950, 579, 906, 366});
-    label(ui, 976, 604, 24, "Simulation use");
-    label(ui, 976, 648, 17, "OpenSky is for simulation and entertainment only.");
-    label(ui, 976, 682, 17, "It is not certified for real-world navigation or flight training.");
-    label(ui, 976, 716, 17, "Use current official charts, weather and aircraft procedures.");
-    ui.hud_rect(976, 777, 854, 1, .18f, .34f, .38f, .85f);
-    label(ui, 976, 805, 16, "Community aircraft and regions are independent works.", true);
-    label(ui, 976, 839, 16, "Their authors are responsible for rights to included content.", true);
+    panel(ui, {950, 594, 906, 354});
+    label(ui, 976, 619, 24, "Trademarks & simulation notice");
+    label(ui, 976, 663, 17, "OpenSky VFR is an independent open-source project, not affiliated with");
+    label(ui, 976, 697, 17, "or endorsed by any aircraft, engine, or avionics manufacturer.");
+    label(ui, 976, 735, 17, "For simulation & VFR exploration only; not certified for training.");
+    ui.hud_rect(976, 785, 854, 1, .18f, .34f, .38f, .85f);
+    label(ui, 976, 813, 16, "Use official charts, weather, and aircraft documentation in real flight.", true);
+    label(ui, 976, 847, 16, "Community aircraft and region packs keep their own author licenses.", true);
 
-    label(ui, 66, 1002, 14, "OpenSky VFR  |  Built for curious pilots, careful modders, and scenic flights.", true);
+    label(ui, 66, 1002, 14, "OpenSky VFR  |  MIT Engine  |  IGN CC BY 4.0  |  OSM ODbL 1.0  |  JSBSim LGPL-2.1", true);
 }
 
 void GameFrontend::draw_walk(AircraftAndHud &ui, const PlatformWindow &win,
@@ -1730,7 +1757,7 @@ void GameFrontend::draw_walk(AircraftAndHud &ui, const PlatformWindow &win,
             label(ui, 566, 976, 17, line);
             label(ui, 566, 1004, 15, "WASD Walk around aircraft   /   Drag or arrows Look   /   Esc World", true);
         } else {
-            std::snprintf(line, sizeof(line), "Cessna 172S (EC-VFR)   |   %.0f m", distance);
+            std::snprintf(line, sizeof(line), "OpenSky 172S (EC-VFR)   |   %.0f m", distance);
             label(ui, 566, 940, 22, line);
             label(ui, 566, 982, 17, "WASD Walk toward aircraft   /   Shift Run   /   Drag or arrows Look   /   Esc World", true);
         }
@@ -1739,7 +1766,7 @@ void GameFrontend::draw_walk(AircraftAndHud &ui, const PlatformWindow &win,
     } else {
         // 6-Station Spatial Walkaround & Servicing Clipboard
         panel(ui, {1160, 145, 720, 795});
-        label(ui, 1188, 168, 28, "Cessna 172S Walkaround");
+        label(ui, 1188, 168, 28, "OpenSky 172S Walkaround");
         label(ui, 1188, 206, 16, full_svc
             ? "Home / Regional Hangar - full servicing available (all free)"
             : "Remote Strip - Field Kit only (major overhaul/swap at Castejon, LECI, LEHC, LEZG)", true);
@@ -2012,7 +2039,7 @@ void GameFrontend::draw_navigation(AircraftAndHud &ui, const PlatformWindow &win
     }
 
     // Live Symptom & Aircraft Care Caution Banner (only shown when something needs attention!)
-    const auto &sys = ui.systems_;
+    auto &sys = ui.systems_;
     std::string caution;
     if (ui.is_chocked_or_tied() && ui.jsb_state().on_ground)
         caution = "CHOCKS / TIE-DOWNS FITTED - Press Esc -> Park & step outside to remove!";
@@ -2055,119 +2082,296 @@ void GameFrontend::draw_navigation(AircraftAndHud &ui, const PlatformWindow &win
         label(ui, 584, 880, 16, "Taxi clear of the runway, shut down (K), then Esc -> Park to log this flight.", true);
     }
 
-    // Clickable In-Flight Systems & Checklist Kneeboard (Tab)
+    // Clickable Study-Level In-Flight Systems, Avionics & Circuit Breaker Kneeboard (Tab)
     if (kneeboard_open_) {
         const int kx = 28, ky = caution.empty() ? 174 : 238;
-        panel(ui, {kx, ky, 590, 566});
-        label(ui, kx + 22, ky + 18, 22, "Cockpit Systems & Checklist");
-        if (button(ui, {kx + 458, ky + 12, 112, 32}, "Hide (Tab)")) kneeboard_open_ = false;
+        panel(ui, {kx, ky, 636, 656});
+        label(ui, kx + 22, ky + 16, 22, "Cockpit Systems & Avionics");
+        if (button(ui, {kx + 502, ky + 10, 112, 32}, "Hide (Tab)")) kneeboard_open_ = false;
 
-        // Live Engine & Electrical Telemetry
+        if (button(ui, {kx + 22, ky + 48, 190, 32}, "Engine & Lights", true, kneeboard_tab_ == 0)) kneeboard_tab_ = 0;
+        if (button(ui, {kx + 222, ky + 48, 190, 32}, "Avionics & AP", true, kneeboard_tab_ == 1)) kneeboard_tab_ = 1;
+        if (button(ui, {kx + 422, ky + 48, 192, 32}, "Breakers (12)", true, kneeboard_tab_ == 2)) kneeboard_tab_ = 2;
+
         const auto &fs = ui.jsb_state();
-        std::snprintf(line, sizeof(line), "RPM %4.0f | Oil %.1fqt %.0fF %.0fpsi | CHT %.0fF",
-                      fs.rpm, sys.get_oil_quarts(), sys.get_oil_temp_f(), sys.get_oil_press_psi(), sys.get_cht_f());
-        label(ui, kx + 22, ky + 56, 16, line);
-        std::snprintf(line, sizeof(line), "Bus %.1fV (Bat %.0f%%) | Mix %.0f%% | CarbIce %.0f%% | Plugs %.0f%%",
-                      sys.get_bus_volts(), sys.get_battery_soc() * 100.0, ui.state().mixture * 100.0,
-                      sys.get_carb_ice_level() * 100.0, (1.0 - sys.get_spark_fouling()) * 100.0);
-        label(ui, kx + 22, ky + 84, 15, line, true);
-        std::snprintf(line, sizeof(line), "Fuel: L %.1f / R %.1f gal  |  Flow %.1f gph  |  Flaps %.0f deg",
-                      sys.get_left_tank_gal(), sys.get_right_tank_gal(),
-                      sys.get_fuel_flow_gph(), sys.get_flaps_actual_deg());
-        label(ui, kx + 22, ky + 110, 15, line, true);
+        auto &st = ui.state();
+        if (kneeboard_tab_ == 0) {
+            std::snprintf(line, sizeof(line), "RPM %4.0f | Oil %.1fqt %.0fF %.0fpsi | CHT %.0fF | Vac %.1f inHg",
+                          fs.rpm, sys.get_oil_quarts(), sys.get_oil_temp_f(), sys.get_oil_press_psi(),
+                          sys.get_cht_f(), sys.get_vacuum_inhg());
+            label(ui, kx + 22, ky + 92, 15, line);
+            std::snprintf(line, sizeof(line), "Bus %.1fV (%+.0fA, Bat %.0f%%) | Mix %.0f%% | CarbIce %.0f%% | Plugs %.0f%%",
+                          sys.get_bus_volts(), sys.get_ammeter_amps(), sys.get_battery_soc() * 100.0,
+                          st.mixture * 100.0, sys.get_carb_ice_level() * 100.0, (1.0 - sys.get_spark_fouling()) * 100.0);
+            label(ui, kx + 22, ky + 116, 14, line, true);
+            std::snprintf(line, sizeof(line), "Fuel: L %.1f / R %.1f gal (%.1f gph) | Baro %.0f hPa (Ind %.0f ft)",
+                          sys.get_left_tank_gal(), sys.get_right_tank_gal(),
+                          sys.get_fuel_flow_gph(), sys.get_baro_hpa(), st.ind_alt_ft);
+            label(ui, kx + 22, ky + 140, 14, line, true);
 
-        // Clickable Cockpit Controls (mirror keys 1..8 and K)
-        if (button(ui, {kx + 22, ky + 144, 174, 38},
-                   sys.get_master_battery() ? "[1] Master: ON" : "[1] Master: OFF", true, sys.get_master_battery())) {
-            const bool next = !sys.get_master_battery();
-            ui.systems_.set_master_battery(next);
-            ui.systems_.set_master_alternator(next);
-            ui.systems_.set_light_switch(0, next);
-        }
-        if (button(ui, {kx + 208, ky + 144, 174, 38},
-                   sys.get_avionics_master() ? "[2] Avionics: ON" : "[2] Avionics: OFF", true, sys.get_avionics_master())) {
-            ui.systems_.set_avionics_master(!sys.get_avionics_master());
-        }
-        static constexpr const char *kMagNames[5] = {"OFF", "R", "L", "BOTH", "START"};
-        std::snprintf(line, sizeof(line), "[3] Mags: %s", kMagNames[std::clamp(sys.get_magnetos(), 0, 4)]);
-        if (button(ui, {kx + 394, ky + 144, 174, 38}, line, true, sys.get_magnetos() == 3)) {
-            ui.systems_.set_magnetos((sys.get_magnetos() + 1) % 4);
-        }
+            if (button(ui, {kx + 22, ky + 168, 190, 34},
+                       sys.get_master_battery() ? "[1] Master: ON" : "[1] Master: OFF", true, sys.get_master_battery())) {
+                const bool next = !sys.get_master_battery();
+                sys.set_master_battery(next);
+                sys.set_master_alternator(next);
+                sys.set_light_switch(0, next);
+            }
+            if (button(ui, {kx + 222, ky + 168, 190, 34},
+                       sys.get_avionics_master() ? "[2] Avionics: ON" : "[2] Avionics: OFF", true, sys.get_avionics_master())) {
+                sys.set_avionics_master(!sys.get_avionics_master());
+            }
+            static constexpr const char *kMagNames[5] = {"OFF", "R", "L", "BOTH", "START"};
+            std::snprintf(line, sizeof(line), "[3] Mags: %s", kMagNames[std::clamp(sys.get_magnetos(), 0, 4)]);
+            if (button(ui, {kx + 422, ky + 168, 192, 34}, line, true, sys.get_magnetos() == 3)) {
+                sys.set_magnetos((sys.get_magnetos() + 1) % 4);
+            }
 
-        if (button(ui, {kx + 22, ky + 192, 174, 38}, "[5] Mix -10%", ui.state().mixture > 0.01)) {
-            ui.state().mixture = std::max(0.0, ui.state().mixture - 0.10);
-        }
-        if (button(ui, {kx + 208, ky + 192, 174, 38}, "[6] Mix +10%", ui.state().mixture < 0.99)) {
-            ui.state().mixture = std::min(1.0, ui.state().mixture + 0.10);
-        }
-        static constexpr const char *kFuelNames[4] = {"OFF", "LEFT", "BOTH", "RIGHT"};
-        std::snprintf(line, sizeof(line), "Fuel: %s", kFuelNames[std::clamp(sys.get_fuel_selector(), 0, 3)]);
-        if (button(ui, {kx + 394, ky + 192, 174, 38}, line, true, sys.get_fuel_selector() == 2)) {
-            ui.systems_.cycle_fuel_selector();
-        }
+            if (button(ui, {kx + 22, ky + 208, 140, 34}, "[5] Mix -10%", st.mixture > 0.01)) {
+                st.mixture = std::max(0.0, st.mixture - 0.10);
+            }
+            if (button(ui, {kx + 168, ky + 208, 140, 34}, "[6] Mix +10%", st.mixture < 0.99)) {
+                st.mixture = std::min(1.0, st.mixture + 0.10);
+            }
+            static constexpr const char *kFuelNames[4] = {"OFF", "LEFT", "BOTH", "RIGHT"};
+            std::snprintf(line, sizeof(line), "Fuel: %s", kFuelNames[std::clamp(sys.get_fuel_selector(), 0, 3)]);
+            if (button(ui, {kx + 314, ky + 208, 146, 34}, line, true, sys.get_fuel_selector() == 2)) {
+                sys.cycle_fuel_selector();
+            }
+            if (button(ui, {kx + 466, ky + 208, 148, 34},
+                       sys.get_fuel_shutoff_pulled() ? "Valve: SHUTOFF" : "Valve: OPEN", true, sys.get_fuel_shutoff_pulled())) {
+                sys.set_fuel_shutoff_pulled(!sys.get_fuel_shutoff_pulled());
+            }
 
-        if (button(ui, {kx + 22, ky + 240, 174, 38},
-                   sys.get_carb_heat() > 0.5 ? "[7] CarbHt: ON" : "[7] CarbHt: OFF", true, sys.get_carb_heat() > 0.5)) {
-            ui.systems_.set_carb_heat(sys.get_carb_heat() > 0.5 ? 0.0 : 1.0);
-        }
-        if (!sys.is_engine_running()) {
-            std::snprintf(line, sizeof(line), "[8] Prime (%d)", sys.get_primer_strokes());
-            if (button(ui, {kx + 208, ky + 240, 174, 38}, line, true, sys.get_primer_strokes() >= 2))
-                ui.systems_.actuate_primer();
+            if (button(ui, {kx + 22, ky + 248, 140, 34},
+                       sys.get_carb_heat() > 0.5 ? "[7] CarbHt ON" : "[7] CarbHt", true, sys.get_carb_heat() > 0.5)) {
+                sys.set_carb_heat(sys.get_carb_heat() > 0.5 ? 0.0 : 1.0);
+            }
+            if (!sys.is_engine_running()) {
+                std::snprintf(line, sizeof(line), "[8] Prime (%d)", sys.get_primer_strokes());
+                if (button(ui, {kx + 168, ky + 248, 140, 34}, line, true, sys.get_primer_strokes() >= 2))
+                    sys.actuate_primer();
+            } else {
+                if (button(ui, {kx + 168, ky + 248, 140, 34},
+                           sys.get_pitot_heat_switch() ? "[8] PitotHt ON" : "[8] PitotHt", true, sys.get_pitot_heat_switch()))
+                    sys.set_pitot_heat_switch(!sys.get_pitot_heat_switch());
+            }
+            if (button(ui, {kx + 314, ky + 248, 146, 34},
+                       sys.get_fuel_pump_switch() ? "Aux Pump ON" : "Aux Pump", true, sys.is_fuel_pump_active())) {
+                sys.set_fuel_pump_switch(!sys.get_fuel_pump_switch());
+            }
+            if (button(ui, {kx + 466, ky + 248, 148, 34},
+                       sys.is_starter_cranking() ? "Cranking..." : "[4] Hold Start",
+                       !sys.is_engine_running() && sys.get_master_battery(), sys.is_starter_cranking())) {
+                sys.set_magnetos(4);
+            }
+
+            static constexpr const char *kLightLbls[5] = {"BCN", "LDG", "NAV", "STRB", "INST"};
+            for (int li = 0; li < 5; ++li) {
+                std::snprintf(line, sizeof(line), "%s %s", kLightLbls[li], sys.get_light_switch(li) ? "ON" : "OFF");
+                if (button(ui, {kx + 22 + li * 119, ky + 288, 113, 32}, line, true, sys.is_light_powered(li))) {
+                    sys.set_light_switch(li, !sys.get_light_switch(li));
+                }
+            }
+
+            if (button(ui, {kx + 22, ky + 328, 592, 36},
+                       sys.is_engine_running() ? "[K] Clean Shutdown (idle-cutoff, mags & master OFF)"
+                                               : "[K] Quick Start Engine (helper)",
+                       true, !sys.is_engine_running())) {
+                ui.quick_start_or_shutdown();
+            }
+
+            ui.hud_rect(kx + 22, ky + 374, 592, 1, .21f, .32f, .39f, .85f);
+            if (!sys.is_engine_running()) {
+                label(ui, kx + 22, ky + 388, 17, "Cold-and-Dark Start Checklist:");
+                std::snprintf(line, sizeof(line), "[%c] 1. Exterior chocks & pitot cover removed", !ui.is_chocked_or_tied() && !sys.is_pitot_cover_on() ? 'x' : ' ');
+                label(ui, kx + 22, ky + 420, 15, line, !ui.is_chocked_or_tied() && !sys.is_pitot_cover_on());
+                std::snprintf(line, sizeof(line), "[%c] 2. Fuel BOTH & Open, Master ON (1), BCN ON", sys.get_fuel_selector() == 2 && !sys.get_fuel_shutoff_pulled() && sys.get_master_battery() ? 'x' : ' ');
+                label(ui, kx + 22, ky + 448, 15, line, sys.get_fuel_selector() == 2 && sys.get_master_battery());
+                std::snprintf(line, sizeof(line), "[%c] 3. Mixture Rich (6), Prime 2x if cold (8)", st.mixture >= 0.8 ? 'x' : ' ');
+                label(ui, kx + 22, ky + 476, 15, line, st.mixture >= 0.8);
+                label(ui, kx + 22, ky + 504, 15, "[ ] 4. Hold Start (4) until oil pressure rises (or press K)", false);
+                label(ui, kx + 22, ky + 540, 14, "After start: switch Avionics ON (2), check oil >110 F before takeoff.", true);
+            } else if (fs.on_ground) {
+                label(ui, kx + 22, ky + 388, 17, "Run-Up & Before-Takeoff Checklist:");
+                std::snprintf(line, sizeof(line), "[%c] 1. Oil temp >110 F & pressure green (%.0f F / %.0f psi)",
+                              sys.get_oil_temp_f() >= 110.0 && sys.get_oil_press_psi() >= 40.0 ? 'x' : ' ',
+                              sys.get_oil_temp_f(), sys.get_oil_press_psi());
+                label(ui, kx + 22, ky + 420, 15, line, sys.get_oil_temp_f() >= 110.0);
+                std::snprintf(line, sizeof(line), "[%c] 2. Magnetos BOTH & L/R drop check at 1700 RPM (key 3)", sys.get_magnetos() == 3 ? 'x' : ' ');
+                label(ui, kx + 22, ky + 448, 15, line, sys.get_magnetos() == 3);
+                std::snprintf(line, sizeof(line), "[%c] 3. Carb Heat OFF (7) & Avionics ON (2) & Vacuum %.1f\"",
+                              sys.get_carb_heat() < 0.1 && sys.get_avionics_master() ? 'x' : ' ', sys.get_vacuum_inhg());
+                label(ui, kx + 22, ky + 476, 15, line, sys.get_carb_heat() < 0.1 && sys.get_avionics_master());
+                std::snprintf(line, sizeof(line), "[%c] 4. Set Kollsman Baro, XPDR ALT, Brake off (X), rotate 55 kt",
+                              !st.parking_brake ? 'x' : ' ');
+                label(ui, kx + 22, ky + 504, 15, line, !st.parking_brake);
+                label(ui, kx + 22, ky + 540, 14, "After landing: clear runway, press K to shut down, then Esc -> Park.", true);
+            } else {
+                label(ui, kx + 22, ky + 388, 17, "Cruise & Avionics Management:");
+                label(ui, kx + 22, ky + 420, 15, "- Tune VOR1 (e.g. 114.50 HUE, 115.90 BLB, 116.40 STG) in Avionics tab.", true);
+                label(ui, kx + 22, ky + 448, 15, "- Engage 2-Axis AP (HDG/NAV GPS|VOR1 + VS/ALT ARM) for enroute legs.", true);
+                label(ui, kx + 22, ky + 476, 15, "- Lean mixture (5) above 1,500 m MSL; Carb Heat (7) before descents.", true);
+                label(ui, kx + 22, ky + 504, 15, "- Pull Pitot Heat (8) in icing/rain; monitor Vacuum & Bus Volts.", true);
+                label(ui, kx + 22, ky + 540, 14, "After landing: clear runway, shut down (K), then Esc -> Park.", true);
+            }
+        } else if (kneeboard_tab_ == 1) {
+            const bool av1 = sys.is_avionics_bus_powered(1);
+            const bool av2 = sys.is_avionics_bus_powered(2);
+            // COM 1 & NAV 1 (Bus 1)
+            std::snprintf(line, sizeof(line), "COM 1: ACT %.2f  |  STBY %.2f   %s",
+                          sys.get_com_active(1), sys.get_com_standby(1), av1 ? "" : "[BUS1 OFF]");
+            label(ui, kx + 22, ky + 94, 16, line, !av1);
+            if (button(ui, {kx + 22, ky + 120, 86, 32}, "SWAP", av1)) sys.swap_com(1);
+            if (button(ui, {kx + 114, ky + 120, 74, 32}, "-1M", av1)) sys.step_com_standby(1, -1.0);
+            if (button(ui, {kx + 194, ky + 120, 74, 32}, "-25k", av1)) sys.step_com_standby(1, -0.025);
+            if (button(ui, {kx + 274, ky + 120, 74, 32}, "+25k", av1)) sys.step_com_standby(1, 0.025);
+            if (button(ui, {kx + 354, ky + 120, 74, 32}, "+1M", av1)) sys.step_com_standby(1, 1.0);
+
+            const char *tf_s = sys.get_nav_to_from(1) > 0 ? "TO" : (sys.get_nav_to_from(1) < 0 ? "FR" : "--");
+            std::snprintf(line, sizeof(line), "NAV 1: %.2f / %.2f | %s %s %.1fNM CDI%+.2f",
+                          sys.get_nav_active(1), sys.get_nav_standby(1), sys.get_nav_ident(1).c_str(),
+                          tf_s, sys.get_nav_dme_nm(1), sys.get_nav_cdi(1));
+            label(ui, kx + 22, ky + 162, 15, line, !av1);
+            if (button(ui, {kx + 22, ky + 188, 86, 32}, "SWAP", av1)) sys.swap_nav(1);
+            if (button(ui, {kx + 114, ky + 188, 74, 32}, "-1M", av1)) sys.step_nav_standby(1, -1.0);
+            if (button(ui, {kx + 194, ky + 188, 74, 32}, "-50k", av1)) sys.step_nav_standby(1, -0.05);
+            if (button(ui, {kx + 274, ky + 188, 74, 32}, "+50k", av1)) sys.step_nav_standby(1, 0.05);
+            if (button(ui, {kx + 354, ky + 188, 74, 32}, "+1M", av1)) sys.step_nav_standby(1, 1.0);
+            std::snprintf(line, sizeof(line), "OBS %03d", sys.get_nav_obs_deg(1));
+            label(ui, kx + 440, ky + 195, 15, line);
+            if (button(ui, {kx + 516, ky + 188, 46, 32}, "-10", av1)) sys.set_nav_obs_deg(1, sys.get_nav_obs_deg(1) - 10);
+            if (button(ui, {kx + 566, ky + 188, 46, 32}, "+10", av1)) sys.set_nav_obs_deg(1, sys.get_nav_obs_deg(1) + 10);
+
+            // COM 2 & NAV 2 (Bus 2)
+            std::snprintf(line, sizeof(line), "COM2 %.2f/%.2f | NAV2 %.2f/%.2f (%s)",
+                          sys.get_com_active(2), sys.get_com_standby(2),
+                          sys.get_nav_active(2), sys.get_nav_standby(2),
+                          av2 ? sys.get_nav_ident(2).c_str() : "OFF");
+            label(ui, kx + 22, ky + 232, 15, line, !av2);
+            if (button(ui, {kx + 22, ky + 258, 96, 30}, "SWAP C2", av2)) sys.swap_com(2);
+            if (button(ui, {kx + 124, ky + 258, 72, 30}, "C2-.05", av2)) sys.step_com_standby(2, -0.05);
+            if (button(ui, {kx + 202, ky + 258, 72, 30}, "C2+.05", av2)) sys.step_com_standby(2, 0.05);
+            if (button(ui, {kx + 292, ky + 258, 96, 30}, "SWAP N2", av2)) sys.swap_nav(2);
+            if (button(ui, {kx + 394, ky + 258, 72, 30}, "N2-.05", av2)) sys.step_nav_standby(2, -0.05);
+            if (button(ui, {kx + 472, ky + 258, 72, 30}, "N2+.05", av2)) sys.step_nav_standby(2, 0.05);
+
+            // Kollsman Baro & Transponder
+            ui.hud_rect(kx + 22, ky + 298, 592, 1, .21f, .32f, .39f, .85f);
+            std::snprintf(line, sizeof(line), "Altimeter Baro: %.1f hPa (Ind %.0f ft) | QNH %.1f hPa",
+                          sys.get_baro_hpa(), st.ind_alt_ft, ui.last_air().qnh_hpa);
+            label(ui, kx + 22, ky + 308, 15, line);
+            if (button(ui, {kx + 22, ky + 334, 88, 30}, "Baro -1")) sys.set_baro_hpa(sys.get_baro_hpa() - 1.0);
+            if (button(ui, {kx + 116, ky + 334, 108, 30}, "STD 1013")) sys.set_baro_hpa(1013.25);
+            if (button(ui, {kx + 230, ky + 334, 88, 30}, "Baro +1")) sys.set_baro_hpa(sys.get_baro_hpa() + 1.0);
+            if (button(ui, {kx + 328, ky + 334, 138, 30}, "Match QNH")) sys.set_baro_hpa(ui.last_air().qnh_hpa);
+
+            static constexpr const char *kXpdrTxt[4] = {"OFF", "STBY", "ON", "ALT"};
+            std::snprintf(line, sizeof(line), "XPDR: %s  Code %04d  %s",
+                          kXpdrTxt[std::clamp(sys.get_xpdr_mode(), 0, 3)], sys.get_xpdr_squawk(),
+                          sys.is_xpdr_ident_active() ? "[IDENT]" : "");
+            label(ui, kx + 22, ky + 374, 15, line, !av1);
+            if (button(ui, {kx + 22, ky + 400, 94, 32}, "Mode", av1)) sys.cycle_xpdr_mode();
+            if (button(ui, {kx + 122, ky + 400, 82, 32}, "7000", av1)) sys.set_xpdr_vfr_7000();
+            const int sq = sys.get_xpdr_squawk();
+            auto step_oct = [&](int mul) {
+                const int d = ((sq / mul) % 10 + 1) % 8;
+                const int prev = ((sq / mul) % 10);
+                sys.set_xpdr_squawk(sq + (d - prev) * mul);
+            };
+            if (button(ui, {kx + 210, ky + 400, 72, 32}, "D1+", av1)) step_oct(1000);
+            if (button(ui, {kx + 288, ky + 400, 72, 32}, "D2+", av1)) step_oct(100);
+            if (button(ui, {kx + 366, ky + 400, 72, 32}, "D3+", av1)) step_oct(10);
+            if (button(ui, {kx + 444, ky + 400, 72, 32}, "D4+", av1)) step_oct(1);
+            if (button(ui, {kx + 522, ky + 400, 92, 32}, "IDENT", av1, sys.is_xpdr_ident_active())) sys.trigger_xpdr_ident();
+
+            // 2-Axis Autopilot Full Panel inside Kneeboard
+            ui.hud_rect(kx + 22, ky + 442, 592, 1, .21f, .32f, .39f, .85f);
+            const bool ap_ok = av1 && sys.is_circuit_powered(nspain::CB_TURN_COORD) && sys.get_bus_volts() >= 19.5;
+            std::snprintf(line, sizeof(line), "2-Axis Autopilot (%s)  |  %s  |  %s",
+                          ap_ok ? (st.ap_master ? "ENGAGED" : "READY") : "UNPOWERED/CB",
+                          st.ap_trim_annunc > 0 ? "TRIM UP" : (st.ap_trim_annunc < 0 ? "TRIM DN" : "Trim OK"),
+                          st.ap_disconnect_warn_s > 0.0f ? "AP DISC ALERT!" : "");
+            label(ui, kx + 22, ky + 452, 16, line, !ap_ok);
+            if (button(ui, {kx + 22, ky + 480, 94, 34}, st.ap_master ? "AP ON" : "AP OFF", ap_ok && !fs.on_ground, st.ap_master)) {
+                st.ap_master = !st.ap_master;
+                st.ap_disconnect_warn_s = 0.0f;
+                if (st.ap_master) st.ap_rol_bank_deg = std::clamp(st.roll_deg, -22.0, 22.0);
+            }
+            if (button(ui, {kx + 122, ky + 480, 78, 34}, "ROL", true, st.ap_master && !st.ap_hdg_hold && !st.ap_nav_hold)) {
+                st.ap_hdg_hold = false; st.ap_nav_hold = false;
+                st.ap_rol_bank_deg = (std::abs(st.roll_deg) > 4.0) ? std::clamp(st.roll_deg, -22.0, 22.0) : 0.0;
+                if (ap_ok && !fs.on_ground) st.ap_master = true;
+            }
+            if (button(ui, {kx + 206, ky + 480, 78, 34}, "HDG", true, st.ap_master && st.ap_hdg_hold && !st.ap_nav_hold)) {
+                st.ap_hdg_hold = true; st.ap_nav_hold = false;
+                if (ap_ok && !fs.on_ground) st.ap_master = true;
+            }
+            if (button(ui, {kx + 290, ky + 480, 108, 34}, st.ap_nav_source ? "NAV:VOR1" : "NAV:GPS", true, st.ap_master && st.ap_nav_hold)) {
+                st.ap_nav_hold = true; st.ap_hdg_hold = false;
+                if (ap_ok && !fs.on_ground) st.ap_master = true;
+            }
+            if (button(ui, {kx + 404, ky + 480, 102, 34}, "SRC GPS/VOR", true)) {
+                st.ap_nav_source = (st.ap_nav_source + 1) % 2;
+            }
+            if (button(ui, {kx + 512, ky + 480, 102, 34}, "CLR DISC", st.ap_disconnect_warn_s > 0.0f)) {
+                st.ap_disconnect_warn_s = 0.0f;
+            }
+
+            std::snprintf(line, sizeof(line), "HDG %03d", (int(std::round(st.ap_hdg_deg)) % 360 + 360) % 360);
+            label(ui, kx + 22, ky + 528, 16, line);
+            if (button(ui, {kx + 114, ky + 522, 54, 32}, "-10")) st.ap_hdg_deg = std::fmod(st.ap_hdg_deg + 350.0, 360.0);
+            if (button(ui, {kx + 174, ky + 522, 46, 32}, "-1"))  st.ap_hdg_deg = std::fmod(st.ap_hdg_deg + 359.0, 360.0);
+            if (button(ui, {kx + 226, ky + 522, 46, 32}, "+1"))  st.ap_hdg_deg = std::fmod(st.ap_hdg_deg + 1.0, 360.0);
+            if (button(ui, {kx + 278, ky + 522, 54, 32}, "+10")) st.ap_hdg_deg = std::fmod(st.ap_hdg_deg + 10.0, 360.0);
+            if (button(ui, {kx + 346, ky + 522, 130, 32}, "VS MODE", true, st.ap_vs_hold)) {
+                st.ap_vs_hold = true; st.ap_alt_hold = false;
+                st.ap_vs_fpm = std::clamp(std::round((st.vsi_mps * 196.85) / 100.0) * 100.0, -1500.0, 1200.0);
+                if (ap_ok && !fs.on_ground) st.ap_master = true;
+            }
+            if (button(ui, {kx + 482, ky + 522, 132, 32}, "ALT ARM", true, st.ap_alt_arm)) {
+                st.ap_alt_arm = !st.ap_alt_arm;
+            }
+
+            std::snprintf(line, sizeof(line), "VS %+4.0f fpm | ALT %.0f ft", st.ap_vs_fpm, st.ap_alt_ft);
+            label(ui, kx + 22, ky + 570, 15, line);
+            if (button(ui, {kx + 22, ky + 598, 78, 34}, "VS-100")) st.ap_vs_fpm = std::max(-1500.0, st.ap_vs_fpm - 100.0);
+            if (button(ui, {kx + 106, ky + 598, 78, 34}, "VS+100")) st.ap_vs_fpm = std::min(1200.0, st.ap_vs_fpm + 100.0);
+            if (button(ui, {kx + 194, ky + 598, 108, 34}, "ALT HOLD", true, st.ap_master && st.ap_alt_hold)) {
+                st.ap_alt_hold = true; st.ap_vs_hold = false; st.ap_alt_arm = false;
+                if (ap_ok && !fs.on_ground) st.ap_master = true;
+            }
+            if (button(ui, {kx + 312, ky + 598, 70, 34}, "-500")) { st.ap_alt_ft = std::max(1000.0, st.ap_alt_ft - 500.0); st.ap_alt_arm = st.ap_vs_hold; }
+            if (button(ui, {kx + 388, ky + 598, 70, 34}, "-100")) { st.ap_alt_ft = std::max(1000.0, st.ap_alt_ft - 100.0); st.ap_alt_arm = st.ap_vs_hold; }
+            if (button(ui, {kx + 464, ky + 598, 70, 34}, "+100")) { st.ap_alt_ft = std::min(14500.0, st.ap_alt_ft + 100.0); st.ap_alt_arm = st.ap_vs_hold; }
+            if (button(ui, {kx + 540, ky + 598, 74, 34}, "+500")) { st.ap_alt_ft = std::min(14500.0, st.ap_alt_ft + 500.0); st.ap_alt_arm = st.ap_vs_hold; }
         } else {
-            if (button(ui, {kx + 208, ky + 240, 174, 38},
-                       sys.get_pitot_heat_switch() ? "[8] PitotHt: ON" : "[8] PitotHt: OFF", true, sys.get_pitot_heat_switch()))
-                ui.systems_.set_pitot_heat_switch(!sys.get_pitot_heat_switch());
-        }
-        if (button(ui, {kx + 394, ky + 240, 174, 38},
-                   sys.is_starter_cranking() ? "Cranking..." : "[4] Hold Start",
-                   !sys.is_engine_running() && sys.get_master_battery(), sys.is_starter_cranking())) {
-            // Clicking Start arms magnetos=4 briefly; holding key 4 cranks continuously
-            ui.systems_.set_magnetos(4);
-        }
+            // Tab 2: 28V Electrical Bus, Vacuum & 12 Individual Circuit Breakers
+            std::snprintf(line, sizeof(line), "Bus: %.1fV | Ammeter: %+.1fA | Load: %.1fA | Batt: %.0f%% | Vac: %.2f inHg",
+                          sys.get_bus_volts(), sys.get_ammeter_amps(), sys.get_load_amps(),
+                          sys.get_battery_soc() * 100.0, sys.get_vacuum_inhg());
+            label(ui, kx + 22, ky + 96, 15, line);
+            label(ui, kx + 22, ky + 124, 14,
+                  "Click a circuit breaker to pull (OUT) or reset (IN). Pulling TURN_COORD or AVN1 disconnects AP.", true);
 
-        if (button(ui, {kx + 22, ky + 292, 546, 42},
-                   sys.is_engine_running() ? "[K] Clean Shutdown (idle-cutoff, mags & master OFF)"
-                                           : "[K] Quick Start Engine (helper)",
-                   true, !sys.is_engine_running())) {
-            ui.quick_start_or_shutdown();
-        }
-
-        // Dynamic Contextual Checklist (Start / Run-Up / Shutdown)
-        ui.hud_rect(kx + 22, ky + 348, 546, 1, .21f, .32f, .39f, .85f);
-        if (!sys.is_engine_running()) {
-            label(ui, kx + 22, ky + 362, 18, "Cold-and-Dark Start Checklist:");
-            std::snprintf(line, sizeof(line), "[%c] 1. Exterior chocks & pitot cover removed", !ui.is_chocked_or_tied() && !sys.is_pitot_cover_on() ? 'x' : ' ');
-            label(ui, kx + 22, ky + 394, 15, line, !ui.is_chocked_or_tied() && !sys.is_pitot_cover_on());
-            std::snprintf(line, sizeof(line), "[%c] 2. Fuel Selector BOTH & Master ON (key 1)", sys.get_fuel_selector() == 2 && sys.get_master_battery() ? 'x' : ' ');
-            label(ui, kx + 22, ky + 422, 15, line, sys.get_fuel_selector() == 2 && sys.get_master_battery());
-            std::snprintf(line, sizeof(line), "[%c] 3. Mixture Rich (key 6) & Prime 2x if cold (key 8)", ui.state().mixture >= 0.8 ? 'x' : ' ');
-            label(ui, kx + 22, ky + 450, 15, line, ui.state().mixture >= 0.8);
-            std::snprintf(line, sizeof(line), "[%c] 4. Hold key 4 to crank starter (or press K Quick Start)", sys.is_engine_running() ? 'x' : ' ');
-            label(ui, kx + 22, ky + 478, 15, line, false);
-            label(ui, kx + 22, ky + 514, 15, "After start: switch Avionics ON (key 2) and warm oil >110 F.", true);
-        } else if (ui.jsb_state().on_ground) {
-            label(ui, kx + 22, ky + 362, 18, "Run-Up & Before-Takeoff Checklist:");
-            std::snprintf(line, sizeof(line), "[%c] 1. Oil temp >110 F & pressure green (%.0f F / %.0f psi)",
-                          sys.get_oil_temp_f() >= 110.0 && sys.get_oil_press_psi() >= 40.0 ? 'x' : ' ',
-                          sys.get_oil_temp_f(), sys.get_oil_press_psi());
-            label(ui, kx + 22, ky + 394, 15, line, sys.get_oil_temp_f() >= 110.0);
-            std::snprintf(line, sizeof(line), "[%c] 2. Magnetos BOTH (test L/R drop with key 3 at 1700 RPM)", sys.get_magnetos() == 3 ? 'x' : ' ');
-            label(ui, kx + 22, ky + 422, 15, line, sys.get_magnetos() == 3);
-            std::snprintf(line, sizeof(line), "[%c] 3. Carb Heat OFF (key 7) & Avionics ON (key 2)",
-                          sys.get_carb_heat() < 0.1 && sys.get_avionics_master() ? 'x' : ' ');
-            label(ui, kx + 22, ky + 450, 15, line, sys.get_carb_heat() < 0.1 && sys.get_avionics_master());
-            std::snprintf(line, sizeof(line), "[%c] 4. Release brake (X), taxi onto clear runway, rotate 55 kt",
-                          !ui.state().parking_brake ? 'x' : ' ');
-            label(ui, kx + 22, ky + 478, 15, line, !ui.state().parking_brake);
-            label(ui, kx + 22, ky + 514, 15, "After landing: clear runway, press K to shut down, then Esc -> Park.", true);
-        } else {
-            label(ui, kx + 22, ky + 362, 18, "In-Flight Engine Management:");
-            label(ui, kx + 22, ky + 394, 15, "- Lean mixture (5) above 1,500 m MSL for Pyrenean climbs.", true);
-            label(ui, kx + 22, ky + 422, 15, "- Pull Carb Heat (7) before low-power descents in moist air.", true);
-            label(ui, kx + 22, ky + 450, 15, "- Reduce power gradually on descent to avoid shock cooling.", true);
-            label(ui, kx + 22, ky + 478, 15, "- Turn Pitot Heat ON (8) in freezing clouds or precipitation.", true);
-            label(ui, kx + 22, ky + 514, 15, "- Land smoothly, clear runway, shut down (K), then Esc -> Park.", true);
+            for (int cb = 0; cb < nspain::CB_COUNT; ++cb) {
+                const bool pulled = sys.is_breaker_pulled(cb);
+                const bool pwr = sys.is_circuit_powered(cb);
+                const int col = cb % 3;
+                const int row = cb / 3;
+                std::snprintf(line, sizeof(line), "%s: %s",
+                              nspain::PistonAircraftSystems::get_breaker_name(cb),
+                              pulled ? "OUT" : (pwr ? "IN (PWR)" : "IN"));
+                if (button(ui, {kx + 22 + col * 200, ky + 160 + row * 56, 192, 44}, line, true, !pulled)) {
+                    sys.toggle_breaker(cb);
+                }
+            }
+            ui.hud_rect(kx + 22, ky + 394, 592, 1, .21f, .32f, .39f, .85f);
+            label(ui, kx + 22, ky + 410, 16, "Live Fault Simulation Matrix:");
+            label(ui, kx + 22, ky + 442, 14, "- ALT_FIELD OUT: Alternator drops offline; battery discharges under load.", true);
+            label(ui, kx + 22, ky + 468, 14, "- AVIONICS_BUS_1 OUT: NAV/GPS1, XPDR, and Autopilot lose 28V power.", true);
+            label(ui, kx + 22, ky + 494, 14, "- AVIONICS_BUS_2 OUT: COM 2 / NAV 2 display shuts down.", true);
+            label(ui, kx + 22, ky + 520, 14, "- TURN_COORD OUT: Turn coordinator stops; Autopilot trips AP DISC.", true);
+            label(ui, kx + 22, ky + 546, 14, "- FLAPS OUT: Electric flap actuator motor freezes at current position.", true);
         }
     }
 
@@ -2193,42 +2397,78 @@ void GameFrontend::draw_navigation(AircraftAndHud &ui, const PlatformWindow &win
         label(ui, 1368, 356, 16, "   Backspace resets seat/cam | T hides tutorial.", true);
     }
 
-    // Integrated Cockpit KAP-140 2-Axis Autopilot Strip (powered by Master + Avionics bus, drives real 3D yoke/trim!)
-    if (!ui.jsb_state().on_ground && sys.get_master_battery() && sys.get_avionics_master()) {
+    // Integrated Study-Level 2-Axis Autopilot Strip (powered by AVN1 + TURN_COORD breakers, drives real 3D yoke/trim)
+    const bool ap_powered = !ui.jsb_state().on_ground &&
+                            sys.is_avionics_bus_powered(1) &&
+                            sys.is_circuit_powered(nspain::CB_TURN_COORD) &&
+                            sys.get_bus_volts() >= 19.5;
+    if (ap_powered) {
         auto &st = ui.state();
-        constexpr int ax = 1140, ay = 946;
-        panel(ui, {ax, ay, 752, 91});
-        label(ui, ax + 16, ay + 10, 15, "KAP-140 COCKPIT AUTOPILOT  (coupled to 3D Yoke & Trim)", true);
-        if (button(ui, {ax + 16, ay + 38, 82, 40}, st.ap_master ? "AP ON" : "AP OFF", true, st.ap_master)) {
+        constexpr int ax = 1044, ay = 946;
+        panel(ui, {ax, ay, 848, 91});
+        std::snprintf(line, sizeof(line),
+                      "2-AXIS COCKPIT AUTOPILOT  (%s | %s | Baro %.0f hPa)%s",
+                      st.ap_master ? "ACTIVE" : "STANDBY",
+                      st.ap_trim_annunc > 0 ? "TRIM UP" : (st.ap_trim_annunc < 0 ? "TRIM DN" : "Trim OK"),
+                      sys.get_baro_hpa(),
+                      st.ap_disconnect_warn_s > 0.0f ? "  |  AP DISC!" : "");
+        label(ui, ax + 16, ay + 10, 14, line, st.ap_disconnect_warn_s <= 0.0f);
+        if (button(ui, {ax + 14, ay + 38, 76, 40}, st.ap_master ? "AP ON" : "AP OFF", true, st.ap_master)) {
             st.ap_master = !st.ap_master;
+            st.ap_disconnect_warn_s = 0.0f;
             if (st.ap_master) {
                 st.ap_hdg_deg = std::round(st.heading_deg);
-                st.ap_alt_ft = std::round((st.alt_msl_m * 3.28084) / 100.0) * 100.0;
+                st.ap_rol_bank_deg = std::clamp(st.roll_deg, -22.0, 22.0);
+                if (!st.ap_vs_hold) st.ap_alt_ft = std::round(st.ind_alt_ft / 100.0) * 100.0;
             }
         }
+        if (button(ui, {ax + 96, ay + 38, 56, 40}, "ROL", true, st.ap_master && !st.ap_hdg_hold && !st.ap_nav_hold)) {
+            st.ap_hdg_hold = false; st.ap_nav_hold = false;
+            st.ap_rol_bank_deg = (std::abs(st.roll_deg) > 4.0) ? std::clamp(st.roll_deg, -22.0, 22.0) : 0.0;
+            st.ap_master = true;
+        }
         std::snprintf(line, sizeof(line), "HDG %03d", (int(std::round(st.ap_hdg_deg)) % 360 + 360) % 360);
-        if (button(ui, {ax + 108, ay + 38, 108, 40}, line, true, st.ap_master && st.ap_hdg_hold && !st.ap_nav_hold)) {
+        if (button(ui, {ax + 158, ay + 38, 92, 40}, line, true, st.ap_master && st.ap_hdg_hold && !st.ap_nav_hold)) {
             st.ap_hdg_hold = true;
             st.ap_nav_hold = false;
             st.ap_master = true;
         }
-        if (button(ui, {ax + 222, ay + 38, 40, 40}, "-", true)) st.ap_hdg_deg = std::fmod(st.ap_hdg_deg + 350.0, 360.0);
-        if (button(ui, {ax + 268, ay + 38, 40, 40}, "+", true)) st.ap_hdg_deg = std::fmod(st.ap_hdg_deg + 10.0, 360.0);
+        if (button(ui, {ax + 256, ay + 38, 36, 40}, "-", true)) st.ap_hdg_deg = std::fmod(st.ap_hdg_deg + 350.0, 360.0);
+        if (button(ui, {ax + 296, ay + 38, 36, 40}, "+", true)) st.ap_hdg_deg = std::fmod(st.ap_hdg_deg + 10.0, 360.0);
 
-        std::snprintf(line, sizeof(line), "ALT %.0f", st.ap_alt_ft);
-        if (button(ui, {ax + 322, ay + 38, 120, 40}, line, true, st.ap_master && st.ap_alt_hold)) {
-            st.ap_alt_hold = !st.ap_alt_hold;
-            st.ap_master = true;
-        }
-        if (button(ui, {ax + 448, ay + 38, 42, 40}, "-5", true)) st.ap_alt_ft = std::max(1500.0, st.ap_alt_ft - 500.0);
-        if (button(ui, {ax + 496, ay + 38, 42, 40}, "+5", true)) st.ap_alt_ft = std::min(13500.0, st.ap_alt_ft + 500.0);
-
-        if (button(ui, {ax + 552, ay + 38, 184, 40},
-                   st.ap_nav_valid ? (st.ap_nav_hold ? "NAV: TRACKING" : "NAV: DIRECT WP") : "NAV: NO ROUTE",
-                   st.ap_nav_valid, st.ap_master && st.ap_nav_hold && st.ap_nav_valid)) {
+        const bool vor1_valid = (sys.get_nav_to_from(1) != 0);
+        const bool nav_ready = st.ap_nav_source ? vor1_valid : st.ap_nav_valid;
+        if (button(ui, {ax + 340, ay + 38, 126, 40},
+                   st.ap_nav_source ? (vor1_valid ? "NAV:VOR1" : "VOR1 NONE")
+                                    : (st.ap_nav_valid ? "NAV:GPS" : "GPS NONE"),
+                   nav_ready, st.ap_master && st.ap_nav_hold && nav_ready)) {
             st.ap_nav_hold = !st.ap_nav_hold;
+            if (st.ap_nav_hold) st.ap_hdg_hold = false;
             st.ap_master = true;
         }
+
+        std::snprintf(line, sizeof(line), st.ap_vs_hold ? "VS %+4.0f" : (st.ap_alt_arm ? "ARM %.0f" : "ALT %.0f"),
+                      st.ap_vs_hold ? st.ap_vs_fpm : st.ap_alt_ft);
+        if (button(ui, {ax + 474, ay + 38, 114, 40}, line, true, st.ap_master && (st.ap_alt_hold || st.ap_vs_hold))) {
+            st.ap_alt_hold = !st.ap_alt_hold;
+            st.ap_vs_hold = !st.ap_alt_hold;
+            if (st.ap_vs_hold) st.ap_vs_fpm = std::clamp(std::round((st.vsi_mps * 196.85) / 100.0) * 100.0, -1500.0, 1200.0);
+            st.ap_master = true;
+        }
+        if (button(ui, {ax + 594, ay + 38, 60, 40}, st.ap_vs_hold ? "VS-1" : "-500", true)) {
+            if (st.ap_vs_hold) st.ap_vs_fpm = std::max(-1500.0, st.ap_vs_fpm - 100.0);
+            else st.ap_alt_ft = std::max(1000.0, st.ap_alt_ft - 500.0);
+        }
+        if (button(ui, {ax + 658, ay + 38, 60, 40}, st.ap_vs_hold ? "VS+1" : "+500", true)) {
+            if (st.ap_vs_hold) st.ap_vs_fpm = std::min(1200.0, st.ap_vs_fpm + 100.0);
+            else st.ap_alt_ft = std::min(14500.0, st.ap_alt_ft + 500.0);
+        }
+        if (button(ui, {ax + 724, ay + 38, 110, 40}, st.ap_alt_arm ? "ARM ON" : "ALT ARM", true, st.ap_alt_arm)) {
+            st.ap_alt_arm = !st.ap_alt_arm;
+        }
+    } else if (!ui.jsb_state().on_ground && ui.state().ap_disconnect_warn_s > 0.0f) {
+        panel(ui, {1340, 946, 552, 64});
+        label(ui, 1364, 968, 17, "AUTOPILOT DISCONNECTED (Check Avionics / Turn Coord Breaker)");
     }
 
     if (ui.state().parking_brake && !ui.is_chocked_or_tied()) {

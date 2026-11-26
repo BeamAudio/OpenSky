@@ -541,18 +541,28 @@ PixelRect PlatformWindow::presentation_rect(int output_w, int output_h) const {
 
 bool PlatformWindow::save_framebuffer_png(const std::string &path, int width, int height) {
     if (width <= 0 || height <= 0) return false;
-    std::vector<uint8_t> pixels(static_cast<size_t>(width) * height * 3);
+    thread_local std::vector<uint8_t> pixels;
+    pixels.resize(static_cast<size_t>(width) * height * 3);
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
     glReadPixels(0, 0, width, height, GL_RGB, GL_UNSIGNED_BYTE, pixels.data());
-    // Flip vertically (OpenGL bottom-up -> PNG top-down)
+    // Flip vertically (OpenGL bottom-up -> PNG/PPM top-down)
     const size_t row_bytes = static_cast<size_t>(width) * 3;
-    std::vector<uint8_t> row(row_bytes);
+    thread_local std::vector<uint8_t> row;
+    row.resize(row_bytes);
     for (int y = 0; y < height / 2; y++) {
         uint8_t *a = pixels.data() + static_cast<size_t>(y) * row_bytes;
         uint8_t *b = pixels.data() + static_cast<size_t>(height - 1 - y) * row_bytes;
         std::memcpy(row.data(), a, row_bytes);
         std::memcpy(a, b, row_bytes);
         std::memcpy(b, row.data(), row_bytes);
+    }
+    if (path.size() >= 4 && path.compare(path.size() - 4, 4, ".ppm") == 0) {
+        FILE *fp = std::fopen(path.c_str(), "wb");
+        if (!fp) return false;
+        std::fprintf(fp, "P6\n%d %d\n255\n", width, height);
+        const bool ok = std::fwrite(pixels.data(), 1, pixels.size(), fp) == pixels.size();
+        std::fclose(fp);
+        return ok;
     }
     return stbi_write_png(path.c_str(), width, height, 3, pixels.data(), width * 3) != 0;
 }

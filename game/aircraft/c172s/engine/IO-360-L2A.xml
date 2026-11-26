@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- SPDX-License-Identifier: CC0-1.0 -->
-<piston_engine name="Lycoming IO-360-L2A">
+<piston_engine name="OpenSky Flat-4 360-L2A">
   <maxhp unit="HP">180</maxhp>
   <maxrpm>2700</maxrpm>
   <idlerpm>650</idlerpm>

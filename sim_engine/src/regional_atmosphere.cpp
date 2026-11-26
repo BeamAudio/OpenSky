@@ -342,8 +342,8 @@ void RegionalAtmosphere::live_weather_worker() {
             "https://api.open-meteo.com/v1/forecast?latitude=%.5f&longitude=%.5f"
             "&current=temperature_2m,relative_humidity_2m,dew_point_2m,precipitation,rain,showers,weather_code,cloud_cover,pressure_msl,wind_speed_10m,wind_direction_10m,wind_gusts_10m"
             "&wind_speed_unit=ms&timezone=UTC", lat, lon);
-        char cmd[1500];
-        std::snprintf(cmd, sizeof(cmd), "curl -sS -f -L --connect-timeout 3 --max-time 8 '%s' 2>/dev/null", url);
+        char cmd[1600];
+        std::snprintf(cmd, sizeof(cmd), "curl -sS -f -L --connect-timeout 3 --max-time 8 -A \"OpenSky-VFR/0.3 (+https://github.com/BeamAudio/OpenSky)\" '%s' 2>/dev/null", url);
         FILE *pipe = popen(cmd, "r");
         std::array<char, 8192> response{};
         size_t used = 0;

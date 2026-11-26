@@ -388,13 +388,18 @@ void PistonAircraftSystems::update_navigation(double lat_deg, double lon_deg, do
         double lon_deg;
         double elev_m;
     };
-    // Authentic Northern Spain / Aragón & Pyrenees VOR-DME navaids
+    // Authentic Northern Spain VOR-DME navaids (Aragon, Catalunya, Basque, Asturias, Galicia, Castilla y Leon)
     static constexpr VorStation VORS[] = {
         {"ZAR", 113.00, 41.6581, -1.0314, 265.0}, // Zaragoza VOR-DME
         {"HUE", 114.50, 42.0811, -0.3233, 538.0}, // Huesca-Pirineos VOR
         {"PPN", 112.30, 42.7344, -1.7022, 460.0}, // Pamplona VOR-DME
         {"GRA", 115.80, 42.2010,  0.3420, 620.0}, // Graus / Central Pyrenees VOR
         {"LLE", 113.60, 41.7290,  0.5360, 350.0}, // Lleida-Alguaire VOR
+        {"BLB", 115.90, 43.3040, -2.9360,  42.0}, // Bilbao VOR-DME
+        {"ASN", 112.50, 43.5530, -6.0340, 147.0}, // Asturias VOR-DME
+        {"STG", 116.40, 42.9270, -8.4250, 370.0}, // Santiago VOR-DME
+        {"VLL", 117.20, 41.7060, -4.8520, 846.0}, // Valladolid VOR-DME
+        {"TER", 112.70, 40.4090, -1.2190, 1015.0}, // Teruel / Southern Aragon VOR
     };
     constexpr double DEG2RAD = 3.14159265358979323846 / 180.0;
     constexpr double RAD2DEG = 180.0 / 3.14159265358979323846;

@@ -43,7 +43,7 @@ double bearing(double a_lat, double a_lon, double b_lat, double b_lon) {
 void AircraftSession::init(const PackReader &pack, std::filesystem::path profile_file) {
     AircraftPackage factory;
     factory.id = "c172s";
-    factory.name = "Cessna 172S";
+    factory.name = "OpenSky 172S";
     init(pack, std::move(profile_file), factory);
 }
 

@@ -214,7 +214,31 @@ void test_ownership_care_and_cold_start_systems() {
     for (int i = 0; i < 60; ++i) sys.update(taxi);
     assert(sys.get_carb_ice_level() < 0.01 && sys.get_engine_power_mult() > 0.95);
 
-    std::cout << "[PASS] C172S ownership care: cold-and-dark start, pitot cover, cold wear, mag-drop fouling, sump sputter & low oil\n";
+    // Northern Spain VOR-DME reception & circuit-breaker gating
+    sys.reset_to_running_default();
+    sys.tune_nav_standby(1, 116.40); // STG Santiago VOR
+    sys.swap_nav(1);
+    sys.set_nav_obs_deg(1, 360);
+    sys.update_navigation(42.850, -8.425, 1200.0); // ~4.6 NM south of STG
+    assert(sys.get_nav_ident(1) == "STG" && sys.get_nav_to_from(1) == 1 && sys.get_nav_dme_nm(1) > 2.0);
+    sys.set_breaker_pulled(CB_AVIONICS_BUS_1, true);
+    sys.update_navigation(42.850, -8.425, 1200.0);
+    assert(sys.get_nav_ident(1) == "---" && sys.get_nav_to_from(1) == 0);
+    sys.set_breaker_pulled(CB_AVIONICS_BUS_1, false);
+
+    // Flaps freeze immediately when CB_FLAPS is pulled
+    sys.set_flaps_target_deg(20.0);
+    C172EnvStep flap_step{};
+    flap_step.dt = 0.5;
+    sys.update(flap_step);
+    const double mid_flaps = sys.get_flaps_actual_deg();
+    assert(mid_flaps > 1.0 && mid_flaps < 20.0);
+    sys.set_breaker_pulled(CB_FLAPS, true);
+    sys.set_flaps_target_deg(30.0);
+    sys.update(flap_step);
+    assert(std::abs(sys.get_flaps_actual_deg() - mid_flaps) < 1e-6);
+
+    std::cout << "[PASS] C172S ownership care: cold-and-dark start, pitot cover, cold wear, mag-drop fouling, sump sputter, low oil, VORs & breakers\n";
 }
 
 } // namespace

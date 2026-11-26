@@ -842,9 +842,9 @@ def _build_c172_skin_textures() -> tuple[Image.Image, Image.Image, Image.Image]:
         draw.rectangle([int(W * 0.29), vy, int(W * 0.44), vy + int(H * 0.12)], outline=(48, 52, 58), width=3)
         draw.rectangle([int(W * 0.48), vy + 18, int(W * 0.55), vy + int(H * 0.10)], outline=(52, 56, 62), width=2)
         draw.ellipse([int(W * 0.225), vy + 46, int(W * 0.233), vy + 54], outline=(60, 64, 70), width=2)
-    # Crisp Spanish registration EC-VFR + Spanish flag stripe + SKYHAWK SP decal
+    # Crisp Spanish registration EC-VFR + Spanish flag stripe + OPENSKY 172 decal
     draw.text((int(W * 0.60), int(H * 0.155)), "EC-VFR", fill=(18, 32, 66), font=font_reg)
-    draw.text((int(W * 0.25), int(H * 0.22)), "SKYHAWK SP", fill=(180, 32, 36), font=font_sm)
+    draw.text((int(W * 0.25), int(H * 0.22)), "OPENSKY 172", fill=(180, 32, 36), font=font_sm)
     # Tiny Spanish civil flag decal near registration
     fx0, fy0 = int(W * 0.555), int(H * 0.172)
     draw.rectangle([fx0, fy0, fx0 + 54, fy0 + 9], fill=(190, 24, 30))
@@ -1279,14 +1279,14 @@ def build_c172s_exterior_glb(out_path: Path) -> None:
 
 
 # =============================================================================
-# STUDY-LEVEL 3D COCKPIT INSTRUMENT & AVIONICS TEXTURE BAKERS (CESSNA 172S)
+# STUDY-LEVEL 3D COCKPIT INSTRUMENT & AVIONICS TEXTURE BAKERS (OPENSKY 172S)
 # =============================================================================
 def _bake_gauge_dial_atlas() -> tuple[Image.Image, Image.Image, Image.Image]:
     """
     Bake 3 crisp high-resolution cockpit textures:
       1. 1536x1536 3x3 Steam Gauge Face Atlas (512px/dial: ASI, AI_Frame, ALT, TC, HDG_Frame, VSI, RPM, VOR, FUEL_OIL)
       2. 1024x512 Rotating Card Atlas (512px/card: Left=Attitude Horizon Ball Card, Right=Directional Gyro Compass Rose)
-      3. 1024x1536 Center Avionics Stack (Annunciator, GMA340 Audio, Garmin GNS430 GPS/NAV/COM, KX155A, GTX327)
+      3. 1024x1536 Center Avionics Stack (Annunciator, Audio, NAV/GPS 1, COM/NAV 2, 2-Axis AP, Mode C XPDR)
     """
     S = 512
     K = S / 340.0
@@ -1467,72 +1467,86 @@ def _bake_gauge_dial_atlas() -> tuple[Image.Image, Image.Image, Image.Image]:
         cd.text((hcx + math.cos(a) * 150, hcy + math.sin(a) * 150), t,
                 fill=(252, 204, 74) if t in ("N", "E", "S", "W") else (244, 246, 242), font=fc_md, anchor="mm")
 
-    # --- 3. CENTER AVIONICS STACK TEXTURE (1024x1536: Annunciator + GMA340 + GNS430 + KX155A + GTX327) ---
+    # --- 3. CENTER AVIONICS STACK TEXTURE (1024x1536: Annunciator + Audio + NAV/GPS1 + COM/NAV2 + 2-Axis AP + XPDR) ---
     av = Image.new("RGB", (1024, 1536), (22, 25, 30))
     ad = ImageDraw.Draw(av)
-    fa_lg = _load_font(56)
-    fa_md = _load_font(40)
-    fa_sm = _load_font(30)
-    fa_xs = _load_font(26)
-    # Top Annunciator Bar (0..128)
-    ad.rectangle([16, 16, 1008, 116], fill=(14, 16, 20), outline=(76, 82, 92), width=6)
+    fa_lg = _load_font(54)
+    fa_md = _load_font(36)
+    fa_sm = _load_font(28)
+    fa_xs = _load_font(23)
+
+    # Top Annunciator Bar (16..112)
+    ad.rectangle([16, 16, 1008, 112], fill=(14, 16, 20), outline=(76, 82, 92), width=6)
     for i, (lbl, col) in enumerate([("VOLTS", (62, 66, 72)), ("OIL P", (62, 66, 72)), ("FUEL", (62, 66, 72)), ("VAC", (62, 66, 72)), ("VFR OK", (52, 232, 118))]):
         x0 = 36 + i * 192
-        ad.rectangle([x0, 32, x0 + 176, 100], fill=(10, 12, 16), outline=(62, 68, 76), width=2)
-        ad.text((x0 + 88, 66), lbl, fill=col, font=fa_sm, anchor="mm")
+        ad.rectangle([x0, 30, x0 + 176, 98], fill=(10, 12, 16), outline=(62, 68, 76), width=2)
+        ad.text((x0 + 88, 64), lbl, fill=col, font=fa_sm, anchor="mm")
 
-    # GMA 340 Audio Panel (144..288)
-    ad.rectangle([16, 144, 1008, 288], fill=(28, 32, 38), outline=(82, 88, 98), width=6)
-    ad.text((132, 184), "GMA 340", fill=(222, 228, 236), font=fa_sm, anchor="mm")
+    # Audio Panel (132..264)
+    ad.rectangle([16, 132, 1008, 264], fill=(28, 32, 38), outline=(82, 88, 98), width=6)
+    ad.text((132, 168), "AUDIO SEL", fill=(222, 228, 236), font=fa_sm, anchor="mm")
     for i, lbl in enumerate(["COM1", "COM2", "NAV1", "MKR", "SPKR", "ICS"]):
         bx = 264 + i * 120
-        ad.rectangle([bx, 168, bx + 100, 260], fill=(18, 22, 26), outline=(98, 104, 114), width=4)
+        ad.rectangle([bx, 150, bx + 100, 240], fill=(18, 22, 26), outline=(98, 104, 114), width=4)
         if i in (0, 2, 5):
-            ad.rectangle([bx + 16, 180, bx + 84, 196], fill=(56, 242, 122))
-        ad.text((bx + 50, 228), lbl, fill=(222, 228, 236), font=fa_xs, anchor="mm")
+            ad.rectangle([bx + 16, 162, bx + 84, 178], fill=(56, 242, 122))
+        ad.text((bx + 50, 208), lbl, fill=(222, 228, 236), font=fa_xs, anchor="mm")
 
-    # GARMIN GNS 430 GPS / NAV / COM (312..876)
-    ad.rectangle([16, 312, 1008, 876], fill=(26, 30, 36), outline=(92, 100, 114), width=6)
-    ad.text((156, 348), "GNS 430", fill=(236, 242, 248), font=fa_sm, anchor="mm")
-    ad.rectangle([48, 384, 824, 792], fill=(8, 18, 28), outline=(112, 124, 140), width=6)
-    ad.rectangle([56, 392, 312, 784], fill=(10, 22, 36), outline=(52, 86, 116), width=4)
-    ad.text((184, 424), "COM", fill=(122, 206, 252), font=fa_sm, anchor="mm")
-    ad.text((184, 480), "123.50", fill=(80, 250, 150), font=fa_md, anchor="mm")
-    ad.text((184, 532), "118.40", fill=(184, 216, 236), font=fa_sm, anchor="mm")
-    ad.line([(64, 572), (304, 572)], fill=(52, 86, 116), width=4)
-    ad.text((184, 608), "VLOC", fill=(122, 206, 252), font=fa_sm, anchor="mm")
-    ad.text((184, 664), "114.50", fill=(80, 250, 150), font=fa_md, anchor="mm")
-    ad.text((184, 720), "LECI", fill=(252, 212, 82), font=fa_sm, anchor="mm")
-    # Right Moving Map Terrain + Magenta Pyrenees VFR Track!
-    ad.rectangle([324, 392, 816, 784], fill=(14, 34, 24))
-    ad.polygon([(340, 740), (436, 580), (550, 640), (680, 500), (804, 570), (804, 776), (340, 776)], fill=(34, 64, 38))
-    ad.line([(420, 750), (564, 584), (710, 448)], fill=(248, 72, 238), width=10)
-    ad.polygon([(564, 564), (544, 604), (584, 604)], fill=(252, 252, 252))
-    ad.text((688, 424), "ES-0205", fill=(252, 222, 88), font=fa_sm, anchor="mm")
-    ad.text((568, 754), "RNG 15 NM  GPS", fill=(92, 238, 252), font=fa_sm, anchor="mm")
-    # Softkeys on right bezel (shifted slightly up so lower 3D rotary knob stays clear of ENT)
+    # NAV / GPS 1 (282..834; lower corners clear of 3D knobs at x=84/940, y=812)
+    ad.rectangle([16, 282, 1008, 834], fill=(26, 30, 36), outline=(92, 100, 114), width=6)
+    ad.text((156, 316), "NAV / GPS 1", fill=(236, 242, 248), font=fa_sm, anchor="mm")
+    ad.rectangle([48, 348, 824, 756], fill=(8, 18, 28), outline=(112, 124, 140), width=6)
+    ad.rectangle([56, 356, 312, 748], fill=(10, 22, 36), outline=(52, 86, 116), width=4)
+    ad.text((184, 388), "COM", fill=(122, 206, 252), font=fa_sm, anchor="mm")
+    ad.text((184, 444), "123.50", fill=(80, 250, 150), font=fa_md, anchor="mm")
+    ad.text((184, 496), "118.40", fill=(184, 216, 236), font=fa_sm, anchor="mm")
+    ad.line([(64, 540), (304, 540)], fill=(52, 86, 116), width=4)
+    ad.text((184, 574), "VLOC", fill=(122, 206, 252), font=fa_sm, anchor="mm")
+    ad.text((184, 630), "114.50", fill=(80, 250, 150), font=fa_md, anchor="mm")
+    ad.text((184, 688), "HUE 14N", fill=(252, 212, 82), font=fa_xs, anchor="mm")
+    # Right Moving Map Terrain + VFR Track
+    ad.rectangle([324, 356, 816, 748], fill=(14, 34, 24))
+    ad.polygon([(340, 708), (436, 548), (550, 608), (680, 468), (804, 538), (804, 740), (340, 740)], fill=(34, 64, 38))
+    ad.line([(420, 718), (564, 552), (710, 416)], fill=(248, 72, 238), width=10)
+    ad.polygon([(564, 532), (544, 572), (584, 572)], fill=(252, 252, 252))
+    ad.text((688, 392), "ES-0205", fill=(252, 222, 88), font=fa_sm, anchor="mm")
+    ad.text((568, 720), "RNG 15 NM  GPS", fill=(92, 238, 252), font=fa_sm, anchor="mm")
     for ki, kl in enumerate(["RNG", "D->", "MENU", "CLR", "ENT"]):
-        ky = 388 + ki * 72
-        ad.rounded_rectangle([848, ky, 984, ky + 56], radius=10, fill=(38, 42, 50), outline=(118, 124, 134), width=4)
-        ad.text((916, ky + 28), kl, fill=(236, 240, 246), font=fa_sm, anchor="mm")
+        ky = 352 + ki * 68
+        ad.rounded_rectangle([848, ky, 984, ky + 52], radius=10, fill=(38, 42, 50), outline=(118, 124, 134), width=4)
+        ad.text((916, ky + 26), kl, fill=(236, 240, 246), font=fa_sm, anchor="mm")
 
-    # KX 155A NAV/COM 2 (904..1176)
-    ad.rectangle([16, 904, 1008, 1176], fill=(26, 30, 36), outline=(86, 92, 104), width=6)
-    ad.rectangle([52, 944, 972, 1080], fill=(22, 10, 8), outline=(96, 66, 60), width=4)
-    ad.text((276, 1012), "121.50   119.30", fill=(252, 114, 48), font=fa_md, anchor="mm")
-    ad.text((756, 1012), "113.00   108.90", fill=(252, 114, 48), font=fa_md, anchor="mm")
-    ad.text((512, 1128), "KX 155A   COM 2  /  NAV 2", fill=(214, 220, 230), font=fa_sm, anchor="mm")
+    # COM 2 / NAV 2 (852..1068)
+    ad.rectangle([16, 852, 1008, 1068], fill=(26, 30, 36), outline=(86, 92, 104), width=6)
+    ad.rectangle([140, 872, 884, 1004], fill=(22, 10, 8), outline=(96, 66, 60), width=4)
+    ad.text((322, 938), "121.50  119.30", fill=(252, 114, 48), font=fa_md, anchor="mm")
+    ad.text((702, 938), "113.00  108.90", fill=(252, 114, 48), font=fa_md, anchor="mm")
+    ad.text((512, 1038), "COM 2  /  NAV 2", fill=(214, 220, 230), font=fa_sm, anchor="mm")
 
-    # GTX 327 Digital Transponder (1204..1512)
-    ad.rectangle([16, 1204, 1008, 1512], fill=(26, 30, 36), outline=(86, 92, 104), width=6)
-    ad.rectangle([56, 1244, 676, 1392], fill=(20, 16, 10), outline=(112, 98, 66), width=4)
-    ad.text((156, 1316), "ALT", fill=(252, 208, 68), font=fa_md, anchor="mm")
-    ad.text((448, 1316), "7000", fill=(255, 222, 78), font=fa_lg, anchor="mm")
-    ad.text((840, 1316), "GTX 327\nVFR XPDR", fill=(218, 224, 234), font=fa_sm, anchor="mm", align="center")
+    # 2-Axis Digital Autopilot (1086..1294; OLED centered inside x=148..876 clear of x=84/940 y=1143 rotary knobs!)
+    ad.rectangle([16, 1086, 1008, 1294], fill=(24, 28, 34), outline=(92, 100, 114), width=6)
+    ad.rectangle([148, 1106, 876, 1236], fill=(12, 14, 10), outline=(116, 104, 68), width=4)
+    ad.text((224, 1138), "AP STBY", fill=(180, 186, 160), font=fa_sm, anchor="mm")
+    ad.text((438, 1138), "ROL", fill=(252, 206, 74), font=fa_sm, anchor="mm")
+    ad.text((612, 1138), "ARM", fill=(94, 238, 146), font=fa_sm, anchor="mm")
+    ad.text((776, 1138), "VS", fill=(252, 206, 74), font=fa_sm, anchor="mm")
+    ad.text((294, 1196), "HDG 160", fill=(252, 198, 66), font=fa_md, anchor="mm")
+    ad.text((662, 1196), "ALT 04500", fill=(252, 198, 66), font=fa_md, anchor="mm")
+    for ki, kl in enumerate(["AP", "HDG", "NAV", "VS", "ARM", "DN", "UP"]):
+        bx = 156 + ki * 102
+        ad.rounded_rectangle([bx, 1246, bx + 90, 1284], radius=6, fill=(38, 42, 50), outline=(118, 124, 134), width=2)
+        ad.text((bx + 45, 1265), kl, fill=(230, 236, 242), font=fa_xs, anchor="mm")
+
+    # Digital Mode C VFR Transponder (1312..1516; clear of x=940, y=1447 rotary knob)
+    ad.rectangle([16, 1312, 1008, 1516], fill=(26, 30, 36), outline=(86, 92, 104), width=6)
+    ad.rectangle([148, 1328, 704, 1424], fill=(20, 16, 10), outline=(112, 98, 66), width=4)
+    ad.text((238, 1376), "ALT", fill=(252, 208, 68), font=fa_md, anchor="mm")
+    ad.text((488, 1376), "7000", fill=(255, 222, 78), font=fa_lg, anchor="mm")
+    ad.text((848, 1376), "MODE C\nVFR XPDR", fill=(218, 224, 234), font=fa_xs, anchor="mm", align="center")
     for i in range(8):
-        bx = 56 + i * 116
-        ad.rectangle([bx, 1416, bx + 96, 1484], fill=(42, 46, 54), outline=(118, 124, 134), width=2)
-        ad.text((bx + 48, 1450), str(i), fill=(242, 244, 248), font=fa_sm, anchor="mm")
+        bx = 56 + i * 100
+        ad.rectangle([bx, 1440, bx + 84, 1498], fill=(42, 46, 54), outline=(118, 124, 134), width=2)
+        ad.text((bx + 42, 1469), str(i), fill=(242, 244, 248), font=fa_xs, anchor="mm")
 
     return atlas, cards, av
 
@@ -1626,7 +1640,7 @@ def _bake_cockpit_panel_face_pbr(
     draw.rounded_rectangle([pl_x0, pl_y0, pl_x1, pl_y1], radius=4, fill=(18, 20, 24), outline=(156, 162, 170), width=2)
     draw.rectangle([pl_x0 + 4, pl_y0 + 4, pl_x0 + 146, pl_y1 - 4], fill=(172, 28, 30))
     draw.text((pl_x0 + 75, (pl_y0 + pl_y1) // 2), "EC-VFR", fill=(250, 250, 246), font=f_md, anchor="mm")
-    draw.text(((pl_x0 + 152 + pl_x1) // 2, (pl_y0 + pl_y1) // 2), "CESSNA 172S SKYHAWK SP  •  VNE 163  VA 105  VFE 85 KT", fill=(236, 240, 246), font=f_sm, anchor="mm")
+    draw.text(((pl_x0 + 152 + pl_x1) // 2, (pl_y0 + pl_y1) // 2), "OPENSKY 172S TRAINER  •  VNE 163  VA 105  VFE 85 KT", fill=(236, 240, 246), font=f_sm, anchor="mm")
 
     # Lower Switch Bar Silkscreen Labels (cleanly spaced over 3D Ignition, Master, Toggles & Circuit Breakers!)
     draw.text((px(-0.422), py(-0.118)), "MAGS", fill=(228, 234, 240), font=f_sw, anchor="mm")
@@ -1645,10 +1659,10 @@ def _bake_cockpit_panel_face_pbr(
     for fi, flbl in enumerate(["UP", "10", "20", "30"]):
         draw.text((px(0.296), py(-0.160 - fi * 0.014)), flbl, fill=(230, 236, 244), font=f_xs, anchor="lm")
 
-    # Co-Pilot Side Panel: Brushed Skyhawk SP Emblem (positioned cleanly below curved glareshield brow!)
+    # Co-Pilot Side Panel: Brushed Trainer Emblem (positioned cleanly below curved glareshield brow!)
     draw.rounded_rectangle([px(0.515), py(0.112), px(0.825), py(0.064)], radius=8, fill=(26, 30, 36), outline=(128, 136, 148), width=3)
-    draw.text((px(0.670), py(0.094)), "SKYHAWK  SP", fill=(240, 244, 250), font=f_lg, anchor="mm")
-    draw.text((px(0.670), py(0.074)), "180 HP  •  LYCOMING IO-360", fill=(200, 208, 220), font=f_sm, anchor="mm")
+    draw.text((px(0.670), py(0.094)), "OPENSKY  172S", fill=(240, 244, 250), font=f_lg, anchor="mm")
+    draw.text((px(0.670), py(0.074)), "180 HP  •  FLAT-4 360", fill=(200, 208, 220), font=f_sm, anchor="mm")
     # Digital Davtron-style OAT / Volts / UTC Mini Display
     draw.rounded_rectangle([px(0.515), py(0.054), px(0.648), py(0.006)], radius=6, fill=(10, 14, 18), outline=(104, 112, 124), width=3)
     draw.text((px(0.581), py(0.039)), "OAT +16C  28.2V", fill=(255, 194, 64), font=f_sm, anchor="mm")
@@ -2124,8 +2138,99 @@ def verify_glb(path: Path, expected_nodes: list[str] | None = None) -> tuple[int
     return n_nodes, n_meshes, n_prims, n_tris
 
 
+def _cockpit_panel_layout():
+    """Shared panel geometry constants for cockpit mesh export and texture refresh."""
+    G_R = 0.047
+    ROW_TOP, ROW_BOT = 0.068, -0.042
+    COL_L, COL_C, COL_R, COL_E = -0.228, -0.114, 0.000, 0.114
+    all_gauges = [
+        (COL_L, ROW_TOP, G_R), (COL_C, ROW_TOP, G_R), (COL_R, ROW_TOP, G_R), (COL_E, ROW_TOP, G_R),
+        (COL_L, ROW_BOT, G_R), (COL_C, ROW_BOT, G_R), (COL_R, ROW_BOT, G_R), (COL_E, ROW_BOT, G_R),
+        (-0.352, ROW_TOP, 0.039), (-0.352, ROW_BOT, 0.039),
+    ]
+    av_rect = (0.214, 0.482, -0.102, 0.140)
+    PX0, PX1, PY0, PY1 = -0.58, 0.86, -0.23, 0.175
+
+    def glareshield_brow_y_world(x_m: float) -> float:
+        pilot_dome = 0.022 / (1.0 + math.exp((x_m - 0.19) * 14.0))
+        edge_tuck = -0.012 * ((max(0.0, abs(x_m - 0.14) - 0.52) / 0.25) ** 2)
+        return -0.168 + pilot_dome + edge_tuck
+
+    return G_R, ROW_TOP, ROW_BOT, COL_L, COL_C, COL_R, COL_E, all_gauges, av_rect, PX0, PX1, PY0, PY1, glareshield_brow_y_world
+
+
+def refresh_cockpit_glb_textures(glb_path: Path) -> None:
+    """Replace PanelFace2K and AvionicsStack PNGs inside an existing cockpit GLB without Blender."""
+    raw = glb_path.read_bytes()
+    magic, version, _ = struct.unpack_from("<III", raw, 0)
+    assert magic == 0x46546C67 and version == 2, f"Not a valid GLB 2.0 file: {glb_path}"
+    json_len, json_type = struct.unpack_from("<II", raw, 12)
+    assert json_type == 0x4E4F534A
+    gltf = json.loads(raw[20:20 + json_len].decode("utf-8"))
+    bin_off = 20 + json_len
+    bin_len, bin_type = struct.unpack_from("<II", raw, bin_off)
+    assert bin_type == 0x004E4942
+    old_bin = raw[bin_off + 8:bin_off + 8 + bin_len]
+
+    _, _, av_tex = _bake_gauge_dial_atlas()
+    _, _, _, _, _, _, _, all_gauges, av_rect, PX0, PX1, PY0, PY1, brow_fn = _cockpit_panel_layout()
+    panel_alb, _, _ = _bake_cockpit_panel_face_pbr(PX0, PX1, PY0, PY1, all_gauges, av_rect, lambda x: brow_fn(x) + 0.312)
+
+    replacements: dict[int, bytes] = {}
+    for mat in gltf.get("materials", []):
+        name = mat.get("name", "")
+        bc = mat.get("pbrMetallicRoughness", {}).get("baseColorTexture", {}).get("index")
+        if bc is None:
+            continue
+        img_idx = gltf["textures"][bc]["source"]
+        img_obj = gltf["images"][img_idx]
+        bv_idx = img_obj["bufferView"]
+        buf = io.BytesIO()
+        if name == "PanelFace2K":
+            panel_alb.save(buf, format="PNG")
+            replacements[bv_idx] = buf.getvalue()
+        elif name == "AvionicsStack":
+            av_tex.save(buf, format="PNG")
+            replacements[bv_idx] = buf.getvalue()
+    assert len(replacements) == 2, f"Expected PanelFace2K and AvionicsStack in {glb_path}, got {list(replacements)}"
+
+    new_bin = bytearray()
+    for bv_idx, bv in enumerate(gltf["bufferViews"]):
+        if bv_idx in replacements:
+            chunk = replacements[bv_idx]
+        else:
+            o = bv.get("byteOffset", 0)
+            chunk = old_bin[o:o + bv["byteLength"]]
+        while len(new_bin) % 4 != 0:
+            new_bin.append(0)
+        bv["byteOffset"] = len(new_bin)
+        bv["byteLength"] = len(chunk)
+        new_bin.extend(chunk)
+    while len(new_bin) % 4 != 0:
+        new_bin.append(0)
+    gltf["buffers"][0]["byteLength"] = len(new_bin)
+
+    jb = json.dumps(gltf, separators=(",", ":")).encode("utf-8")
+    while len(jb) % 4 != 0:
+        jb += b" "
+    total = 12 + 8 + len(jb) + 8 + len(new_bin)
+    glb_path.write_bytes(
+        struct.pack("<III", 0x46546C67, 2, total)
+        + struct.pack("<II", len(jb), 0x4E4F534A)
+        + jb
+        + struct.pack("<II", len(new_bin), 0x004E4942)
+        + bytes(new_bin)
+    )
+
+
 def main() -> None:
     import sys
+    if "--refresh-cockpit-textures" in sys.argv:
+        ckp = MODELS_DIR / "aircraft" / "c172s_cockpit.glb"
+        refresh_cockpit_glb_textures(ckp)
+        nn, nm, npr, nt = verify_glb(ckp, None)
+        print(f"  [REFRESHED] {str(ckp.relative_to(ROOT)):44s} | {ckp.stat().st_size // 1024:4d} KB | nodes={nn:2d} surfs={npr:2d} tris={nt:5d}")
+        return
     aircraft_only = "--aircraft-only" in sys.argv
     cockpit_only = "--cockpit-only" in sys.argv
     ac = MODELS_DIR / "aircraft"

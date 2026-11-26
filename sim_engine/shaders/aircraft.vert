@@ -29,22 +29,21 @@ void main() {
     vec3 acp = (u_ac_node * vec4(a_pos, 1.0)).xyz;
     float max_d = max(max(u_dmg_zones.x, u_dmg_zones.w), max(u_dmg_zones.y, u_dmg_zones.z));
     if (max_d > 0.015 && (u_dmg_extra.w < 0.5 || abs(acp.x) > 0.85 || acp.z < -1.05)) {
-        float w_nose = smoothstep(-0.65, -1.65, acp.z) * u_dmg_zones.x;
-        float w_wl   = smoothstep(-0.75, -3.20, acp.x) * u_dmg_zones.y;
-        float w_wr   = smoothstep( 0.75,  3.20, acp.x) * u_dmg_zones.z;
-        float w_tail = smoothstep( 1.75,  4.10, acp.z) * u_dmg_zones.w;
-        float w_bel  = smoothstep(-0.18, -0.75, acp.y) * u_dmg_extra.x * 0.45;
-        float w = clamp(w_nose + w_wl + w_wr + w_tail + w_bel, 0.0, 1.35);
+        float w_nose = smoothstep(-1.45, -3.45, acp.z) * u_dmg_zones.x;
+        float w_wl   = smoothstep(-0.75, -4.40, acp.x) * u_dmg_zones.y;
+        float w_wr   = smoothstep( 0.75,  4.40, acp.x) * u_dmg_zones.z;
+        float w_tail = smoothstep( 1.75,  3.75, acp.z) * u_dmg_zones.w;
+        float w_bel  = smoothstep(-0.22, -1.05, acp.y) * u_dmg_extra.x * 0.60;
+        float w = clamp(w_nose + w_wl + w_wr + w_tail + w_bel, 0.0, 1.50);
         if (w > 0.005) {
-            float d1 = dmg_wave(acp * 1.15);
-            float d2 = dmg_wave(acp * 2.60 + vec3(1.7, 0.9, 2.3));
-            float crumple = (0.45 + 0.55 * abs(d1)) * w * 0.14;
-            vec3 inward = normalize(vec3(-acp.x * 0.45, (acp.y < 0.0 ? 0.55 : -0.35), (acp.z < 0.0 ? 0.40 : -0.30)) + 1e-4);
-            // Wingtip upward curl / leading-edge crush
-            inward.y += (w_wl + w_wr) * 0.45;
-            vec3 disp_ac = inward * crumple + vec3(d1, d2, d1 * 0.7) * (0.045 * w);
+            float d1 = dmg_wave(acp * 1.35);
+            float d2 = dmg_wave(acp * 3.10 + vec3(1.7, 0.9, 2.3));
+            float crumple = (0.48 + 0.52 * abs(d1)) * w * 0.24;
+            vec3 inward = normalize(vec3(-acp.x * 0.48, (acp.y < 0.0 ? 0.65 : -0.35), (acp.z < -0.5 ? 0.55 : -0.35)) + 1e-4);
+            inward.y += (w_wl + w_wr) * 0.55;
+            vec3 disp_ac = inward * crumple + vec3(d1, d2, d1 * 0.7) * (0.075 * w);
             lp += transpose(mat3(u_ac_node)) * disp_ac;
-            ln = normalize(ln + vec3(d2, d1, d2 - d1) * (0.48 * w));
+            ln = normalize(ln + vec3(d2, d1, d2 - d1) * (0.62 * w));
         }
     }
     vec4 wp = u_model * vec4(lp, 1.0);

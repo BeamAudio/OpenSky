@@ -104,74 +104,109 @@ vec3 rain_hash32(vec2 p) {
     return fract((p3.xxy + p3.yzz) * p3.zyx);
 }
 
-// Analytical pinned micro-beads that appear, bead up, and clear organically (zero wallpaper scrolling).
-// Returns xy = dome normal, z = bead mask, w = dome height.
-vec4 rain_static_beads(vec2 uv, float scale, float t, float dens) {
+// Stochastic falling raindrop impacts across the entire windshield: droplets strike random (x, y)
+// spots out of the air, quiver briefly on impact, then streak along airflow (+y airborne, -y gravity).
+// Returns xy = dome normal, z = drop mask, w = relief / wake.
+vec4 rain_static_beads(vec2 uv, float scale, float t, float dens, float sign_y, float air01) {
     vec2 st = uv * scale;
     vec2 id = floor(st);
     vec2 gv = fract(st) - 0.5;
-    vec3 h = rain_hash32(id);
-    if (h.x > dens) return vec4(0.0);
-    float cycle = fract(t * (0.032 + 0.055 * h.z) + h.y * 11.37);
-    float life = smoothstep(0.0, 0.09, cycle) * smoothstep(1.0, 0.74, cycle);
-    if (life < 0.01) return vec4(0.0);
-    vec2 jitter = (h.xy - 0.5) * 0.56;
-    vec2 dvec = gv - jitter;
-    float r = mix(0.085, 0.185, h.z * h.z) * (0.55 + 0.45 * life);
-    float dist = length(dvec);
-    float aa = max(0.014, fwidth(dist) * 1.25);
-    float m = smoothstep(r + aa, r - aa, dist) * life;
-    if (m < 0.005) return vec4(0.0);
-    vec2 nrm = clamp(dvec / max(r, 1e-4), vec2(-1.0), vec2(1.0));
-    float h_dome = sqrt(max(0.0, 1.0 - dot(nrm, nrm)));
-    return vec4(nrm * m, m, h_dome * m);
+
+    vec2 best_n = vec2(0.0);
+    float best_m = 0.0;
+    float best_h = 0.0;
+    float stretch = mix(1.02, 1.55, air01);
+
+    for (int k = 0; k < 2; ++k) {
+        vec2 off = vec2(0.0, float(k) * sign_y);
+        vec2 cid = id - off;
+        vec2 lgv = gv + off;
+        vec3 h = rain_hash32(cid + vec2(scale * 7.31, 1.93));
+        if (h.x > dens) continue;
+
+        float phase = t * mix(1.05, 2.35, h.z) + h.y * 31.7;
+        float epoch = floor(phase);
+        float c = fract(phase);
+        vec3 rnd = rain_hash32(cid + vec2(epoch * 13.7, epoch * 29.1));
+        if (rnd.x > dens) continue;
+
+        float fade = smoothstep(0.0, 0.03, c) * smoothstep(1.0, 0.56, c);
+        if (fade < 0.01) continue;
+
+        vec2 p0 = (rnd.yz - 0.5) * vec2(0.68, 0.54);
+        float move_u = pow(max(0.0, c - 0.12) / 0.88, 1.75);
+        float run_len = mix(0.28, 0.88, air01) * (0.50 + 0.70 * h.y);
+        float cur_y = p0.y + sign_y * move_u * run_len;
+        float cur_x = p0.x + 0.055 * sin(c * 14.0 + h.z * 6.2831) * move_u;
+
+        // Crisp leading impact droplet head
+        float r = mix(0.068, 0.128, h.z * h.z) * (0.68 + 0.32 * smoothstep(0.0, 0.15, c));
+        vec2 hd = lgv - vec2(cur_x, cur_y);
+        hd.y /= stretch;
+        float dist = length(hd);
+        float aa = max(0.014, fwidth(dist) * 1.25);
+        float m_head = smoothstep(r + aa, r - aa, dist) * fade;
+        vec2 n_head = clamp(hd / max(r, 1e-4), vec2(-1.0), vec2(1.0));
+
+        // Slender wet micro-trail left directly behind moving impact droplet
+        float span = abs(cur_y - p0.y);
+        float lo_y = min(p0.y, cur_y);
+        float hi_y = max(p0.y, cur_y);
+        float in_tr = smoothstep(lo_y - 0.02, lo_y + 0.04, lgv.y) * smoothstep(hi_y + 0.02, hi_y - 0.04, lgv.y);
+        float tr_t = clamp((lgv.y - p0.y) * sign_y / max(span, 1e-4), 0.0, 1.0);
+        float tr_x = mix(p0.x, cur_x, tr_t);
+        float r_tr = r * mix(0.22, 0.42, tr_t);
+        float m_tr = smoothstep(r_tr + aa, r_tr - aa, abs(lgv.x - tr_x)) * in_tr * step(0.04, span) * fade * 0.65;
+        vec2 n_tr = vec2(clamp((lgv.x - tr_x) / max(r_tr, 1e-4), -1.0, 1.0), 0.0) * 0.65;
+
+        float m = max(m_head, m_tr);
+        if (m > best_m) {
+            best_m = m;
+            best_n = mix(n_tr, n_head, m_head) * m;
+            best_h = sqrt(max(0.0, 1.0 - dot(n_head, n_head))) * m;
+        }
+    }
+    return vec4(best_n, best_m, best_h);
 }
 
-// Analytical meandering stick-slip rivulet layer with Rayleigh-Plateau beaded wake trail.
-// Flow always runs toward +uv.y inside this helper. Returns xy = normal, z = mask, w = cleared film wake.
+// Fine coalesced aerodynamic slipstream rivulet layer. Flow always runs toward +uv.y.
+// Returns xy = normal, z = mask, w = cleared film wake.
 vec4 rain_rivulet_layer(vec2 uv, float scale, float t, float dens, float stretch) {
-    const vec2 aspect = vec2(2.15, 1.0);
+    const vec2 aspect = vec2(2.6, 1.0);
     vec2 st = uv * scale * aspect;
-    st.y -= t * 0.28;
+    float col_x = floor(st.x);
+    float col_h = rain_hash11(col_x * 19.37 + scale * 3.7);
+    float col_spd = 0.90 + 0.60 * fract(col_h * 11.3);
+    st.y = st.y - t * col_spd + col_h * 17.0;
     vec2 id = floor(st);
-    float col_shift = rain_hash11(id.x * 19.37 + scale);
-    st.y += col_shift;
-    id = floor(st);
     vec2 gv = fract(st) - 0.5;
     vec3 h = rain_hash32(id + vec2(scale * 3.1, 0.0));
     if (h.x > dens) return vec4(0.0);
 
-    // Organic acrylic wiggle along the flow axis.
-    float w = (uv.y * scale + col_shift) * 3.1 + h.y * 6.2831;
-    float x = (h.z - 0.5) * 0.58;
-    x += (0.42 - abs(x)) * sin(3.0 * w) * pow(sin(w), 6.0) * 0.44;
+    float w = uv.y * scale * 2.4 + col_h * 6.2831;
+    float x = (h.z - 0.5) * 0.52 + 0.16 * sin(w + sin(w * 0.6));
+    float ti = t * (2.6 + 1.4 * h.y) + h.x * 6.2831;
+    float y = 0.08 * sin(ti);
 
-    // Stick-slip motion: drops pause, tremble, then surge forward instead of scrolling uniformly.
-    float ti = t * (0.68 + 0.52 * h.y) + h.x * 6.2831;
-    float y = -sin(ti + sin(ti + sin(ti) * 0.5)) * 0.37;
-    y -= (gv.x - x) * (gv.x - x) * 0.30;
-
-    // Leading drop head (slightly elongated along slipstream at cruise speed).
     vec2 head_d = (gv - vec2(x, y)) / aspect;
     head_d.y /= stretch;
-    float r_head = mix(0.024, 0.041, h.y);
+    float r_head = mix(0.022, 0.038, h.y);
     float d_head = length(head_d);
     float aa = max(0.005, fwidth(d_head) * 1.25);
     float m_head = smoothstep(r_head + aa, r_head - aa, d_head);
     vec2 n_head = clamp(head_d / max(r_head, 1e-4), vec2(-1.0), vec2(1.0)) * m_head;
 
-    // Beaded micro-droplet trail left behind the sliding head (only upstream of y).
-    float behind = smoothstep(y, y - 0.05, gv.y) * smoothstep(-0.49, y - 0.06, gv.y);
-    float trail_sub = (fract(gv.y * 8.0 + h.z * 3.7) - 0.5) / 8.0;
-    vec2 trail_d = vec2(gv.x - x, trail_sub) / aspect;
+    float behind = smoothstep(y + 0.01, y - 0.04, gv.y) * smoothstep(-0.49, y - 0.08, gv.y);
+    float wake_x = x + 0.07 * sin(gv.y * 16.0 + col_h * 9.0);
+    float trail_sub = (fract(gv.y * 5.0 + h.z * 3.7) - 0.5) / 5.0;
+    vec2 trail_d = vec2(gv.x - wake_x, trail_sub) / aspect;
     float taper = clamp((gv.y + 0.5) / max(0.08, y + 0.5), 0.0, 1.0);
-    float r_trail = r_head * mix(0.24, 0.48, taper);
+    float r_trail = r_head * mix(0.24, 0.52, taper);
     float d_trail = length(trail_d);
     float m_trail = smoothstep(r_trail + aa, r_trail - aa, d_trail) * behind;
-    vec2 n_trail = clamp(trail_d / max(r_trail, 1e-4), vec2(-1.0), vec2(1.0)) * m_trail * 0.72;
+    vec2 n_trail = clamp(trail_d / max(r_trail, 1e-4), vec2(-1.0), vec2(1.0)) * m_trail * 0.78;
 
-    // Wiped clear channel behind the moving head.
-    float wipe = behind * smoothstep(r_head * 1.35, r_head * 0.35, abs(gv.x - x) / aspect.x);
+    float wipe = behind * smoothstep(r_head * 1.65, r_head * 0.35, abs(gv.x - wake_x) / aspect.x);
 
     float m = max(m_head, m_trail);
     vec2 nrm = mix(n_trail, n_head, m_head);
@@ -325,46 +360,45 @@ void main() {
         float wipe_clear = 0.0;
         if (wet > 0.005) {
             float air01 = smoothstep(4.5, 24.0, airspeed);
-            float rain_dens = clamp(0.18 + 0.52 * wet + 0.30 * heavy_rain, 0.0, 0.96);
-            float stretch = mix(1.06, 1.65, air01);
+            float rain_dens = clamp(0.22 + 0.50 * wet + 0.28 * heavy_rain, 0.0, 0.96);
+            float stretch = mix(1.08, 1.90, air01);
             vec2 flow_uv;
             float slide_t;
-            float nrm_flip_y = 1.0;
+            float sign_y = 1.0;
             bool rot_side = false;
             if (front_glass) {
-                // Propwash & slipstream fan droplets UP and slightly OUTWARD from the cowl in flight;
-                // gravity creeps drops slowly DOWNWARD when parked or taxiing.
-                float fan = (v_uv.x - 0.5) * 0.24 * air01;
+                // Propwash & slipstream fan droplets radially upward & outward from cowling when flying;
+                // gravity trickles freshly landed raindrops downward when parked/taxiing.
+                float fan = (v_uv.x - 0.5) * 0.28 * air01;
                 flow_uv = vec2((v_uv.x - 0.5) * 1.68 - fan * (1.0 - v_uv.y), 1.0 - v_uv.y);
-                float slide_v = mix(-0.22, 0.42 + min(airspeed, 90.0) * 0.022, air01);
-                if (slide_v < 0.0) {
-                    flow_uv.y = -flow_uv.y;
-                    nrm_flip_y = -1.0;
-                }
-                slide_t = sim_time * abs(slide_v);
+                sign_y = (air01 < 0.25) ? -1.0 : 1.0;
+                slide_t = sim_time * (0.95 + min(airspeed, 95.0) * 0.040 * air01);
             } else {
-                // Side windows: slipstream sweeps droplets AFT (+v_uv.x) with slight gravity droop at low speed.
-                float droop = mix(0.58, 0.06, air01);
+                // Side windows: falling impacts trickle down on ground, sweep aft with droop in flight.
+                float droop = mix(0.65, 0.06, air01);
                 flow_uv = vec2((v_uv.y - 0.5) - v_uv.x * droop, v_uv.x * 1.32 + v_uv.y * (1.0 - air01) * 0.42);
-                slide_t = sim_time * mix(0.20, 0.46 + min(airspeed, 90.0) * 0.024, air01);
+                sign_y = 1.0;
+                slide_t = sim_time * mix(0.40, 1.05 + min(airspeed, 95.0) * 0.044, air01);
                 rot_side = true;
             }
-            vec4 st0 = rain_static_beads(flow_uv, front_glass ? 28.0 : 30.0, sim_time, rain_dens * 0.82);
-            vec4 st1 = rain_static_beads(flow_uv + vec2(0.37, 0.61), front_glass ? 50.0 : 52.0, sim_time * 1.25 + 3.1, rain_dens * 0.68);
-            vec4 rv0 = rain_rivulet_layer(flow_uv, front_glass ? 4.8 : 5.8, slide_t, rain_dens * 0.85, stretch);
-            vec4 rv1 = rain_rivulet_layer(flow_uv + vec2(0.43, 0.19), front_glass ? 8.2 : 9.6, slide_t * 1.18 + 2.3, rain_dens * 0.65, stretch * 0.92);
+            float imp_dens = rain_dens * mix(0.88, 0.72, air01);
+            vec4 st0 = rain_static_beads(flow_uv, front_glass ? 19.0 : 21.0, sim_time, imp_dens, sign_y, air01);
+            vec4 st1 = rain_static_beads(flow_uv + vec2(0.37, 0.61), front_glass ? 32.0 : 35.0, sim_time * 1.28 + 3.1, imp_dens * 0.92, sign_y, air01);
+            vec4 st2 = rain_static_beads(flow_uv + vec2(0.73, 0.17), front_glass ? 48.0 : 52.0, sim_time * 1.55 + 7.4, imp_dens * 0.80, sign_y, air01);
+            vec4 rv0 = rain_rivulet_layer(flow_uv, front_glass ? 11.5 : 13.0, slide_t, rain_dens * 0.42 * air01, stretch);
+            vec4 rv1 = rain_rivulet_layer(flow_uv + vec2(0.43, 0.19), front_glass ? 18.0 : 20.0, slide_t * 1.24 + 2.3, rain_dens * 0.36 * air01, stretch * 0.92);
 
-            float m_st = max(st0.z, st1.z * 0.88);
-            vec2 n_st = mix(st1.xy * 0.82, st0.xy, st0.z);
-            float m_rv = max(rv0.z, rv1.z * 0.90);
-            vec2 n_rv = mix(rv1.xy * 0.88, rv0.xy, rv0.z);
+            float m_st = max(max(st0.z, st1.z * 0.88), st2.z * 0.72);
+            vec2 n_st = mix(mix(st2.xy * 0.70, st1.xy * 0.86, st1.z), st0.xy, st0.z);
+            float m_rv = max(rv0.z, rv1.z * 0.88);
+            vec2 n_rv = mix(rv1.xy * 0.86, rv0.xy, rv0.z);
+            float rv_wipe = max(rv0.w, rv1.w * 0.80);
 
-            drop_mask = clamp(max(m_rv, m_st * (1.0 - rv0.w * 0.65)), 0.0, 1.0) * wet;
-            vec2 n_flow = mix(n_st, n_rv, m_rv);
-            // Convert flow-aligned bead normal back to screen-aligned (right, up) optical normal.
-            drop_nrm = rot_side ? vec2(n_flow.y, -n_flow.x) : vec2(n_flow.x, n_flow.y * nrm_flip_y);
-            drop_relief = clamp(max(max(st0.w, st1.w * 0.75), m_rv * 0.95), 0.0, 1.0) * wet;
-            wipe_clear = clamp(max(rv0.w, rv1.w * 0.75), 0.0, 1.0);
+            drop_mask = clamp(max(m_st, m_rv * 0.92), 0.0, 1.0) * wet;
+            vec2 n_flow = mix(n_st, n_rv, clamp(m_rv * 1.25, 0.0, 1.0));
+            drop_nrm = rot_side ? vec2(n_flow.y, -n_flow.x) : n_flow;
+            drop_relief = clamp(max(max(st0.w, st1.w * 0.78), max(st2.w * 0.60, m_rv * 0.90)), 0.0, 1.0) * wet;
+            wipe_clear = clamp(rv_wipe, 0.0, 1.0);
         }
 
         // 2. Crystalline Frost / Rime Ice creeping inward from A-pillars & top frame, cleared by lower-center defroster!
@@ -492,6 +526,95 @@ void main() {
         rough = clamp(orm.g * u_pbr_factors.y * 1.15, 0.05, 0.96);
         metal = clamp(orm.b * max(0.65, u_pbr_factors.x * 2.0), 0.0, 1.0);
     }
+    // Resolution-independent 4K-equivalent object-space OpenSky aviation PBR livery, panel seams & rivets!
+    if (u_livery > 0.5 && u_is_interior < 0.5) {
+        vec3 p = v_ac_pos; // X=right, Y=up, Z=aft (nose ~ -3.7, tail ~ +3.7, wings +/-5.5)
+        float ax = abs(p.x);
+        float z = p.z;
+        float y = p.y;
+        float ao_base = clamp(dot(base, vec3(0.3333)), 0.55, 1.0);
+
+        // Crisp Matterhorn Pearl White clearcoat base
+        vec3 paint = vec3(0.92, 0.93, 0.95) * ao_base;
+        float liv_rough = 0.17;
+        float liv_metal = 0.07;
+
+        vec3 navy = vec3(0.032, 0.078, 0.175) * ao_base;
+        vec3 crimson = vec3(0.56, 0.045, 0.055) * ao_base;
+        vec3 gold = vec3(0.68, 0.50, 0.16) * ao_base;
+
+        // 1. Fuselage & Vertical Tail swept cheatline (Midnight Navy + Crimson Accent + Metallic Champagne Gold)
+        float on_body = smoothstep(1.02, 0.76, ax) * smoothstep(-3.60, -3.25, z) * smoothstep(3.75, 3.35, z);
+        float curve_y = -0.30 + 0.07 * sin(clamp((z + 2.8) * 0.65, 0.0, 3.6))
+                      + smoothstep(1.35, 3.25, z) * 0.62;
+        float dy = y - curve_y;
+        float fw_y = max(0.005, fwidth(dy) * 1.25);
+
+        float band_navy = smoothstep(-0.22 - fw_y, -0.22 + fw_y, dy) * smoothstep(0.02 + fw_y, 0.02 - fw_y, dy) * on_body
+                        * smoothstep(-3.42, -3.34, z);
+        float band_crim = smoothstep(0.035 - fw_y, 0.035 + fw_y, dy) * smoothstep(0.115 + fw_y, 0.115 - fw_y, dy) * on_body
+                        * smoothstep(-3.16, -3.08, z);
+        float band_gold = smoothstep(0.014 - fw_y, 0.014 + fw_y, dy) * smoothstep(0.034 + fw_y, 0.034 - fw_y, dy) * on_body
+                        * smoothstep(-3.36, -3.28, z);
+
+        // Tail fin sweeping crimson/navy flash
+        float on_fin = smoothstep(0.28, 0.14, ax) * smoothstep(1.85, 2.25, z) * smoothstep(0.12, 0.35, y);
+        float fin_line = (y - 0.18) - (z - 2.15) * 0.72;
+        float fw_f = max(0.006, fwidth(fin_line) * 1.25);
+        float fin_navy = smoothstep(-0.42 - fw_f, -0.42 + fw_f, fin_line) * smoothstep(-0.08 + fw_f, -0.08 - fw_f, fin_line) * on_fin;
+        float fin_crim = smoothstep(-0.06 - fw_f, -0.06 + fw_f, fin_line) * smoothstep( 0.16 + fw_f,  0.16 - fw_f, fin_line) * on_fin;
+
+        // Wingtip & Horizontal Stabilizer Navy + Gold aerodynamic tip bands
+        float on_wing = smoothstep(0.75, 0.95, ax) * smoothstep(0.10, 0.40, y) * smoothstep(1.20, 0.80, z);
+        float wt_navy = smoothstep(4.78, 4.82, ax) * on_wing;
+        float wt_gold = smoothstep(4.68, 4.70, ax) * smoothstep(4.78, 4.76, ax) * on_wing;
+        float stab_tip = smoothstep(1.25, 1.32, ax) * smoothstep(2.30, 2.55, z) * smoothstep(0.25, 0.05, abs(y - 0.15));
+
+        // Wheel-pant sleek lower navy fairing stripe
+        float on_pant = smoothstep(-0.72, -0.82, y);
+        float pant_navy = smoothstep(-1.02, -1.06, y) * on_pant;
+        float pant_gold = smoothstep(-0.98, -1.00, y) * smoothstep(-1.04, -1.02, y) * on_pant;
+
+        // Matte anti-glare charcoal top cowling in front of windshield
+        float glare_pad = smoothstep(-2.05, -2.18, z) * smoothstep(-3.60, -3.42, z)
+                        * smoothstep(0.08, 0.16, y) * smoothstep(0.42, 0.34, ax) * smoothstep(0.35, 0.65, nrm.y);
+
+        float m_navy = clamp(max(max(band_navy, fin_navy), max(max(wt_navy, stab_tip), pant_navy)), 0.0, 1.0);
+        float m_crim = clamp(max(band_crim, fin_crim), 0.0, 1.0);
+        float m_gold = clamp(max(max(band_gold, wt_gold), pant_gold), 0.0, 1.0);
+
+        paint = mix(paint, navy, m_navy);
+        paint = mix(paint, crimson, m_crim);
+        paint = mix(paint, gold, m_gold);
+        liv_rough = mix(liv_rough, 0.15, max(m_navy, m_crim));
+        liv_metal = mix(liv_metal, 0.72, m_gold);
+        liv_rough = mix(liv_rough, 0.22, m_gold);
+
+        paint = mix(paint, vec3(0.045, 0.048, 0.054) * ao_base, glare_pad);
+        liv_rough = mix(liv_rough, 0.78, glare_pad);
+
+        // Crisp anti-aliased riveted aluminum sheet-metal panel seams (zero pixelation at walkaround distance!)
+        float pz_grid = abs(fract(z / 0.64) - 0.5) * 0.64;
+        float px_grid = abs(fract(ax / 0.58) - 0.5) * 0.58;
+        float fw_z = max(0.0025, fwidth(z) * 1.15);
+        float fw_x = max(0.0025, fwidth(ax) * 1.15);
+        float seam_z = 1.0 - smoothstep(0.0025, 0.0025 + fw_z, pz_grid);
+        float seam_x = (1.0 - smoothstep(0.0025, 0.0025 + fw_x, px_grid)) * smoothstep(0.75, 0.95, ax);
+        float hinge_z = (1.0 - smoothstep(0.004, 0.004 + fw_z, abs(z - (-0.82)))) * on_wing;
+        float cowl_z = (1.0 - smoothstep(0.0035, 0.0035 + fw_z, abs(z - (-2.24)))) * on_body;
+        float seam = clamp(max(max(seam_z * 0.45, seam_x * 0.45), max(hinge_z * 0.85, cowl_z * 0.75)), 0.0, 0.85);
+        // Subtle rivet dimples running alongside panel seams
+        float riv_z = smoothstep(0.018, 0.008, abs(pz_grid - 0.022)) *
+                      (1.0 - smoothstep(0.003, 0.006, abs(fract(y * 16.0) - 0.5) / 16.0)) *
+                      smoothstep(0.012, 0.004, fw_z);
+        paint *= (1.0 - seam * 0.34 - riv_z * 0.14);
+        liv_rough = clamp(liv_rough + seam * 0.25, 0.08, 0.94);
+
+        base = paint;
+        rough = liv_rough;
+        metal = liv_metal;
+    }
+
     // Exterior / visible high-wing & cowling rime ice + wet rain sheen!
     float exposed_part = (u_is_interior < 0.5 || abs(v_obj_pos.x) > 0.65 || v_obj_pos.z < -0.95) ? 1.0 : 0.0;
     if (exposed_part > 0.5) {
@@ -509,31 +632,31 @@ void main() {
             metal *= (1.0 - rime * 0.88);
         }
         // Procedural exterior structural scratches, torn paint to bare aluminum, and engine scorch/oil soot
-        float z_nose = smoothstep(-0.55, -1.55, v_ac_pos.z) * u_dmg_zones.x;
-        float z_wl   = smoothstep(-0.65, -3.00, v_ac_pos.x) * u_dmg_zones.y;
-        float z_wr   = smoothstep( 0.65,  3.00, v_ac_pos.x) * u_dmg_zones.z;
-        float z_tail = smoothstep( 1.65,  3.90, v_ac_pos.z) * u_dmg_zones.w;
-        float z_bel  = smoothstep(-0.15, -0.75, v_ac_pos.y) * u_dmg_extra.x * 0.55;
+        float z_nose = smoothstep(-1.45, -3.45, v_ac_pos.z) * u_dmg_zones.x;
+        float z_wl   = smoothstep(-0.70, -4.20, v_ac_pos.x) * u_dmg_zones.y;
+        float z_wr   = smoothstep( 0.70,  4.20, v_ac_pos.x) * u_dmg_zones.z;
+        float z_tail = smoothstep( 1.75,  3.75, v_ac_pos.z) * u_dmg_zones.w;
+        float z_bel  = smoothstep(-0.20, -0.95, v_ac_pos.y) * u_dmg_extra.x * 0.65;
         float zone_d = clamp(z_nose + z_wl + z_wr + z_tail + z_bel, 0.0, 1.0);
         if (zone_d > 0.02) {
             float streak = cabin_grain(vec3(v_ac_pos.xy * 18.0, v_ac_pos.z * 2.2)) * 0.65 +
                            cabin_grain(vec3(v_ac_pos.xy * 44.0, v_ac_pos.z * 5.0)) * 0.35;
-            float gouge = smoothstep(0.54 - zone_d * 0.36, 0.76 - zone_d * 0.25, streak);
-            float primer_rim = smoothstep(0.46 - zone_d * 0.36, 0.55 - zone_d * 0.34, streak) * (1.0 - gouge);
-            vec3 bare_alu = vec3(0.52, 0.54, 0.57) * (0.85 + 0.30 * streak);
-            base = mix(base, vec3(0.11, 0.13, 0.10), primer_rim * zone_d * 0.85);
+            float gouge = smoothstep(0.50 - zone_d * 0.38, 0.72 - zone_d * 0.25, streak);
+            float primer_rim = smoothstep(0.42 - zone_d * 0.38, 0.52 - zone_d * 0.34, streak) * (1.0 - gouge);
+            vec3 bare_alu = vec3(0.54, 0.56, 0.60) * (0.85 + 0.30 * streak);
+            base = mix(base, vec3(0.11, 0.13, 0.10), primer_rim * zone_d * 0.90);
             base = mix(base, bare_alu, gouge * zone_d);
-            metal = mix(metal, 0.88, gouge * zone_d);
-            rough = mix(rough, 0.32, gouge * zone_d);
+            metal = mix(metal, 0.90, gouge * zone_d);
+            rough = mix(rough, 0.28, gouge * zone_d);
         }
         float scorch_amt = clamp(u_dmg_extra.z, 0.0, 1.0);
         if (scorch_amt > 0.02) {
-            float cowl_aft = smoothstep(-2.1, -1.2, v_ac_pos.z) * (1.0 - smoothstep(-0.3, 1.6, v_ac_pos.z));
-            float exhaust = smoothstep(0.32, -0.45, v_ac_pos.y) * (1.0 - smoothstep(0.28, 0.72, abs(v_ac_pos.x)));
+            float cowl_aft = smoothstep(-3.6, -2.2, v_ac_pos.z) * (1.0 - smoothstep(-0.6, 1.6, v_ac_pos.z));
+            float exhaust = smoothstep(0.45, -0.55, v_ac_pos.y) * (1.0 - smoothstep(0.35, 0.90, abs(v_ac_pos.x)));
             float soot_n = cabin_grain(vec3(v_ac_pos.xy * 12.0, v_ac_pos.z * 1.5));
-            float soot = clamp(cowl_aft * exhaust * scorch_amt * (0.45 + 0.75 * soot_n), 0.0, 0.92);
-            base = mix(base, vec3(0.035, 0.032, 0.030), soot);
-            rough = mix(rough, 0.92, soot);
+            float soot = clamp(cowl_aft * exhaust * scorch_amt * (0.55 + 0.75 * soot_n), 0.0, 0.95);
+            base = mix(base, vec3(0.028, 0.024, 0.022), soot);
+            rough = mix(rough, 0.94, soot);
             metal *= (1.0 - soot);
         }
     }

@@ -240,7 +240,7 @@ bool PackReader::download_online_tile_to_disk(
 
     std::string tmp_path = cache_path + ".tmp." + std::to_string(
         std::hash<std::thread::id>{}(std::this_thread::get_id()) & 0xFFFFu);
-    const std::string cmd = "curl -sS -f -L --connect-timeout 2 --max-time 4 -A \"Mozilla/5.0\" -o " +
+    const std::string cmd = "curl -sS -f -L --connect-timeout 2 --max-time 4 -A \"OpenSky-VFR/0.3 (+https://github.com/BeamAudio/OpenSky)\" -o " +
         shell_quote(tmp_path) + " " + shell_quote(url) + " 2>/dev/null";
     int rc = std::system(cmd.c_str());
     struct stat st{};

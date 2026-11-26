@@ -33,6 +33,9 @@ public:
                    bool preparing_airfield, int &time_of_day,
                    RegionalAtmosphere *reg_atmo = nullptr, double sim_time_sec = 0.0);
     void focus_map(const AirportInfo &airport) { focus_airport(airport, 48.0f); }
+    void set_demo_view(int page_idx, double lat, double lon, float zoom, const std::string &selected_ap = "", bool show_weather = true);
+    void add_demo_route_airport(const AirportInfo &airport);
+    void set_demo_walk(double lat, double lon, double alt, float yaw, float pitch, bool inspecting = false);
     bool capture_world(AircraftAndHud &aircraft, SkyAndClouds &sky, const PlatformWindow &win,
                        int &time_of_day, RegionalAtmosphere *weather, const std::string &path);
     void draw_walk(AircraftAndHud &aircraft, const PlatformWindow &win,
@@ -135,6 +138,7 @@ private:
     int first_flight_step_ = 0;
     std::filesystem::path first_flight_state_file_;
     bool kneeboard_open_ = false;
+    int kneeboard_tab_ = 0; // 0=Engine & Lights, 1=Avionics & AP, 2=Breakers
     bool replay_available_ = false;
     Location walker_{};
     std::string status_;

@@ -128,16 +128,21 @@ void SkyAndClouds::alloc_fbos(int win_w, int win_h, int quality, int pixel_perce
     scene_w_ = std::max(320, static_cast<int>(cur_win_w_ * scale));
     scene_h_ = std::max(180, static_cast<int>(cur_win_h_ * scale));
 
-    // Render clouds at 2/3 on Ultra (dGPU), 2/5 on High (Renoir 60 FPS), 1/3 on Low/Medium!
+    // Preserve fine cloud silhouettes on discrete-GPU tiers. Balanced keeps
+    // enough cloud pixels for stable temporal reconstruction while leaving
+    // margin for its higher in-cloud raymarch cost on laptop GPUs.
     if (cloud_quality_ >= 3) {
+        cloud_w_ = std::max(160, (scene_w_ * 3) / 4);
+        cloud_h_ = std::max(90,  (scene_h_ * 3) / 4);
+    } else if (cloud_quality_ == 2) {
         cloud_w_ = std::max(160, (scene_w_ * 2) / 3);
         cloud_h_ = std::max(90,  (scene_h_ * 2) / 3);
-    } else if (cloud_quality_ == 2) {
-        cloud_w_ = std::max(160, (scene_w_ * 2) / 5);
-        cloud_h_ = std::max(90,  (scene_h_ * 2) / 5);
+    } else if (cloud_quality_ == 1) {
+        cloud_w_ = std::max(160, (scene_w_ * 46) / 100);
+        cloud_h_ = std::max(90,  (scene_h_ * 46) / 100);
     } else {
-        cloud_w_ = std::max(160, scene_w_ / 3);
-        cloud_h_ = std::max(90,  scene_h_ / 3);
+        cloud_w_ = std::max(160, (scene_w_ * 40) / 100);
+        cloud_h_ = std::max(90,  (scene_h_ * 40) / 100);
     }
 
     glCreateTextures(GL_TEXTURE_2D, 1, &scene_col_);

@@ -890,6 +890,7 @@ int main(int argc, char **argv) {
         if (loading_title) show_loading(loading_title, "Preparing world coordinates...", 0.20f);
         const auto next_frame = pack.prepare_world_frame(lat, lon, !promo_only);
         if (next_frame) {
+            reg_atmo.finish_pending_initialization();
             pack.commit_world_frame(next_frame);
             vegetation.invalidate();
             if (loading_title) show_loading(loading_title, "Streaming coarse terrain & IGN PNOA...", 0.50f);
@@ -909,6 +910,7 @@ int main(int argc, char **argv) {
             const double elapsed = PlatformWindow::now_sec() - async_cross.start_wall_t;
             if (!streamer.is_async_transition_ready(elapsed)) return false;
             if (async_cross.prepared.frame) {
+                reg_atmo.finish_pending_initialization();
                 pack.commit_world_frame(async_cross.prepared.frame);
                 streamer.commit_async_transition();
                 vegetation.invalidate();
@@ -1440,7 +1442,9 @@ int main(int argc, char **argv) {
                     std::printf("[SOAK] Pack %s at frame %d\n", region->region_id.c_str(), frame);
                     previous_region = region;
                 }
-                if (step_flight_world_transition(state.lat_deg, state.lon_deg, state.vel_east_mps, state.vel_north_mps))
+                const bool committed = step_flight_world_transition(
+                    state.lat_deg, state.lon_deg, state.vel_east_mps, state.vel_north_mps);
+                if (committed)
                     std::printf("[SOAK] Terrain anchor committed at frame %d\n", frame);
                 capture_frame(step, debug_overlays);
             }
@@ -2127,14 +2131,32 @@ int main(int argc, char **argv) {
             wx_advance = 0.94f;
             snap("storm_view.png", 42.53131, 0.47676, 135.0, 118.0, 22.0, 2,
                  0.0, 0.0f, 0.0f, 0.0, 0.0, false);
+            constexpr double inside_lat = 42.34800, inside_lon = 0.22600;
+            snap("storm_inside_probe.png", inside_lat, inside_lon, 1000.0, 32.0, 2.0, 2,
+                 25.0, 0.0f, 0.0f, 0.0, 0.0, false, false, false);
+            const double inside_ground = pack.sample_elevation(inside_lat, inside_lon);
+            const float layer_bottom_msl = sky_clouds.atmo().cloud_base_m;
+            const float layer_top_msl = layer_bottom_msl + sky_clouds.atmo().cloud_thick_m;
+            const double inside_agl = std::clamp(
+                0.5 * (static_cast<double>(layer_bottom_msl) + layer_top_msl) - inside_ground,
+                100.0, 5000.0);
+            std::printf("[CLOUD-QA] Interior camera %.0fm AGL within %.0f–%.0fm MSL\n",
+                        inside_agl, layer_bottom_msl, layer_top_msl);
+            snap("storm_inside_view.png", inside_lat, inside_lon, inside_agl, 32.0, 2.0, 2,
+                 0.0, 0.0f, 0.0f, 0.0, 0.0, false);
             // Hold the last weather upload, simulation time and camera. The
             // geometry projection still cycles through all eight TAA phases.
-            for (int frame = 0; frame < 48 && !win.should_close(); ++frame) {
+            for (int frame = 0; frame < 72 && !win.should_close(); ++frame) {
                 const bool moving_weather = frame >= 24;
+                const bool moving_camera = frame >= 48;
                 char filename[32];
-                std::snprintf(filename, sizeof(filename), "/storm_%s_%02d.png", moving_weather ? "evolving" : "fixed", frame % 24);
+                const char *phase = moving_camera ? "moving" : moving_weather ? "evolving" : "fixed";
+                std::snprintf(filename, sizeof(filename), "/storm_%s_%02d.png", phase, frame % 24);
                 win.poll_events();
                 if (moving_weather) {
+                    if (moving_camera) {
+                        ac_hud.state().look_yaw_deg = static_cast<float>((frame - 48) * 0.5 - 6.0);
+                    }
                     step_flight(1.0 / 60.0);
                     capture_frame(1.0 / 60.0, false, 1, autotest_dir + filename);
                 } else {

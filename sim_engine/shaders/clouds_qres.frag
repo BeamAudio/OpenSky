@@ -220,7 +220,7 @@ float sample_cloud_shadow(vec2 p_en, float h01, vec2 wind_base, vec2 shear_en, f
     float top = mix(0.36, 0.98, clamp(ma.b * 0.75 + eff_cov * 0.25 + u_precip * 0.25, 0.0, 1.0));
     float base_shape = cover * smoothstep(0.0, 0.08, h01) * (1.0 - smoothstep(top * 0.50, top, h01));
     if (base_shape <= 0.02) return 0.0;
-    vec3 w_coord = vec3(p * 0.00070, h01 * (u_cloud_thick_m * 0.00078) - u_time * 0.00035);
+    vec3 w_coord = vec3(p * 0.00070, h01 * (u_cloud_thick_m * 0.00078));
     vec4 w = textureLod(u_cloud_detail, w_coord, min(w_lod, 1.8));
     float worley_lo = w.a * 0.62 + w.b * 0.38;
     return clamp(remap01(base_shape, (1.0 - worley_lo) * 0.54, 1.0), 0.0, 1.0);
@@ -243,7 +243,7 @@ float sample_cloud_modern(vec2 p_en, float h01, float altitude_msl, vec2 wind_ba
 
     // Gentle multi-scale 3D Worley lobes aligned with solved flow (zero boiling artifacts).
     vec2 curl = vec2(macro_b.g - 0.5, macro_a.g - 0.5) * (95.0 * (0.20 + 0.80 * h_eff));
-    vec3 w_coord = vec3((p + curl) * 0.00070, (altitude_msl - u_cloud_base_m) * 0.00078 - u_time * 0.00035);
+    vec3 w_coord = vec3((p + curl) * 0.00070, (altitude_msl - u_cloud_base_m) * 0.00078);
     // Band-limit density along the march as well as across the screen. Large
     // steps through tiny lobes otherwise alternate opaque and clear pixels.
     float footprint = max(dist_m * 0.00014, step_m / 300.0);
@@ -295,6 +295,8 @@ void main() {
     }
 
     float slab_top = u_cloud_base_m + u_cloud_thick_m;
+    float camera_in_cloud = smoothstep(0.0, 350.0,
+        min(u_cam_alt_m - u_cloud_base_m, slab_top - u_cam_alt_m));
     float t0 = 0.0, t1 = 0.0;
     bool valid = true;
     if (u_cam_alt_m < u_cloud_base_m) {
@@ -341,6 +343,8 @@ void main() {
     float trans = 1.0;
     vec3 accum = vec3(0.0);
     float w_dist = 0.0, w_sum = 0.0;
+    float interior_density_integral = 0.0;
+    float interior_density_distance = 0.0;
     float rain_end = min(max_ray_t, 12000.0);
     if (u_cam_alt_m < u_cloud_base_m && vy > 0.002) {
         rain_end = min(rain_end, intersect_shell_above(u_cloud_base_m - u_cam_alt_m, vy));
@@ -390,8 +394,11 @@ void main() {
         // Smooth synoptic upper-level shear across the slab (immune to pitch/ridge artifacts).
         vec2 shear_en = sample_regional_layer(u_cam_en, 2.0).xy * 2.2;
         float eff_cov = clamp(u_coverage, 0.06, 0.96);
-        float inside = smoothstep(0.0, 350.0, min(u_cam_alt_m - u_cloud_base_m, slab_top - u_cam_alt_m));
-        float max_m = mix(18000.0, 12000.0, inside);
+        float inside = camera_in_cloud;
+        // Resolve the nearby cloud structure with shorter steps when the
+        // camera is in the layer. Long exterior rays are useful for silhouettes,
+        // while a multi-kilometer interval per sample collapses the interior to fog.
+        float max_m = mix(18000.0, 2200.0, inside);
         float march_len = min(t1 - t0, max_m);
 
         {
@@ -404,7 +411,11 @@ void main() {
             float s_y = max(0.06, sdir.y);
             float inv_thick = 1.0 / max(150.0, u_cloud_thick_m);
 
-            int steps = clamp(u_steps, 8, 36);
+            int exterior_steps = clamp(u_steps, 8, 36);
+            int interior_steps = u_steps >= 24 ? max(exterior_steps, 32)
+                : (u_steps >= 14 ? max(exterior_steps, 24) : max(exterior_steps, 20));
+            int steps = int(round(mix(float(exterior_steps),
+                                      float(interior_steps), inside)));
             float inv_steps = 1.0 / float(steps);
             // Fixed midpoint quadrature prevents dense cloud silhouettes from
             // pulsing in place as the integration phase changes each frame.
@@ -425,19 +436,77 @@ void main() {
                 vec2 p_en = u_cam_en + ray_en * t;
                 float ero = 0.5, billow = 0.5, w_lod = 0.0, base_g = 0.0;
                 vec3 w_coord = vec3(0.0);
-                float d = sample_cloud_modern(p_en, h01, sample_alt_msl, wind_base, shear_en, eff_cov, t, dt_cur,
-                                              ero, billow, w_coord, w_lod, base_g);
+                float d = 0.0;
+                float interior_noise = 0.0;
+                if (inside > 0.0) {
+                    // Resolve cloud interior as a 3D medium instead of a flat
+                    // coverage mask. The coarse and fine cellular fields stay
+                    // locked to world space and advect with solved wind, so
+                    // they add depth without per-frame boiling.
+                    vec2 macro_p = p_en;
+                    vec3 macro_a = vec3(0.0), macro_b = vec3(0.0);
+                    float h_eff = 0.0;
+                    if (h01 > 0.0 && h01 < 1.0) {
+                        vec4 mf = sample_regional_atmo(p_en, sample_alt_msl);
+                        base_g = sample_cloud_macro(p_en, h01, wind_base, shear_en, eff_cov,
+                                                    mf, macro_p, macro_a, macro_b, h_eff);
+                    }
+                    vec2 interior_p = macro_p;
+                    vec3 interior_world = vec3(interior_p.x, sample_alt_msl, interior_p.y);
+                    vec3 interior_coord = interior_world * 0.00052;
+                    // The detail volume maps to roughly 30 m per texel here.
+                    // Filter against the actual ray interval to suppress
+                    // undersampled storm detail instead of letting it shimmer.
+                    float interior_lod = clamp(log2(max(1.0, dt_cur * 0.033)), 0.0, 2.0);
+                    vec4 cells0 = textureLod(u_cloud_detail, interior_coord, interior_lod);
+                    vec3 fine_world = vec3(interior_world.x * 2.35 + 173.0,
+                                           interior_world.y * 2.35 - 91.0,
+                                           interior_world.z * 2.35 + 47.0);
+                    vec4 cells1 = textureLod(u_cloud_detail, fine_world * 0.00052,
+                                             min(interior_lod + 0.7, 2.7));
+                    float coarse_cells = cells0.a * 0.14 + cells0.b * 0.24 + cells0.g * 0.34 + cells0.r * 0.28;
+                    float fine_cells = cells1.r * 0.46 + cells1.g * 0.30 + cells1.b * 0.17 + cells1.a * 0.07;
+                    // Worley distance values cluster around the middle of the
+                    // range. A broad threshold turns nearly every sample into
+                    // the same fog density, so keep the transition around that
+                    // median to preserve open pockets between 3D cloud lobes.
+                    float cell_mass = smoothstep(0.52, 0.70,
+                        coarse_cells * 0.58 + fine_cells * 0.42);
+                    float interior_envelope = smoothstep(0.015, 0.24, base_g);
+                    float interior_density = interior_envelope * mix(0.015, 2.35, cell_mass);
+                    interior_density_integral += interior_density * dt_cur;
+                    interior_density_distance += dt_cur;
+                    d = interior_density;
+                    interior_noise = cell_mass;
+                    billow = cell_mass;
+                    ero = 1.0;
+                } else {
+                    d = sample_cloud_modern(p_en, h01, sample_alt_msl, wind_base, shear_en,
+                                            eff_cov, t, dt_cur, ero, billow,
+                                            w_coord, w_lod, base_g);
+                    interior_noise = billow;
+                }
                 if (d > 0.004) {
-                    // Fast 3-step logarithmic sun cone raymarch:
-                    // Step 0 uses local 3D Worley gradient (1 tap) for crisp cauliflower ridge self-shadowing!
-                    vec4 sw0 = textureLod(u_cloud_detail, w_coord + vec3(s_en * 0.085, s_y * 0.11), w_lod);
-                    float billow_s0 = sw0.a * 0.52 + sw0.b * 0.30 + sw0.g * 0.18;
-                    float d_s0 = clamp(billow_s0 * base_g * 1.35, 0.0, 1.0);
-                    float d_s1 = sample_cloud_shadow(p_en + s_en * 440.0,  h01 + s_y * (440.0  * inv_thick), wind_base, shear_en, eff_cov, w_lod + 0.50);
-                    float d_s2 = u_steps >= 22
-                        ? sample_cloud_shadow(p_en + s_en * 1250.0, h01 + s_y * (1250.0 * inv_thick), wind_base, shear_en, eff_cov, w_lod + 0.90)
-                        : d_s1 * 0.65;
-                    float tau_sun = (d_s0 * 0.72 + d_s1 * 1.10 + d_s2 * 1.72) * (1.0 + storm_tint * 0.72);
+                    float billow_s0 = interior_noise;
+                    float tau_sun;
+                    if (inside > 0.5) {
+                        // Approximate local self-shadow from the resolved
+                        // interior cells and avoid three extra shadow lookups
+                        // on every pixel while the aircraft is in cloud.
+                        tau_sun = clamp((1.0 - interior_noise) * 2.1 + d * 0.48, 0.08, 2.2) *
+                                  (1.0 + storm_tint * 0.45);
+                    } else {
+                        // Fast 3-step logarithmic sun cone raymarch.
+                        // The first tap resolves the local Worley gradient.
+                        vec4 sw0 = textureLod(u_cloud_detail, w_coord + vec3(s_en * 0.085, s_y * 0.11), w_lod);
+                        billow_s0 = sw0.a * 0.52 + sw0.b * 0.30 + sw0.g * 0.18;
+                        float d_s0 = clamp(billow_s0 * base_g * 1.35, 0.0, 1.0);
+                        float d_s1 = sample_cloud_shadow(p_en + s_en * 440.0,  h01 + s_y * (440.0  * inv_thick), wind_base, shear_en, eff_cov, w_lod + 0.50);
+                        float d_s2 = u_steps >= 22
+                            ? sample_cloud_shadow(p_en + s_en * 1250.0, h01 + s_y * (1250.0 * inv_thick), wind_base, shear_en, eff_cov, w_lod + 0.90)
+                            : d_s1 * 0.65;
+                        tau_sun = (d_s0 * 0.72 + d_s1 * 1.10 + d_s2 * 1.72) * (1.0 + storm_tint * 0.72);
+                    }
 
                     // Calibrated Hillaire/Wrenninge 2-octave multiple scattering: bright snow-white
                     // sunlit cauliflower peaks + luminous creamy multi-scatter + cool slate-blue bases!
@@ -456,6 +525,7 @@ void main() {
                     vec3 ambient = mix(gnd_amb, sky_amb, h_amb) * amb_occ * (1.0 - storm_tint * 0.36);
 
                     vec3 step_c = ambient + u_cloud_lit * sun_energy;
+                    step_c *= mix(1.0, mix(0.45, 1.55, interior_noise), inside);
                     float silver = pow(1.0 - ero, 2.0) * pow(max(0.0, cos_th), 5.0) * exp(-tau_sun * 0.60) * sun_vis;
                     step_c += u_cloud_lit * vec3(1.16, 1.04, 0.86) * (silver * 0.78);
 
@@ -474,6 +544,13 @@ void main() {
                     // Solid volumetric cumulus extinction + soft 180m mountain-wrap fade
                     float terrain_wrap = smoothstep(0.0, 180.0, max_ray_t - t);
                     float extinction = mix(0.0085, 0.0038, smoothstep(100.0, 3800.0, t)) * terrain_wrap;
+                    // Preserve near-field density variation from inside the
+                    // cloud. Exterior extinction makes the first local samples
+                    // fully opaque and hides all depth and self-shadow cues.
+                    // Keep enough transmittance across the interior for deep
+                    // density and lighting changes to remain visible. The
+                    // integrated full slab still becomes opaque in storm.
+                    extinction = mix(extinction, 0.0022 * terrain_wrap, inside);
                     float seg_tau = d * dt_cur * extinction * (1.0 + u_precip * 0.35);
                     float seg_trans = exp(-seg_tau);
                     float w = trans * (1.0 - seg_trans);
@@ -510,13 +587,20 @@ void main() {
     if (final_a > 0.001) {
         avg_d = w_dist / max(0.001, w_sum);
         vec3 fc = accum / max(0.001, w_sum);
+        float mean_interior_density = interior_density_integral /
+                                      max(1.0, interior_density_distance);
+        // The ray's integrated 3D mass controls in-cloud inscattering too.
+        // Without this, a long, dense storm ray averages many lobes to one
+        // flat gray even though its transmittance is correctly volumetric.
+        float interior_lobe_light = mix(0.38, 1.62,
+            smoothstep(0.66, 1.52, mean_interior_density));
+        fc *= mix(1.0, interior_lobe_light, camera_in_cloud);
         float sun_vis = clamp((sdir.y + 0.08) / 0.24, 0.0, 1.0);
         vec3 hcol = mix(u_haze_cool, u_haze_warm * 1.15, pow(max(0.0, cos_th), 3.0) * 0.65 * sun_vis);
         fc = mix(fc, hcol, smoothstep(28000.0, 74000.0, avg_d) * 0.74);
         final_a *= 1.0 - smoothstep(58000.0, 76000.0, avg_d);
         cur_col = vec4(fc * final_a, final_a);
     }
-
     // Temporal Reprojection: smoothly accumulate distant clouds, taper blend at close range when flying INSIDE clouds!
     vec4 prev_clip = u_prev_vp * vec4(view_dir * avg_d + u_camera_delta, 1.0);
     vec2 prev_uv = (prev_clip.xy / max(1e-5, prev_clip.w)) * 0.5 + 0.5;

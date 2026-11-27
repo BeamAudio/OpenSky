@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <ctime>
+#include <future>
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
@@ -198,6 +199,7 @@ public:
     GLuint local_terrain_tex() const { return local_terrain_tex_; }
     Vec4 local_domain_bounds() const;
     void sync_region(double lat_deg, double lon_deg);
+    void finish_pending_initialization();
     void shutdown();
 
     void set_regime(WindRegime r);
@@ -298,7 +300,8 @@ private:
         void spawn_dynamic_cell(DynamicCell &c, bool initial_spread);
         void seed_dynamic_cells();
         void advance_dynamic_cells(float dt, float solar);
-        void step(float dt, const Vec3 &sun_dir, const WeatherSnapshot &forcing);
+        bool step(float dt, const Vec3 &sun_dir, const WeatherSnapshot &forcing,
+                  const std::atomic<bool> *stop_requested = nullptr);
     };
 
     struct WeatherPublication {
@@ -337,10 +340,13 @@ private:
     void initialize_local_weather_model();
     void refresh_local_refinement_climate();
     void sync_local_refinement_boundary();
-    void advance_weather_with_refinement(float dt, const Vec3 &sun, const WeatherSnapshot &forcing);
+    bool advance_weather_with_refinement(float dt, const Vec3 &sun, const WeatherSnapshot &forcing,
+                                         const std::atomic<bool> *stop_requested = nullptr);
     void build_weather_texture_field(const WeatherSolver &solver, std::vector<uint16_t> &out) const;
     void live_weather_worker();
     void initialize_weather_model();
+    bool poll_weather_model_initialization();
+    void finish_weather_model_initialization();
     void weather_worker_loop();
     void start_weather_worker();
     void stop_weather_worker();
@@ -411,6 +417,9 @@ private:
     double weather_model_accum_ = 0.0;
     double weather_anchor_lat_ = 0.0, weather_anchor_lon_ = 0.0;
     std::thread weather_worker_;
+    std::future<void> weather_init_future_;
+    bool weather_init_pending_ = false;
+    bool weather_terrain_upload_pending_ = false;
     mutable std::mutex weather_job_mtx_;
     std::condition_variable weather_job_cv_;
     std::atomic<bool> weather_worker_stop_{false};

@@ -4,8 +4,12 @@
 #include <initialization/FGInitialCondition.h>
 #include <initialization/FGTrim.h>
 #include <input_output/FGGroundCallback.h>
+#include <models/FGAircraft.h>
+#include <models/FGAerodynamics.h>
 #include <models/FGAtmosphere.h>
 #include <models/FGAuxiliary.h>
+#include <models/FGExternalForce.h>
+#include <models/FGExternalReactions.h>
 #include <models/FGFCS.h>
 #include <models/FGGroundReactions.h>
 #include <models/FGInertial.h>
@@ -22,6 +26,7 @@
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
+#include <memory>
 #include <numbers>
 
 namespace nspain {
@@ -82,6 +87,73 @@ private:
     double semimajor_, semiminor_;
 };
 
+// Generic wind-axis rain/ice aero penalty and body-axis rotational gust torques so ANY JSBSim aircraft
+// responds physically to rain drag, icing accretion, and 3D rotational turbulence without custom XML hooks.
+class WeatherCouplingForce final : public JSBSim::FGExternalForce {
+public:
+    enum class Mode { AeroAndGusts, IceWeight };
+
+    WeatherCouplingForce(JSBSim::FGFDMExec *exec, std::shared_ptr<const FlightEnvironment> env,
+                         Mode mode, bool apply_custom_fallback)
+        : FGExternalForce(exec), env_(std::move(env)), mode_(mode), apply_fallback_(apply_custom_fallback) {
+        SetTransformType(mode_ == Mode::IceWeight ? tLocalBody : tWindBody);
+    }
+
+    const JSBSim::FGColumnVector3 &GetBodyForces() override {
+        vFn.InitMatrix();
+        vMn.InitMatrix();
+        if (!env_ || !fdmex) return FGForce::GetBodyForces();
+
+        if (mode_ == Mode::IceWeight) {
+            if (apply_fallback_ && env_->airframe_ice_kg > 1e-3) {
+                const auto cg_in = fdmex->GetMassBalance()->GetXYZcg();
+                SetLocation(cg_in(1), cg_in(2), cg_in(3));
+                vFn(3) = std::clamp(env_->airframe_ice_kg, 0.0, 35.0) * 2.2046226; // +Down in NED Local axes
+            }
+            return FGForce::GetBodyForces();
+        }
+
+        const auto aircraft = fdmex->GetAircraft();
+        const auto aero = fdmex->GetAerodynamics();
+        const auto aux = fdmex->GetAuxiliary();
+        if (!aircraft || !aero || !aux) return FGForce::GetBodyForces();
+
+        const auto rp_in = aircraft->GetXYZrp();
+        SetLocation(rp_in(1), rp_in(2), rp_in(3));
+        const double qbar = std::max(0.0, aux->Getqbar());
+        const double sw = std::max(1.0, aircraft->GetWingArea());
+        const double ice_f = std::clamp(env_->airframe_ice_factor, 0.0, 1.0);
+        const double rain_f = std::clamp(env_->rain_drag_factor, 0.0, 1.0);
+
+        if (apply_fallback_ && qbar > 0.05 && (ice_f > 1e-4 || rain_f > 1e-4)) {
+            const double lift_lbs = aero->GetvFw(JSBSim::FGAerodynamics::eLift);
+            const double lift_loss_lbs = lift_lbs * (0.24 * ice_f + 0.04 * rain_f);
+            const double drag_add_lbs = qbar * sw * (0.042 * ice_f + 0.008 * rain_f);
+            // tWindBody transforms directly via Tw2b: +X is forward into relative wind (drag = -X), +Z is down (lift loss = +Z).
+            vFn(1) = -drag_add_lbs;
+            vFn(3) = lift_loss_lbs;
+        }
+        if (apply_fallback_ && qbar > 0.05) {
+            const double vt = std::max(15.0, aux->GetVt());
+            const double bw = std::max(5.0, aircraft->GetWingSpan());
+            const double cbar = std::max(1.0, aircraft->Getcbar());
+            const double span_scale = bw / (2.0 * vt);
+            const double chord_scale = cbar / (2.0 * vt);
+            // Body-axis rotational turbulence torques (Roll L, Pitch M, Yaw N) in lbs*ft.
+            const double roll_ftlb = qbar * sw * bw * 0.48 * span_scale * env_->p_turb_rps;
+            const double pitch_ftlb = qbar * sw * cbar * 1.15 * chord_scale * env_->q_turb_rps;
+            const double yaw_ftlb = qbar * sw * bw * 0.14 * span_scale * env_->r_turb_rps;
+            vMn = JSBSim::FGColumnVector3(roll_ftlb, pitch_ftlb, yaw_ftlb);
+        }
+        return FGForce::GetBodyForces();
+    }
+
+private:
+    std::shared_ptr<const FlightEnvironment> env_;
+    Mode mode_;
+    bool apply_fallback_;
+};
+
 } // namespace
 
 class FlightModel::Impl {
@@ -90,6 +162,8 @@ public:
     JSBSim::FGPiston *piston = nullptr;
     JSBSim::FGPropeller *prop = nullptr;
     bool engine_permitted = false;
+    bool has_custom_wx_aero = false;
+    std::shared_ptr<FlightEnvironment> live_env = std::make_shared<FlightEnvironment>();
 };
 
 FlightModel::FlightModel() = default;
@@ -130,6 +204,18 @@ bool FlightModel::load(const std::string &aircraft_dir) {
             ground_, env_, *reactions, inertial->GetSemimajor(), inertial->GetSemiminor()));
         exec.GetWinds()->SetTurbType(JSBSim::FGWinds::ttNone);
         propulsion->SetFuelFreeze(true);
+
+        const auto pm = exec.GetPropertyManager();
+        next->has_custom_wx_aero = pm->HasNode("opensky/aero/CL") && pm->HasNode("opensky/aero/CD") &&
+                                   pm->HasNode("opensky/weather/p-gust-rad-s") &&
+                                   pm->HasNode("inertia/pointmass-weight-lbs[3]");
+        *next->live_env = env_;
+        if (auto ext = exec.GetExternalReactions()) {
+            ext->Add(std::make_unique<WeatherCouplingForce>(
+                &exec, next->live_env, WeatherCouplingForce::Mode::AeroAndGusts, !next->has_custom_wx_aero));
+            ext->Add(std::make_unique<WeatherCouplingForce>(
+                &exec, next->live_env, WeatherCouplingForce::Mode::IceWeight, !next->has_custom_wx_aero));
+        }
         impl_ = std::move(next);
         return true;
     } catch (const std::exception &error) {
@@ -165,6 +251,7 @@ void FlightModel::apply_controls() {
 
 void FlightModel::apply_environment(double altitude_m) {
     auto &exec = impl_->exec;
+    *impl_->live_env = env_;
     const auto atmosphere = exec.GetAtmosphere();
     atmosphere->SetPressureSL(JSBSim::FGAtmosphere::eMillibars, std::clamp(env_.qnh_hpa, 850.0, 1100.0));
     atmosphere->SetTemperature(std::clamp(env_.air_temp_c, -75.0, 60.0), altitude_m / ft_to_m,
@@ -173,11 +260,13 @@ void FlightModel::apply_environment(double altitude_m) {
         standard->SetRelativeHumidity(std::clamp(env_.relative_humidity, 0.0, 1.0) * 100.0);
     exec.GetWinds()->SetWindNED(env_.wind_north_mps / ft_to_m, env_.wind_east_mps / ft_to_m,
                                 env_.wind_down_mps / ft_to_m);
-    const double gust[] = {env_.p_turb_rps, env_.q_turb_rps, env_.r_turb_rps};
-    for (size_t i = 0; i < gust_properties.size(); ++i) exec.SetPropertyValue(gust_properties[i], gust[i]);
-    exec.SetPropertyValue("opensky/weather/ice-factor", std::clamp(env_.airframe_ice_factor, 0.0, 1.0));
-    exec.SetPropertyValue("opensky/weather/rain-drag", std::clamp(env_.rain_drag_factor, 0.0, 1.0));
-    exec.SetPropertyValue("inertia/pointmass-weight-lbs[3]", std::clamp(env_.airframe_ice_kg, 0.0, 35.0) * 2.2046226);
+    if (impl_->has_custom_wx_aero) {
+        const double gust[] = {env_.p_turb_rps, env_.q_turb_rps, env_.r_turb_rps};
+        for (size_t i = 0; i < gust_properties.size(); ++i) exec.SetPropertyValue(gust_properties[i], gust[i]);
+        exec.SetPropertyValue("opensky/weather/ice-factor", std::clamp(env_.airframe_ice_factor, 0.0, 1.0));
+        exec.SetPropertyValue("opensky/weather/rain-drag", std::clamp(env_.rain_drag_factor, 0.0, 1.0));
+        exec.SetPropertyValue("inertia/pointmass-weight-lbs[3]", std::clamp(env_.airframe_ice_kg, 0.0, 35.0) * 2.2046226);
+    }
 }
 
 void FlightModel::apply_engine() {
@@ -354,8 +443,16 @@ void FlightModel::read_state() {
     state_.r_rps = propagate->GetPQR(3);
     state_.alpha_deg = aux->Getalpha() * rad_to_deg;
     state_.beta_deg = aux->Getbeta() * rad_to_deg;
-    state_.cl = exec.GetPropertyValue("opensky/aero/CL");
-    state_.cd = exec.GetPropertyValue("opensky/aero/CD");
+    if (impl_->has_custom_wx_aero) {
+        state_.cl = exec.GetPropertyValue("opensky/aero/CL");
+        state_.cd = exec.GetPropertyValue("opensky/aero/CD");
+    } else {
+        const auto aero = exec.GetAerodynamics();
+        const auto aircraft = exec.GetAircraft();
+        const double qs = std::max(0.05, aux->Getqbar() * std::max(1.0, aircraft->GetWingArea()));
+        state_.cl = aero->GetvFw(JSBSim::FGAerodynamics::eLift) / qs;
+        state_.cd = aero->GetvFw(JSBSim::FGAerodynamics::eDrag) / qs;
+    }
     state_.g_load = aux->GetNlf();
     state_.air_density_kg_m3 = atmo->GetDensity() * slug_ft3_to_kg_m3;
     state_.density_alt_ft = atmo->GetDensityAltitude();

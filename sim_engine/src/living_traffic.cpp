@@ -931,6 +931,41 @@ void LivingTraffic::update_and_render(
     glBindVertexArray(0);
 }
 
+LivingTraffic::NearestAircraftSample LivingTraffic::nearest_aircraft(
+    double listener_lat_deg, double listener_lon_deg, double listener_alt_m
+) const {
+    NearestAircraftSample best{};
+    if (!pack_) return best;
+    const double m_lon = pack_->anchor_m_lon();
+    const double m_lat = pack_->anchor_m_lat();
+    float best_d2 = 3000.0f * 3000.0f;
+    for (const auto &a : air_agents_) {
+        if (a.phase == AirPhase::Parked || a.speed_mps < 2.0f) continue;
+        const float de = static_cast<float>((a.lon - listener_lon_deg) * m_lon);
+        const float dn = static_cast<float>((a.lat - listener_lat_deg) * m_lat);
+        const float du = static_cast<float>(a.alt_m - listener_alt_m);
+        const float d2 = de * de + dn * dn + du * du;
+        if (d2 >= best_d2) continue;
+        best_d2 = d2;
+        const float ch = std::cos(a.heading_rad);
+        const float sh = std::sin(a.heading_rad);
+        const float cp = std::cos(a.pitch_rad);
+        const float sp = std::sin(a.pitch_rad);
+        best.valid = true;
+        best.dist_m = std::sqrt(d2);
+        best.rel_east_m = de;
+        best.rel_up_m = du;
+        best.rel_north_m = dn;
+        best.vel_east_mps = a.speed_mps * sh * cp;
+        best.vel_north_mps = a.speed_mps * ch * cp;
+        best.vel_up_mps = a.speed_mps * sp;
+        best.is_airliner = a.is_airliner;
+        const float spd01 = std::clamp(a.speed_mps / (a.is_airliner ? 120.0f : 55.0f), 0.15f, 1.0f);
+        best.rpm_hint = a.is_airliner ? (1400.0f + 1300.0f * spd01) : (1200.0f + 1350.0f * spd01);
+    }
+    return best;
+}
+
 bool LivingTraffic::run_selftest(const PackReader &pack) {
     // 1. Verify parking stands across every loaded airport.
     int paved_airports = 0;

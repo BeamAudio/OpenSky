@@ -23,7 +23,11 @@ public:
         double main_cpu_percent = -1.0;
         int64_t rss_kib = -1, peak_rss_kib = -1, available_kib = -1, total_kib = -1;
         int64_t gpu_busy_pct = -1, vram_used_bytes = -1, vram_total_bytes = -1, gtt_used_bytes = -1;
+        double package_temp_c = -1.0;
+        double gpu_power_w = -1.0;
     };
+
+    static double sample_package_temp_c();
 
     FlightProfiler();
     ~FlightProfiler();

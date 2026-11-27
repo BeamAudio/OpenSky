@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdio>
 #include <numeric>
+#include <vector>
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -41,12 +42,127 @@ double thread_cpu_seconds() {
     return filetime_seconds(k) + filetime_seconds(u);
 }
 
+void sample_thermals(double &cpu_temp_c, double &gpu_temp_c, double &gpu_power_w) {
+    (void)gpu_power_w;
+    using PdhHandle = void *;
+    struct PdhFmtVal { DWORD status; union { LONG lval; double dval; LONGLONG llval; }; };
+    struct PdhFmtItem { const wchar_t *name; PdhFmtVal val; };
+    using FnOpenQueryW = LONG(WINAPI *)(const wchar_t *, DWORD_PTR, PdhHandle *);
+    using FnAddCounterW = LONG(WINAPI *)(PdhHandle, const wchar_t *, DWORD_PTR, PdhHandle *);
+    using FnCollect = LONG(WINAPI *)(PdhHandle);
+    using FnGetArrayW = LONG(WINAPI *)(PdhHandle, DWORD, DWORD *, DWORD *, PdhFmtItem *);
+
+    struct WinThermalPdh {
+        bool init_done = false;
+        bool ready = false;
+        PdhHandle query = nullptr;
+        PdhHandle counter = nullptr;
+        FnCollect collect = nullptr;
+        FnGetArrayW get_array = nullptr;
+        double last_sample_s = -10.0;
+        double cached_c = -1.0;
+    };
+    static WinThermalPdh s;
+
+    const double now_s = PlatformWindow::now_sec();
+    if (s.init_done && (now_s - s.last_sample_s) < 1.0) {
+        if (s.cached_c > 0.0) {
+            cpu_temp_c = std::max(cpu_temp_c, s.cached_c);
+            gpu_temp_c = std::max(gpu_temp_c, s.cached_c);
+        }
+        return;
+    }
+    s.last_sample_s = now_s;
+    if (!s.init_done) {
+        s.init_done = true;
+        HMODULE mod = LoadLibraryW(L"pdh.dll");
+        if (mod) {
+            auto open_q = reinterpret_cast<FnOpenQueryW>(reinterpret_cast<void *>(GetProcAddress(mod, "PdhOpenQueryW")));
+            auto add_c = reinterpret_cast<FnAddCounterW>(reinterpret_cast<void *>(GetProcAddress(mod, "PdhAddEnglishCounterW")));
+            if (!add_c) add_c = reinterpret_cast<FnAddCounterW>(reinterpret_cast<void *>(GetProcAddress(mod, "PdhAddCounterW")));
+            s.collect = reinterpret_cast<FnCollect>(reinterpret_cast<void *>(GetProcAddress(mod, "PdhCollectQueryData")));
+            s.get_array = reinterpret_cast<FnGetArrayW>(reinterpret_cast<void *>(GetProcAddress(mod, "PdhGetFormattedCounterArrayW")));
+            if (open_q && add_c && s.collect && s.get_array &&
+                open_q(nullptr, 0, &s.query) == 0 &&
+                add_c(s.query, L"\\Thermal Zone Information(*)\\Temperature", 0, &s.counter) == 0) {
+                s.ready = true;
+            }
+        }
+    }
+    if (!s.ready || s.collect(s.query) != 0) return;
+    constexpr DWORD kPdhFmtDouble = 0x00000200;
+    DWORD buf_sz = 0, item_cnt = 0;
+    s.get_array(s.counter, kPdhFmtDouble, &buf_sz, &item_cnt, nullptr);
+    if (buf_sz == 0 || buf_sz > 65536) return;
+    std::vector<uint8_t> buf(buf_sz);
+    if (s.get_array(s.counter, kPdhFmtDouble, &buf_sz, &item_cnt,
+                    reinterpret_cast<PdhFmtItem *>(buf.data())) != 0) return;
+    const auto *items = reinterpret_cast<const PdhFmtItem *>(buf.data());
+    double peak_c = -1.0;
+    for (DWORD i = 0; i < item_cnt; ++i) {
+        if (items[i].val.status != 0) continue;
+        const double raw = items[i].val.dval;
+        double c = -1.0;
+        if (raw >= 270.0 && raw <= 410.0) c = raw - 273.15;
+        else if (raw >= 2700.0 && raw <= 4100.0) c = raw * 0.1 - 273.15;
+        if (c > 15.0 && c < 125.0) peak_c = std::max(peak_c, c);
+    }
+    s.cached_c = peak_c;
+    if (peak_c > 0.0) {
+        cpu_temp_c = std::max(cpu_temp_c, peak_c);
+        gpu_temp_c = std::max(gpu_temp_c, peak_c);
+    }
+}
+
 std::filesystem::path render_device() { return {}; }
 #else
 int64_t read_number(const std::filesystem::path &path) {
     std::ifstream in(path);
     int64_t value;
     return (in >> value) ? value : -1;
+}
+
+void sample_thermals(double &cpu_temp_c, double &gpu_temp_c, double &gpu_power_w) {
+    struct LinThermal {
+        double last_s = -10.0;
+        double cached_cpu = -1.0, cached_gpu = -1.0, cached_pwr = -1.0;
+    };
+    static LinThermal s;
+    const double now_s = PlatformWindow::now_sec();
+    if (now_s - s.last_s < 1.0) {
+        if (s.cached_cpu > 0.0) cpu_temp_c = std::max(cpu_temp_c, s.cached_cpu);
+        if (s.cached_gpu > 0.0) gpu_temp_c = std::max(gpu_temp_c, s.cached_gpu);
+        if (s.cached_pwr > 0.0) gpu_power_w = std::max(gpu_power_w, s.cached_pwr);
+        return;
+    }
+    s.last_s = now_s;
+    std::error_code ec;
+    double best_cpu = -1.0, best_gpu = -1.0, best_pwr = -1.0;
+    for (const auto &dir : std::filesystem::directory_iterator("/sys/class/hwmon", ec)) {
+        std::string name;
+        std::ifstream(dir.path() / "name") >> name;
+        const bool is_gpu = (name == "amdgpu" || name == "i915" || name == "xe" || name == "nouveau");
+        const bool is_cpu = (name == "k10temp" || name == "zenpower" || name == "coretemp" || name == "acpitz");
+        if (!is_gpu && !is_cpu) continue;
+        for (int idx = 1; idx <= 4; ++idx) {
+            const int64_t mc = read_number(dir.path() / ("temp" + std::to_string(idx) + "_input"));
+            if (mc >= 15000 && mc <= 125000) {
+                const double c = mc * 0.001;
+                if (is_gpu) best_gpu = std::max(best_gpu, c);
+                else best_cpu = std::max(best_cpu, c);
+            }
+        }
+        if (is_gpu) {
+            const int64_t uw = read_number(dir.path() / "power1_average");
+            if (uw > 0) best_pwr = std::max(best_pwr, uw * 1.0e-6);
+        }
+    }
+    s.cached_cpu = best_cpu;
+    s.cached_gpu = best_gpu;
+    s.cached_pwr = best_pwr;
+    if (best_cpu > 0.0) cpu_temp_c = std::max(cpu_temp_c, best_cpu);
+    if (best_gpu > 0.0) gpu_temp_c = std::max(gpu_temp_c, best_gpu);
+    if (best_pwr > 0.0) gpu_power_w = std::max(gpu_power_w, best_pwr);
 }
 
 void sample_memory_file(const char *path, const char *key_a, int64_t &a, const char *key_b, int64_t &b) {
@@ -113,7 +229,7 @@ bool FlightProfiler::open(const std::filesystem::path &directory) {
     for (auto *name : pass_names) gpu_ << ',' << name << "_gpu_ms," << name << "_cpu_submit_ms";
     gpu_ << '\n';
     resources_ << "since_start_ms,process_cpu_cores,main_cpu_pct,rss_kib,peak_rss_kib,host_available_kib,host_total_kib,"
-                  "device_gpu_busy_pct,device_vram_used_bytes,device_vram_total_bytes,device_gtt_used_bytes\n";
+                  "device_gpu_busy_pct,device_vram_used_bytes,device_vram_total_bytes,device_gtt_used_bytes,package_temp_c,gpu_power_w\n";
     return true;
 }
 
@@ -263,11 +379,15 @@ void FlightProfiler::sample_host(double now) {
         host_.gtt_used_bytes = read_number(drm_device_ / "mem_info_gtt_used");
     }
 #endif
+    host_.package_temp_c = sample_package_temp_c();
+    double ctemp = -1.0, gtemp = -1.0, gpwr = -1.0;
+    sample_thermals(ctemp, gtemp, gpwr);
+    if (gpwr > 0.0) host_.gpu_power_w = gpwr;
     if (resources_.is_open()) {
         resources_ << (now - start_sec_) * 1000 << ',' << host_.cpu_cores << ',' << host_.main_cpu_percent
                    << ',' << host_.rss_kib << ',' << host_.peak_rss_kib << ',' << host_.available_kib << ',' << host_.total_kib
                    << ',' << host_.gpu_busy_pct << ',' << host_.vram_used_bytes << ',' << host_.vram_total_bytes
-                   << ',' << host_.gtt_used_bytes << '\n';
+                   << ',' << host_.gtt_used_bytes << ',' << host_.package_temp_c << ',' << host_.gpu_power_w << '\n';
     }
 }
 
@@ -320,6 +440,12 @@ double FlightProfiler::encode_ms_per_page() const {
 
 double FlightProfiler::build_ms_per_page() const {
     return latest_stream_.finished_pages ? latest_stream_.worker_build_total_ms / latest_stream_.finished_pages : 0.0;
+}
+
+double FlightProfiler::sample_package_temp_c() {
+    double c = -1.0, g = -1.0, p = -1.0;
+    sample_thermals(c, g, p);
+    return std::max(c, g);
 }
 
 } // namespace nsim

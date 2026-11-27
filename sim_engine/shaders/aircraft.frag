@@ -7,6 +7,7 @@ layout(binding = 4) uniform sampler3D u_windscreen_rain_front; // Four physicall
 layout(binding = 5) uniform sampler3D u_windscreen_rain_side;
 layout(binding = 6) uniform sampler2D u_output_lut;
 layout(binding = 7) uniform sampler2D u_backdrop_tex; // Resolved linear HDR world+sky for true optical raindrop refraction!
+layout(binding = 8) uniform sampler2D u_windshield_sim; // 256x160 GPU 2D shallow-water fluid & wiper simulation (R=h, GB=vel, A=wet)
 
 uniform vec3 u_sun_dir;
 uniform vec3 u_haze_cool;
@@ -25,6 +26,7 @@ uniform vec4 u_glass_flow_front; // xy=integrated uv offset, zw=flow velocity ve
 uniform vec4 u_glass_flow_side;  // xy=integrated uv offset, zw=flow velocity vector
 uniform vec4 u_glass_fx;      // x=frost_ice01, y=cabin_mist01, z=grime01, w=snow_factor01
 uniform vec4 u_plane_wx;      // x=airframe_ice01, y=lightning_flash01, z=defrost_clear01, w=wet_sheen01
+uniform vec4 u_glass_wiper;   // x=wiper_pos [0..1], y=mod_phase [0..2PI), z=park_age_s, w=capped_total_rad
 uniform vec4 u_dmg_zones;     // x=nose, y=wing_l, z=wing_r, w=tail
 uniform vec4 u_dmg_extra;     // x=airframe, y=windshield_crack, z=scorch, w=is_interior
 uniform int u_native_output;
@@ -108,32 +110,31 @@ vec3 rain_hash32(vec2 p) {
     return fract((p3.xxy + p3.yzz) * p3.zyx);
 }
 
-// Clinging raindrop impact beads strictly bounded inside each cell (zero edge clipping or rectangles).
+// Clinging micro impact droplets with organic size variance and zero cell-border clipping.
 // Returns xy = dome normal in uv space (+u right/aft, +v down), z = drop mask, w = dome relief.
-vec4 rain_static_beads(vec2 uv, float scale, float t, float dens, vec2 dir, float stretch) {
+vec4 rain_static_beads(vec2 uv, float scale, float t, float dens, vec2 dir, float stretch, float seed) {
     vec2 st = uv * scale;
-    // Smooth quad derivative BEFORE floor/branch so cell boundaries never trigger fwidth spikes!
     float px_cell = max(length(vec2(dFdx(st.x), dFdy(st.x))), length(vec2(dFdx(st.y), dFdy(st.y))));
     float aa = clamp(px_cell * 1.15, 0.010, 0.055);
     vec2 id = floor(st);
     vec2 gv = fract(st) - 0.5;
     vec2 perp = vec2(-dir.y, dir.x);
 
-    vec3 h = rain_hash32(id + vec2(scale * 7.31, 1.93));
+    vec3 h = rain_hash32(id + vec2(scale * 7.31 + seed, 1.93));
     if (h.x > dens) return vec4(0.0);
 
-    float phase = t * mix(0.85, 1.85, h.z) + h.y * 31.7;
+    // Independent asynchronous spawn timing and drop radius per bead so they pop naturally.
+    float phase = t * mix(0.45, 1.65, h.z) + h.y * 47.3 + seed * 3.1;
     float epoch = floor(phase);
     float c = fract(phase);
-    vec3 rnd = rain_hash32(id + vec2(epoch * 13.7, epoch * 29.1));
+    vec3 rnd = rain_hash32(id + vec2(epoch * 13.7 + seed, epoch * 29.1));
     if (rnd.x > dens) return vec4(0.0);
 
-    float fade = smoothstep(0.0, 0.04, c) * smoothstep(1.0, 0.58, c);
+    float fade = smoothstep(0.0, 0.05, c) * smoothstep(1.0, 0.48, c);
     if (fade < 0.01) return vec4(0.0);
 
-    // Offset + radius * stretch <= 0.43 < 0.50: mathematically cannot clip at cell borders!
-    vec2 p0 = (rnd.yz - 0.5) * 0.46 + perp * (sin(c * 22.0 + h.z * 6.2831) * 0.014 * smoothstep(0.0, 0.2, c));
-    float r = mix(0.064, 0.118, h.z * h.z) * (0.66 + 0.34 * smoothstep(0.0, 0.14, c));
+    vec2 p0 = (rnd.yz - 0.5) * 0.50;
+    float r = mix(0.038, 0.112, h.z * h.z) * (0.68 + 0.32 * smoothstep(0.0, 0.14, c));
 
     vec2 d = gv - p0;
     vec2 d_loc = vec2(dot(d, perp), dot(d, dir) / stretch);
@@ -144,73 +145,181 @@ vec4 rain_static_beads(vec2 uv, float scale, float t, float dens, vec2 dir, floa
     return vec4(n_uv, m, sqrt(max(0.0, 1.0 - dot(n_loc, n_loc))) * m);
 }
 
-// Seamless 3x3-neighborhood flowing teardrop droplets driven by integrated slipstream + gravity flow.
-// Returns xy = dome normal in uv space, z = teardrop mask, w = dome relief.
-vec4 rain_rivulet_layer(vec2 uv, vec2 flow_shift, vec2 dir, float scale, float dens, float t, float speed01) {
-    vec2 st = uv * scale - flow_shift * scale;
-    // Continuous screen-space pixel width in cell units (immune to floor() quads and early-continue!).
-    float px_cell = max(length(vec2(dFdx(st.x), dFdy(st.x))), length(vec2(dFdx(st.y), dFdy(st.y))));
-    float aa = clamp(px_cell * 1.15, 0.010, 0.055);
-    vec2 id = floor(st);
-    vec2 gv = fract(st) - 0.5;
+// Individual stochastic raindrops with unique stick-stop-surge bursts, directional scatter, and
+// piecewise random-walk tracks (zero parallel comb lanes, zero shared path, zero block scrolling).
+// Returns xyz = (n_u, n_v, drop_mask), w = crooked wake wipe mask.
+vec4 rain_rivulet_streams(vec2 uv, vec2 dir, float scale, float dens, float t, float flow_mag, float seed, out float out_relief) {
     vec2 perp = vec2(-dir.y, dir.x);
+    float across = dot(uv, perp) * scale;
+    float along  = dot(uv, dir) * (scale * 0.55);
+
+    float px_w = max(length(vec2(dFdx(across), dFdy(across))), length(vec2(dFdx(along), dFdy(along))));
+    float aa = clamp(px_w * 1.15, 0.012, 0.060);
+
+    vec2 base_id = vec2(floor(across), floor(along));
+    vec2 base_gv = vec2(fract(across), fract(along));
 
     vec2 best_n = vec2(0.0);
     float best_m = 0.0;
     float best_h = 0.0;
-    float tail_len = mix(0.14, 0.48, speed01);
+    float wake_wipe = 0.0;
+    float aspect_v = 1.0 / 0.55; // convert row units into isotropic across units
 
-    for (int dy = -1; dy <= 1; ++dy) {
-        for (int dx = -1; dx <= 1; ++dx) {
-            vec2 off = vec2(float(dx), float(dy));
-            vec2 cid = id + off;
-            vec2 lgv = gv - off;
-            vec3 h = rain_hash32(cid + vec2(scale * 3.17, 11.43));
-            if (h.x > dens) continue;
+    for (int dc = -1; dc <= 1; ++dc) {
+        for (int dr = -1; dr <= 0; ++dr) {
+            vec2 cid = base_id + vec2(float(dc), float(dr));
+            vec3 hc = rain_hash32(cid * vec2(1.73, 2.31) + vec2(seed * 5.1, seed * 3.7));
+            if (hc.x > dens) continue;
 
-            float wobble = 0.036 * sin(dot(cid, dir) * 2.1 + t * (2.6 + 1.8 * h.y) + h.z * 6.2831);
-            vec2 p0 = (h.yz - 0.5) * 0.52 + perp * wobble;
-            float r = mix(0.044, 0.086, h.z * h.z);
+            // Independent droplet cycle frequency and start offset so every drop has a fresh generation.
+            float rate = mix(0.24, 0.64, hc.y) * (0.45 + 0.75 * clamp(flow_mag, 0.0, 1.3));
+            float cyc = t * rate + hc.z * 23.17;
+            float epoch = floor(cyc);
+            float life = fract(cyc);
 
-            vec2 d = lgv - p0;
-            float along = dot(d, dir);
-            float across = dot(d, perp);
+            vec3 hr = rain_hash32(cid * vec2(3.11, 5.79) + vec2(epoch * 7.13 + seed, epoch * 11.41));
+            vec3 hs = rain_hash32(cid * vec2(7.43, 1.97) + vec2(epoch * 13.37, seed * 9.73));
+            if (hr.x > dens) continue;
 
-            float dist_uv;
-            vec2 n_loc;
-            float m_fade = 1.0;
-            float aa_eff = aa;
-            if (along >= 0.0) {
-                float head_y = along / 1.15;
-                dist_uv = length(vec2(across, head_y));
-                n_loc = clamp(vec2(across, head_y) / max(r, 1e-4), vec2(-1.0), vec2(1.0));
-            } else {
-                float u = clamp(-along / tail_len, 0.0, 1.0);
-                float tail_w = max(0.22, (1.0 - 0.78 * u * u) * (1.0 - 0.10 * u));
-                float end_cap = max(0.0, (-along) - tail_len);
-                dist_uv = length(vec2(across, end_cap * tail_w));
-                float r_eff = r * tail_w;
-                float m_tail = smoothstep(r_eff + aa_eff * 0.65, max(0.0, r_eff - aa_eff * 0.65), dist_uv);
-                float n_y = (end_cap > 1e-4) ? (-end_cap / max(r, 1e-4)) : (-0.32 * (1.0 - u));
-                n_loc = clamp(vec2(across / max(r_eff, 1e-4), n_y), vec2(-1.0), vec2(1.0));
-                float m = m_tail * (1.0 - 0.55 * u * u) * smoothstep(tail_len * 0.94, tail_len * 0.35, -along);
-                if (m > best_m) {
-                    best_m = m;
-                    best_n = (perp * n_loc.x + dir * n_loc.y) * m;
-                    best_h = sqrt(max(0.0, 1.0 - dot(n_loc, n_loc) * 0.7)) * m;
-                }
-                continue;
+            // Smooth landing & end-of-run fade-out (never pops cleanly at cell boundary).
+            float fade = smoothstep(0.0, 0.08, life) * smoothstep(1.0, 0.76, life);
+            if (fade < 0.01) continue;
+
+            // Per-drop irregular start position inside its home cell.
+            vec2 origin = vec2(0.22 + 0.56 * hr.y, 0.16 + 0.42 * hr.z);
+
+            // Stick-stop-surge physics: settle briefly -> jerk free -> mid-slide pause -> rapid surge.
+            float u = clamp((life - (0.10 + 0.14 * hs.x)) / 0.86, 0.0, 1.0);
+            float burst1 = smoothstep(0.0, 0.34 + 0.12 * hs.y, u);
+            float burst2 = smoothstep(0.46 + 0.14 * hs.z, 0.96, u);
+            float progress = mix(0.38, 0.62, hr.y) * burst1 + mix(0.62, 0.38, hr.y) * burst2;
+            float max_travel = mix(0.28, 1.25, clamp(flow_mag * 0.72 + hs.x * 0.42, 0.0, 1.0));
+            float slide = max_travel * progress;
+
+            // Individual drop lateral deflection + piecewise 1D random walk along its unique path.
+            float speed01 = clamp(flow_mag, 0.0, 1.0);
+            float dir_skew = (hs.y - 0.5) * mix(0.58, 0.24, speed01);
+            float wk_s = slide * 3.1 + hr.z * 19.3;
+            float wi = floor(wk_s);
+            float wf = smoothstep(0.0, 1.0, fract(wk_s));
+            float w0 = rain_hash11(wi * 7.13 + hs.z * 31.7 + epoch * 3.1) - 0.5;
+            float w1 = rain_hash11((wi + 1.0) * 7.13 + hs.z * 31.7 + epoch * 3.1) - 0.5;
+            float head_x = origin.x + (dir_skew * slide + mix(w0, w1, wf) * mix(0.42, 0.24, speed01)) * smoothstep(0.0, 0.12, slide);
+            float head_y = origin.y + slide;
+
+            // Pixel relative position in neighbor cell coords (dx in across, dy_iso in isotropic along).
+            vec2 px_cell = base_gv - vec2(float(dc), float(dr));
+            float dy_head_iso = (px_cell.y - head_y) * aspect_v;
+            float dx_head = px_cell.x - head_x;
+
+            // Fine natural 2-5mm scale droplet with smooth rounded gravity-flattened front lobe.
+            float r = mix(0.044, 0.095, hs.x * hr.z) * (0.76 + 0.28 * burst1);
+            float stretch = mix(1.08, 1.56, speed01 * smoothstep(0.02, 0.22, slide));
+            float y_squash = dy_head_iso / ((dy_head_iso > 0.0) ? (stretch * 0.86) : (stretch * 1.28));
+            float dist_head = length(vec2(dx_head, y_squash));
+            float m_head = smoothstep(r + aa * 1.1, max(0.0, r - aa * 1.1), dist_head) * fade;
+
+            // Subtle faint translucent damp wake behind moving drop (no opaque polka-dot ropes!).
+            float m_tail = 0.0;
+            float m_wipe = 0.0;
+            float dx_trail = dx_head;
+            float u_tail = 1.0;
+            if (slide > 0.05 && px_cell.y >= origin.y && px_cell.y <= head_y) {
+                float s_px = px_cell.y - origin.y;
+                float wk_px = s_px * 3.1 + hr.z * 19.3;
+                float pi = floor(wk_px);
+                float pf = smoothstep(0.0, 1.0, fract(wk_px));
+                float pw0 = rain_hash11(pi * 7.13 + hs.z * 31.7 + epoch * 3.1) - 0.5;
+                float pw1 = rain_hash11((pi + 1.0) * 7.13 + hs.z * 31.7 + epoch * 3.1) - 0.5;
+                float trail_x = origin.x + (dir_skew * s_px + mix(pw0, pw1, pf) * mix(0.42, 0.24, speed01)) * smoothstep(0.0, 0.12, s_px);
+                dx_trail = px_cell.x - trail_x;
+                u_tail = clamp((head_y - px_cell.y) / max(0.05, slide), 0.0, 1.0);
+                float r_tail = r * mix(0.28, 0.07, u_tail);
+                m_tail = smoothstep(r_tail + aa * 0.85, max(0.0, r_tail - aa * 0.85), abs(dx_trail))
+                       * (1.0 - u_tail) * (1.0 - u_tail) * 0.42 * fade;
+                float wipe_r = r * 1.45;
+                m_wipe = smoothstep(wipe_r + aa, wipe_r * 0.45, abs(dx_trail)) * (1.0 - u_tail * 0.55) * fade;
             }
+            wake_wipe = max(wake_wipe, max(m_head, m_wipe));
 
-            float m = smoothstep(r + aa_eff, r - aa_eff, dist_uv) * m_fade;
+            float m = max(m_head, m_tail);
             if (m > best_m) {
                 best_m = m;
+                bool is_head = (m_head >= m_tail);
+                float dx_u = is_head ? dx_head : dx_trail;
+                float dy_u = is_head ? y_squash : (-0.18 * (1.0 - u_tail));
+                float r_eff = is_head ? r : max(0.015, r * mix(0.28, 0.07, u_tail));
+                vec2 n_loc = clamp(vec2(dx_u / max(r_eff, 1e-4), dy_u / (is_head ? max(r, 1e-4) : 1.0)), vec2(-1.0), vec2(1.0));
                 best_n = (perp * n_loc.x + dir * n_loc.y) * m;
-                best_h = sqrt(max(0.0, 1.0 - dot(n_loc, n_loc) * 0.7)) * m;
+                best_h = sqrt(max(0.0, 1.0 - dot(n_loc, n_loc) * 0.72)) * m;
             }
         }
     }
-    return vec4(best_n, best_m, best_h);
+    out_relief = best_h;
+    return vec4(best_n, best_m, wake_wipe);
+}
+
+// Continuous analytic dual-arm bottom-pivoted windshield wiper sweep & pushed water ridge in Windshield UV space.
+float eval_single_wiper_arc(vec2 uv, vec2 piv, float wiper_pos, float mod_phase, float total_rad,
+                            float park_age_s, float rain_mm, out float out_ridge) {
+    out_ridge = 0.0;
+    const float kAx = 2.25;
+    vec2 d = vec2((uv.x - piv.x) * kAx, piv.y - uv.y);
+    float r = length(d);
+    if (r < 0.12 || r > 0.65 || d.x < -0.02 || d.y < -0.02) return 0.0;
+    float r_fade = smoothstep(0.12, 0.16, r) * (1.0 - smoothstep(0.59, 0.65, r));
+
+    float ang = atan(max(0.0, d.y), max(0.0, d.x));
+    const float ang0 = -0.02, ang1 = 1.38;
+    float phi = (ang - ang0) / (ang1 - ang0);
+    if (phi < -0.03 || phi > 1.03) return 0.0;
+    float phi_c = clamp(phi, 0.0, 1.0);
+    float edge_fade = smoothstep(-0.02, 0.03, phi) * (1.0 - smoothstep(0.97, 1.03, phi));
+
+    // Distance in arc-angle from current blade + pushed liquid meniscus bow wave ahead/trailing the blade edge.
+    float blade_dist = abs(phi - wiper_pos);
+    float active_sweep = smoothstep(0.015, 0.06, total_rad) * (1.0 - smoothstep(0.0, 0.35, park_age_s));
+    out_ridge = exp(-blade_dist * blade_dist / 0.00042) * r_fade * active_sweep;
+    if (total_rad <= 0.01 && park_age_s > 3.5) return 0.0;
+
+    // Exact analytic time elapsed since wiper blade crossed phi on either up-stroke or down-stroke.
+    float th_up = acos(clamp(1.0 - 2.0 * phi_c, -1.0, 1.0));
+    float th_dn = 6.2831853 - th_up;
+    float dt_up = (total_rad >= th_up) ? mod(mod_phase - th_up, 6.2831853) : 99.0;
+    float dt_dn = (total_rad >= th_dn) ? mod(mod_phase - th_dn, 6.2831853) : 99.0;
+    float min_dt = min(dt_up, dt_dn);
+    if (min_dt > 50.0) return 0.0;
+
+    float age_cyc = min_dt / 6.2831853;
+    float refill_rate = mix(0.28, 0.85, clamp(rain_mm / 16.0, 0.0, 1.0));
+    float regrow = clamp(age_cyc * (0.45 + refill_rate * 0.75) + park_age_s * (0.28 + refill_rate * 0.52), 0.0, 1.0);
+    return (1.0 - smoothstep(0.06, 0.92, regrow)) * r_fade * edge_fade;
+}
+
+float wiper_wipe_state(vec2 uv, float rain_mm, out float out_ridge) {
+    float r_l = 0.0, r_r = 0.0;
+    float w_l = eval_single_wiper_arc(uv, vec2(0.18, 1.02), u_glass_wiper.x, u_glass_wiper.y,
+                                      u_glass_wiper.w, u_glass_wiper.z, rain_mm, r_l);
+    float w_r = eval_single_wiper_arc(uv, vec2(0.54, 1.02), u_glass_wiper.x, u_glass_wiper.y,
+                                      u_glass_wiper.w, u_glass_wiper.z, rain_mm, r_r);
+    out_ridge = clamp(max(r_l, r_r), 0.0, 1.0);
+    return clamp(max(w_l, w_r), 0.0, 1.0);
+}
+
+// Forward declaration for non-periodic fluid ripples on side glazing.
+float cabin_grain(vec3 p);
+
+// Side-window organic domain-warped fluid wave normals (zero periodic sine bars).
+vec2 side_glass_film_normals(vec2 base_uv, vec2 flow_dir, vec2 flow_off, float sim_time, float speed01) {
+    vec2 perp = vec2(-flow_dir.y, flow_dir.x);
+    vec2 p = base_uv - flow_off * 0.35;
+    float u_a = dot(p, perp);
+    float u_f = dot(p, flow_dir);
+    vec3 q = vec3(u_a * 11.0, u_f * 6.5 - sim_time * (0.6 + 0.8 * speed01), sim_time * 0.25);
+    float h0 = cabin_grain(q);
+    float ha = cabin_grain(q + vec3(0.08, 0.0, 0.0)) - h0;
+    float hf = cabin_grain(q + vec3(0.0, 0.08, 0.0)) - h0;
+    return clamp((perp * ha + flow_dir * hf) * 14.0, vec2(-1.2), vec2(1.2));
 }
 
 // Fast zero-trig tactile micro-grain for vinyl/leather & bead-blasted aluminum panel finish (~4 ALU ops!)
@@ -310,7 +419,9 @@ void main() {
         vec3 baked_color = base * mix(vec3(1.0), cabin_scale, u_is_interior);
         if (u_is_interior > 0.5) {
             // Subtle high-frequency vinyl/leather micro-pebble grain (zero coarse 5mm blotches on close trim).
-            float g_micro = cabin_grain(v_obj_pos * 1350.0) * 0.65 + cabin_grain(v_obj_pos * 480.0) * 0.35;
+            float g_micro = (u_aircraft_detail != 0)
+                ? (cabin_grain(v_obj_pos * 1350.0) * 0.65 + cabin_grain(v_obj_pos * 480.0) * 0.35)
+                : cabin_grain(v_obj_pos * 880.0);
             float micro = 0.985 + 0.032 * g_micro;
             float sun_resp = mix(1.0, 0.86 + 0.28 * max(0.0, dot(N, sdir)), daylight);
             vec3 sun_tint = mix(vec3(1.0), mix(vec3(1.07, 0.93, 0.80), vec3(1.0, 0.99, 0.97), clamp(sdir.y / 0.35, 0.0, 1.0)), daylight * 0.50);
@@ -357,7 +468,7 @@ void main() {
         vec3 V = normalize(-v_world_pos);
         if (dot(N, V) < 0.0) N = -N;
         float rain_mm = max(0.0, u_glass_weather.x);
-        float wet = smoothstep(0.03, 1.8, rain_mm);
+        float wet = smoothstep(0.45, 2.8, rain_mm);
         float heavy_rain = smoothstep(3.5, 22.0, rain_mm);
         float frost_raw = clamp(u_glass_fx.x, 0.0, 1.0);
         float mist_raw  = clamp(u_glass_fx.y, 0.0, 1.0);
@@ -392,56 +503,113 @@ void main() {
         float sim_time = u_glass_weather.y;
         bool front_glass = (u_cabin_glass == 2);
 
-        // 1. Procedural optical water beads & attitude/speed-coupled teardrops (zero grid/cell rectangles!).
+        // 1. Live asynchronous gravity + slipstream droplets, rivulets & continuous superficial water film.
         vec2 drop_nrm = vec2(0.0);
+        vec2 sheet_nrm = vec2(0.0);
         float drop_mask = 0.0;
         float drop_relief = 0.0;
-        bool baked_rain = u_aircraft_detail == 0 && (u_rain_luts & (front_glass ? 1 : 2)) != 0;
-        if (wet > 0.005 && baked_rain) {
-            // The relief volume stores normals in RG, dome height in B and
-            // coverage in A. Advect the larger drops with the live pane flow.
-            float rate_slice = rain_mm < 2.5 ? smoothstep(0.35, 2.5, rain_mm) :
-                               rain_mm < 12.0 ? 1.0 + smoothstep(2.5, 12.0, rain_mm) :
-                                                2.0 + smoothstep(12.0, 45.0, rain_mm);
-            vec2 flow = front_glass ? u_glass_flow_front.xy : u_glass_flow_side.xy;
-            vec2 uv = vec2(v_uv.x, v_uv.y) * (front_glass ? vec2(1.25, 0.95) : vec2(0.95, 0.76)) - flow;
-            vec3 rain_uv = vec3(uv, (rate_slice + 0.5) * 0.25);
-            vec4 rain = front_glass ? textureLod(u_windscreen_rain_front, rain_uv, 0.0) :
-                                      textureLod(u_windscreen_rain_side, rain_uv, 0.0);
-            drop_mask = smoothstep(0.12, 0.60, rain.a) * wet;
-            drop_nrm = (rain.rg * 2.0 - 1.0) * vec2(1.0, -1.0) * drop_mask;
-            drop_relief = rain.b * wet;
-        } else if (wet > 0.005) {
-            float rain_dens = clamp(0.24 + 0.48 * wet + 0.26 * heavy_rain, 0.0, 0.94);
+        float film_sheet = 0.0;
+        float bow_ridge = 0.0;
+        if (wet > 0.005) {
+            float wipe_clear = 0.0;
+            float sim_fill = 1.0;
             vec4 flow_in = front_glass ? u_glass_flow_front : u_glass_flow_side;
+            float airspeed_mps = max(0.0, u_glass_weather.z);
             vec2 flow_vel = flow_in.zw;
-            float vel_mag = length(flow_vel);
-            float speed01 = smoothstep(0.10, 0.85, vel_mag);
-            vec2 flow_dir = (vel_mag > 1e-4) ? (flow_vel / vel_mag) : vec2(0.0, 1.0);
             if (front_glass) {
-                // Aerodynamic outward radial push around curved windshield sides when airflow exceeds gravity
+                // Sample true 256x160 GPU Shallow-Water Fluid & Wiper Simulation (R=height, GB=vel, A=wet trail)
+                const vec2 sim_px = vec2(1.0 / 256.0, 1.0 / 160.0);
+                vec4 sc  = texture(u_windshield_sim, v_uv);
+                float hL = texture(u_windshield_sim, v_uv - vec2(sim_px.x, 0.0)).r;
+                float hR = texture(u_windshield_sim, v_uv + vec2(sim_px.x, 0.0)).r;
+                float hD = texture(u_windshield_sim, v_uv - vec2(0.0, sim_px.y)).r;
+                float hU = texture(u_windshield_sim, v_uv + vec2(0.0, sim_px.y)).r;
+                float sim_h = sc.r;
+                float sim_wet = sc.a;
+                // Couple local fluid simulation velocity (crosswind, prop swirl, gravity & wiper) directly into bead streaks!
+                flow_vel = mix(flow_vel, sc.gb * 1.25, clamp(max(sim_h * 4.0, sim_wet), 0.0, 0.85));
+                // Surface gradient bends light smoothly along real pooled channels, rivulets, and bow-waves!
+                vec2 grad_sim = vec2(hR - hL, hD - hU) * 16.5;
+                sheet_nrm = clamp(grad_sim, vec2(-1.4), vec2(1.4));
+                film_sheet = clamp(smoothstep(0.02, 0.30, sim_h) * 0.92 + smoothstep(0.05, 0.45, sim_wet) * 0.24, 0.0, 1.0);
+                // Live bead density & rivulets fill wiped areas strictly from dynamic fluid sim accumulation!
+                sim_fill = clamp(smoothstep(0.015, 0.22, max(sim_h, sim_wet * 0.65)), 0.0, 1.0);
+                wipe_clear = 1.0 - sim_fill;
+                // Bow-wave highlight from steep pushed wavefront on simulated water height
+                bow_ridge = clamp(length(grad_sim) * smoothstep(0.18, 0.55, sim_h) * 0.38, 0.0, 1.0);
+            }
+            float vel_mag = length(flow_vel);
+            float speed01 = smoothstep(0.05, 1.05, max(vel_mag, airspeed_mps / 44.0));
+            vec2 raw_dir = (vel_mag > 1e-4) ? (flow_vel / vel_mag) : vec2(0.0, 1.0);
+            vec2 flow_dir = normalize(mix(vec2(0.0, 1.0), raw_dir, smoothstep(0.02, 0.14, vel_mag)));
+            if (front_glass) {
+                // Aerodynamic outward radial push around curved windshield sides when airflow lifts drops.
                 float up_flow = clamp(-flow_vel.y, 0.0, 1.5);
                 flow_dir = normalize(flow_dir + vec2((v_uv.x - 0.5) * 0.42 * up_flow, 0.0));
             }
-            float stretch = mix(1.04, 1.42, speed01);
-            vec2 base_uv = front_glass ? vec2(v_uv.x * 1.45, v_uv.y) : vec2(v_uv.x * 1.35, v_uv.y);
-            vec2 base_shift = front_glass ? vec2(flow_in.x * 1.45, flow_in.y) : vec2(flow_in.x * 1.35, flow_in.y);
+            float flow_drive = mix(0.14, 2.35, clamp(max(vel_mag, airspeed_mps / 42.0), 0.0, 1.35)) * (0.72 + 0.48 * wet);
+            float stretch = mix(1.02, 2.35, speed01);
 
-            float imp_dens = rain_dens * mix(0.86, 0.62, speed01);
-            vec4 st0 = rain_static_beads(base_uv, front_glass ? 21.0 : 23.0, sim_time, imp_dens, flow_dir, stretch);
-            vec4 st1 = rain_static_beads(base_uv + vec2(0.37, 0.61), front_glass ? 36.0 : 38.0, sim_time * 1.24 + 3.1, imp_dens * 0.90, flow_dir, stretch);
-            vec4 rv0 = rain_rivulet_layer(base_uv, base_shift, flow_dir, front_glass ? 12.5 : 14.0, rain_dens * mix(0.42, 0.72, speed01), sim_time, speed01);
-            vec4 rv1 = rain_rivulet_layer(base_uv + vec2(0.41, 0.23), base_shift * 0.72, flow_dir, front_glass ? 19.5 : 21.5, rain_dens * mix(0.30, 0.58, speed01), sim_time * 1.18 + 2.3, speed01);
+            // Use physical meter-scale object-space glass coordinates on lateral & rear windows so droplets and
+            // rivulets match the front windshield's exact millimeter scale (never stretched by atlas UVs!).
+            vec2 base_uv;
+            if (front_glass) {
+                base_uv = vec2(v_uv.x * 1.45, v_uv.y);
+            } else {
+                vec3 fn_obj = abs(normalize(cross(dFdx(v_obj_pos), dFdy(v_obj_pos)) + vec3(1e-6, 0.0, 0.0)));
+                bool is_side = (fn_obj.x >= fn_obj.z);
+                // Side glass: horizontal = aft (+Z), vertical = down (-Y); Rear glass: horizontal = X, vertical = down (-Y).
+                vec2 pane_m = is_side ? vec2(v_obj_pos.z * 0.95, -v_obj_pos.y * 1.05)
+                                      : vec2(v_obj_pos.x * 1.05, -v_obj_pos.y * 1.05);
+                base_uv = pane_m * vec2(1.35, 1.0);
+                // On lateral glass, slipstream drives water streaks aft (+X in pane_m) and gravity pulls downward (+Y).
+                if (is_side) {
+                    vec2 side_air = vec2(mix(0.25, 1.45, speed01), mix(0.95, 0.35, speed01));
+                    flow_dir = normalize(side_air);
+                } else {
+                    flow_dir = normalize(vec2((v_obj_pos.x) * 0.25 * speed01, 1.0));
+                }
+                // Sample live 256x160 GPU fluid film on side & rear panes too (mirrored seamless coords, unwiped)!
+                const vec2 sim_px = vec2(1.0 / 256.0, 1.0 / 160.0);
+                vec2 s_raw = is_side ? vec2(-pane_m.y * 0.72, pane_m.x * 0.65) : (pane_m * vec2(0.85, 0.85));
+                vec2 s_uv = clamp(abs(fract(s_raw * 0.5 + 0.5) * 2.0 - 1.0) * 0.84 + 0.08, vec2(0.04), vec2(0.96));
+                vec4 sc  = texture(u_windshield_sim, s_uv);
+                float hL = texture(u_windshield_sim, s_uv - vec2(sim_px.x, 0.0)).r;
+                float hR = texture(u_windshield_sim, s_uv + vec2(sim_px.x, 0.0)).r;
+                float hD = texture(u_windshield_sim, s_uv - vec2(0.0, sim_px.y)).r;
+                float hU = texture(u_windshield_sim, s_uv + vec2(0.0, sim_px.y)).r;
+                vec2 grad_sim = vec2(hR - hL, hD - hU) * 14.5;
+                vec2 s_uv_n = side_glass_film_normals(base_uv, flow_dir, flow_in.xy, sim_time, speed01);
+                float sheet_base = wet * mix(0.32, 0.86, smoothstep(0.6, 8.0, rain_mm));
+                film_sheet = clamp(max(sheet_base, smoothstep(0.03, 0.32, sc.r) * 0.85), 0.0, 1.0);
+                sheet_nrm = clamp(mix(vec2(s_uv_n.x, -s_uv_n.y), grad_sim, 0.65) * film_sheet, vec2(-1.35), vec2(1.35));
+            }
 
-            float m_st = max(st0.z, st1.z * 0.85);
-            vec2 n_st = mix(st1.xy * 0.84, st0.xy, st0.z);
+            float rain_dens = clamp((0.24 + 0.46 * wet + 0.26 * heavy_rain) * mix(0.04, 1.0, sim_fill), 0.0, 0.94);
+
+            float rel0 = 0.0, rel1 = 0.0;
+            vec4 rv0 = rain_rivulet_streams(base_uv, flow_dir, 22.0,
+                                            rain_dens * mix(0.46, 0.78, speed01), sim_time, flow_drive, 1.7, rel0);
+            vec4 rv1 = rain_rivulet_streams(base_uv + vec2(0.31, 0.47), flow_dir, 36.0,
+                                            rain_dens * mix(0.34, 0.66, speed01), sim_time * 1.09 + 4.3, flow_drive * 0.82, 5.9, rel1);
+            float wake = clamp(max(rv0.w, rv1.w), 0.0, 1.0);
+
+            float imp_dens = rain_dens * mix(0.76, 0.48, speed01);
+            vec4 st0 = rain_static_beads(base_uv, 34.0, sim_time, imp_dens, flow_dir, stretch, 2.3);
+            vec4 st1 = (u_aircraft_detail != 0)
+                ? rain_static_beads(base_uv + vec2(0.37, 0.61), 54.0, sim_time * 1.19 + 3.1, imp_dens * 0.82, flow_dir, stretch, 8.1)
+                : vec4(0.0);
+
+            float sweep = 1.0 - wake * 0.85;
+            float m_st = max(st0.z, st1.z * 0.85) * sweep;
+            vec2 n_st = mix(st1.xy * 0.84, st0.xy, st0.z) * sweep;
             float m_rv = max(rv0.z, rv1.z * 0.86);
             vec2 n_rv = mix(rv1.xy * 0.85, rv0.xy, rv0.z);
 
-            drop_mask = clamp(max(m_st, m_rv), 0.0, 1.0) * wet;
-            vec2 n_uv = mix(n_st, n_rv, clamp(m_rv * 1.20, 0.0, 1.0));
+            drop_mask = clamp((max(m_st, m_rv) * sim_fill + bow_ridge * 0.35) * wet, 0.0, 1.0);
+            vec2 n_uv = mix(n_st, n_rv, clamp(m_rv * 1.25, 0.0, 1.0)) * sim_fill;
             drop_nrm = vec2(n_uv.x, -n_uv.y);
-            drop_relief = clamp(max(max(st0.w, st1.w * 0.75), max(rv0.w, rv1.w * 0.80)), 0.0, 1.0) * wet;
+            drop_relief = clamp((max(max(st0.w, st1.w * 0.75) * sweep, max(rel0, rel1 * 0.82)) * sim_fill) + bow_ridge * 0.30, 0.0, 1.0) * wet;
         }
 
         // 2. Crystalline Frost / Rime Ice creeping inward from A-pillars & top frame, cleared by lower-center defroster!
@@ -473,50 +641,59 @@ void main() {
         float crack_mask = glass_crack_mask(v_uv, crack_raw, front_glass);
 
         float fresnel = pow(1.0 - max(0.0, dot(N, V)), 4.5);
-        float drop_alpha = smoothstep(0.02, 0.35, drop_mask);
-        // Smooth continuous optical water sheen without cell-clipped wipe tiles
-        float film_alpha = front_glass && heavy_rain > 0.01 ?
-            heavy_rain * 0.065 * (0.75 + 0.25 * cabin_grain(v_obj_pos * 12.0)) : 0.0;
+        float drop_alpha = smoothstep(0.02, 0.30, drop_mask);
+        // Active optical superficial water layer across all rain intensities (cleared cleanly by wipers!)
+        float film_alpha = film_sheet > 0.01 ?
+            clamp(film_sheet * (front_glass ? 0.14 : 0.09) + bow_ridge * 0.14, 0.0, 0.28) : 0.0;
         float non_drop_alpha = fresnel * 0.055 + frost_mask * 0.80 + mist_mask + grime_mask + crack_mask * 0.72;
-        float glass_alpha = clamp(max(max(drop_alpha, film_alpha), non_drop_alpha), 0.0, 0.96);
+        float glass_alpha = clamp(max(max(drop_alpha * 0.45, film_alpha), non_drop_alpha), 0.0, 0.96);
         if (glass_alpha < 0.012) { frag_color = vec4(0.0); return; }
 
         float daylight = smoothstep(-0.10, 0.16, u_sun_dir.y);
         vec3 glass_color;
-        if (u_native_output != 0 && (drop_alpha > 0.02 || film_alpha > 0.02)) {
-            float slope_mag = clamp(length(drop_nrm), 0.0, 1.0);
-            float dome_z = sqrt(max(0.08, 1.0 - slope_mag * slope_mag * 0.86));
-            vec3 bead_n = normalize(vec3(drop_nrm * 0.92, dome_z));
-            float water_fresnel = (0.025 + 0.975 * pow(1.0 - dome_z, 4.0)) * drop_alpha;
-            float spec = pow(max(0.0, dot(bead_n, normalize(vec3(0.24, 0.62, 0.75)))), 36.0) * drop_alpha;
-            float sky_arc = pow(max(0.0, dot(bead_n, normalize(vec3(-0.15, 0.85, 0.50)))), 5.0) * smoothstep(0.35, 0.92, slope_mag) * drop_alpha;
-            float meniscus_dark = smoothstep(0.64, 0.96, slope_mag) * 0.34 * drop_alpha;
-            vec3 sky_refl = mix(vec3(0.22, 0.28, 0.36), mix(u_haze_cool, vec3(0.92, 0.96, 1.0), 0.45), daylight);
-            vec3 spec_col = mix(vec3(0.55, 0.65, 0.78), vec3(1.45, 1.48, 1.52), daylight);
+        if (u_native_output != 0 && (drop_alpha > 0.02 || film_alpha > 0.015)) {
+            vec2 comb_nrm = clamp(drop_nrm + sheet_nrm * mix(0.65, 0.28, drop_alpha), vec2(-1.4), vec2(1.4));
+            float slope_mag = clamp(length(comb_nrm), 0.0, 1.15);
+            float sheet_slope = clamp(length(sheet_nrm), 0.0, 1.15);
+            float dome_z = sqrt(max(0.08, 1.0 - min(1.0, slope_mag * slope_mag * 0.82)));
+            vec3 bead_n = normalize(vec3(comb_nrm * 0.92, dome_z));
+            float film_vis = clamp(max(drop_alpha, film_sheet * 0.72), 0.0, 1.0);
+            float water_fresnel = (0.02 + 0.88 * pow(1.0 - dome_z, 4.2)) * film_vis;
+            float spec = (pow(max(0.0, dot(bead_n, normalize(vec3(0.24, 0.62, 0.75)))), 72.0) * drop_alpha)
+                       + (pow(max(0.0, dot(bead_n, normalize(vec3(0.18, 0.58, 0.79)))), 36.0) * film_sheet * 0.34);
+            float sky_arc = pow(max(0.0, dot(bead_n, normalize(vec3(-0.15, 0.85, 0.50)))), 6.0) * smoothstep(0.28, 0.92, slope_mag) * film_vis;
+            float meniscus_rim = smoothstep(0.56, 0.95, clamp(length(drop_nrm), 0.0, 1.0)) * drop_alpha;
+            vec3 sky_refl = mix(vec3(0.22, 0.28, 0.36), mix(u_haze_cool, vec3(0.95, 0.98, 1.0), 0.40), daylight);
+            vec3 spec_col = mix(vec3(0.65, 0.75, 0.88), vec3(1.55, 1.58, 1.62), daylight);
             vec3 water_hdr;
             float out_drop_a;
             {
-                // True optical HDR convex-lens refraction across both front windshield & side cabin glazing!
+                // Continuous superficial water-layer refraction + discrete droplet lenses over live HDR backdrop!
                 vec2 screen_uv = clamp((v_clip_pos.xy / max(1e-5, v_clip_pos.w)) * 0.5 + 0.5, vec2(0.002), vec2(0.998));
                 float edge_guard = smoothstep(0.0, 0.035, min(min(screen_uv.x, 1.0 - screen_uv.x), min(screen_uv.y, 1.0 - screen_uv.y)));
-                vec2 refr_scale = front_glass ? vec2(0.030, 0.046) : vec2(0.022, 0.034);
-                vec2 refr_uv = clamp(screen_uv - drop_nrm * refr_scale * (0.55 + 0.65 * drop_relief) * edge_guard,
-                                     vec2(0.002), vec2(0.998));
+                vec2 sheet_scale = front_glass ? vec2(0.011, 0.016) : vec2(0.010, 0.015);
+                vec2 drop_scale  = front_glass ? vec2(0.025, 0.039) : vec2(0.023, 0.036);
+                vec2 total_refr  = (sheet_nrm * sheet_scale + drop_nrm * drop_scale * (0.55 + 0.65 * drop_relief)) * edge_guard;
+                vec2 refr_uv = clamp(screen_uv - total_refr, vec2(0.002), vec2(0.998));
                 vec3 refr_hdr = textureLod(u_backdrop_tex, refr_uv, 0.0).rgb;
-                if (u_aircraft_detail != 0 && film_alpha > 0.02 && drop_alpha < 0.85) {
-                    vec2 blur_r = vec2(0.0020, 0.0034) * edge_guard;
-                    vec3 film_hdr = 0.25 * (
-                        textureLod(u_backdrop_tex, clamp(screen_uv + vec2(blur_r.x, blur_r.y), vec2(0.002), vec2(0.998)), 0.0).rgb +
-                        textureLod(u_backdrop_tex, clamp(screen_uv + vec2(-blur_r.x, blur_r.y), vec2(0.002), vec2(0.998)), 0.0).rgb +
-                        textureLod(u_backdrop_tex, clamp(screen_uv + vec2(blur_r.x, -blur_r.y), vec2(0.002), vec2(0.998)), 0.0).rgb +
-                        textureLod(u_backdrop_tex, clamp(screen_uv + vec2(-blur_r.x, -blur_r.y), vec2(0.002), vec2(0.998)), 0.0).rgb);
-                    refr_hdr = mix(film_hdr, refr_hdr, drop_alpha);
+                if (film_sheet > 0.25 && drop_alpha < 0.75) {
+                    // Subtle flow-aligned directional light dispersion only in thickest unwiped sheet pockets
+                    vec2 blur_r = (abs(sheet_nrm) * 0.0014 + vec2(0.0008, 0.0012)) * (film_sheet * edge_guard);
+                    vec3 film_hdr = 0.5 * (
+                        textureLod(u_backdrop_tex, clamp(refr_uv + blur_r, vec2(0.002), vec2(0.998)), 0.0).rgb +
+                        textureLod(u_backdrop_tex, clamp(refr_uv - blur_r, vec2(0.002), vec2(0.998)), 0.0).rgb);
+                    refr_hdr = mix(refr_hdr, film_hdr, clamp((film_sheet - 0.25) * 0.65 * (1.0 - drop_alpha), 0.0, 0.55));
                 }
-                water_hdr = refr_hdr * (1.0 - meniscus_dark)
-                          + sky_refl * (water_fresnel * 0.52 + sky_arc * 0.22)
-                          + spec_col * (spec * 0.85)
-                          + vec3(0.68, 0.84, 1.20) * (flash * (0.16 * drop_alpha + spec * 0.90));
-                out_drop_a = max(drop_alpha, film_alpha);
+                // Dark total-internal-reflection drop rim + crystal-clear wavy water lens + liquid specular glint (ZERO milky veil!)
+                float rim_tint = smoothstep(0.65, 0.96, clamp(length(drop_nrm), 0.0, 1.0)) * 0.42 * drop_alpha;
+                float sheet_edge_hl = smoothstep(0.38, 0.96, sheet_slope) * film_sheet * (1.0 - drop_alpha);
+                float glints = spec * 1.15 + sheet_edge_hl * 0.08 * daylight;
+                water_hdr = mix(refr_hdr * mix(1.0, 0.96, film_sheet * 0.4 + drop_alpha * 0.6), vec3(0.06, 0.08, 0.11), rim_tint)
+                          + sky_refl * (water_fresnel * 0.34 + sky_arc * 0.26)
+                          + spec_col * glints
+                          + vec3(0.68, 0.84, 1.20) * (flash * (0.07 * film_vis + spec * 0.90));
+                float sheet_out_a = smoothstep(0.03, 0.20, film_sheet) * 0.94 + bow_ridge * 0.16;
+                out_drop_a = clamp(max(sheet_out_a, drop_alpha * (0.14 + 0.46 * meniscus_rim + 0.55 * water_fresnel)) + spec * 0.85, 0.0, 0.96);
             }
             water_hdr = mix(water_hdr, vec3(0.84, 0.90, 0.97) * (0.30 + 0.72 * daylight), snow_fac * 0.28 * drop_alpha);
 

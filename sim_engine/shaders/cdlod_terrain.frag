@@ -30,6 +30,7 @@ uniform float u_snowline_m; // Season- and weather-specific regional snowline ab
 uniform vec4 u_grass_zone;        // EN center, then runway direction (E,N).
 uniform vec4 u_grass_zone_bounds; // half length, outer half width, runway half width, grass-surface flag.
 uniform vec4 u_wx_env;            // x=ground_wetness01, y=snow_factor01, z=lightning_flash01, w=storm_int01
+uniform float u_debug_lod;        // >0 overlays quadtree LOD heatmap, morph zones & patch wireframe grid
 
 in vec3 v_world_pos;
 in vec2 v_world_en;
@@ -294,14 +295,19 @@ void ground_relief(inout vec3 albedo, inout vec3 normal, float vegetation, float
 }
 
 void main() {
-    float n_macro = textureLod(u_cloud_noise, v_world_en * 0.00018 + vec2(0.17, 0.43), 0.0).r;
-    float n_meso  = textureLod(u_cloud_noise, v_world_en * 0.00095 + vec2(n_macro * 0.15, -n_macro * 0.12), 0.0).r;
+    float n_macro = 0.5;
+    float n_meso = 0.5;
+    bool need_morph_noise = (v_morph > 0.001 && v_morph < 0.999) || (v_fade_in < 0.999);
+    if (need_morph_noise || v_elev_m >= u_snowline_m - 260.0 || u_quality > 2) {
+        n_macro = textureLod(u_cloud_noise, v_world_en * 0.00018 + vec2(0.17, 0.43), 0.0).r;
+        n_meso  = textureLod(u_cloud_noise, v_world_en * 0.00095 + vec2(n_macro * 0.15, -n_macro * 0.12), 0.0).r;
+    }
 
     // 1. Organic Noise-Modulated Stochastic CDLOD Parent <-> Child Dissolve (ZERO boxy or jaggy tile inclusions!)
     // New high-res tiles flow naturally across ridges & fields via Perlin-modulated smoothstep!
     float org_noise = (n_macro * 0.60 + n_meso * 0.40 - 0.50) * 0.28;
     float arrival_blend = smoothstep(0.0, 1.0, clamp((v_fade_in * 1.28) - (org_noise + 0.14), 0.0, 1.0));
-    float tex_morph = clamp(max(smoothstep(0.0, 1.0, v_morph + org_noise * 0.55), 1.0 - arrival_blend), 0.0, 1.0);
+    float tex_morph = need_morph_noise ? clamp(max(smoothstep(0.0, 1.0, v_morph + org_noise * 0.55), 1.0 - arrival_blend), 0.0, 1.0) : v_morph;
 
     vec2 ortho_c_uv = (vec2(0.5) + v_child_uv * 511.0) / 512.0;
     vec2 ortho_p_uv = (vec2(0.5) + v_parent_uv * 511.0) / 512.0;
@@ -354,8 +360,8 @@ void main() {
         float rock_fast = smoothstep(0.20, 0.38, slope_fast) * smoothstep(480.0, 720.0, v_elev_m);
         float veg_fast = clamp(max(forest_fast, green_fast * (1.0 - rock_fast)), 0.0, 1.0);
         vec3 fast_albedo = ortho;
-        // Skip u_sat_arr lookup on dense forest canopy (ortho + LiDAR canopy volume supplies the detail).
-        if (forest_fast < 0.82 && v_dist < 14000.0) {
+        // Skip u_sat_arr lookup on dense forest canopy or distant atmospheric haze (ortho + LiDAR canopy volume supplies detail).
+        if (forest_fast < 0.82 && v_dist < 10500.0) {
             int layer_fast = (rock_fast > 0.42) ? ((v_elev_m > 1650.0) ? 13 : 12) :
                              (forest_fast > 0.28) ? ((v_elev_m > 1080.0) ? 9 : 6) :
                              (green_fast > 0.42) ? 2 : 4;
@@ -998,5 +1004,25 @@ void main() {
     vec3 peak_rim_bend = u_haze_warm * (light_bend * 0.42 * (1.0 - water_mask));
 
     vec3 out_col = mix(lit, inscatter, fog_a * 0.90) + peak_rim_bend + (water_glint + pmrf_em) * (1.0 - fog_a * 0.80);
+    if (u_debug_lod > 0.005) {
+        float lod_f = clamp(round(log2(163840.0 / max(v_node_size, 320.0))), 0.0, 9.0);
+        vec3 lod_c = (lod_f >= 8.5) ? vec3(0.08, 0.96, 1.00) : // L9 320m: Cyan
+                     (lod_f >= 7.5) ? vec3(0.20, 0.94, 0.46) : // L8 640m: Emerald
+                     (lod_f >= 6.5) ? vec3(0.98, 0.80, 0.16) : // L7 1.28km: Gold
+                     (lod_f >= 5.5) ? vec3(1.00, 0.42, 0.14) : // L6 2.56km: Orange
+                                      vec3(0.64, 0.36, 1.00);  // L<=5 Horizon: Violet
+        vec3 diag_tint = mix(lod_c, vec3(1.00, 0.22, 0.78), clamp(v_morph * 0.85, 0.0, 1.0));
+        float edge_d = min(min(v_child_uv.x, 1.0 - v_child_uv.x), min(v_child_uv.y, 1.0 - v_child_uv.y));
+        float tile_bw = max(fwidth(v_child_uv.x), fwidth(v_child_uv.y)) * 1.7 + 0.003;
+        float tile_line = 1.0 - smoothstep(0.0, tile_bw, edge_d);
+        vec2 grid_uv = fract(v_child_uv * 16.0);
+        float gd = min(min(grid_uv.x, 1.0 - grid_uv.x), min(grid_uv.y, 1.0 - grid_uv.y));
+        float gw = max(fwidth(grid_uv.x), fwidth(grid_uv.y)) * 1.15 + 0.01;
+        float sub_line = (1.0 - smoothstep(0.0, gw, gd)) * 0.46 * (1.0 - smoothstep(14000.0, 32000.0, v_dist));
+        float shade = clamp(dot(final_n, normalize(sdir)) * 0.58 + 0.46, 0.26, 1.0);
+        vec3 mixed = mix(out_col, diag_tint * shade, clamp(u_debug_lod * 0.62, 0.0, 0.85));
+        mixed = mix(mixed, vec3(1.0, 0.98, 0.92), clamp((tile_line + sub_line) * min(1.0, u_debug_lod * 1.35), 0.0, 1.0));
+        out_col = mixed;
+    }
     frag_color = vec4(out_col, 1.0);
 }

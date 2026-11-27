@@ -56,12 +56,71 @@ struct AlsaApi {
 AlsaApi g_alsa;
 
 inline float one_pole_alpha(float cutoff_hz) {
-    const float w = 6.2831853f * std::clamp(cutoff_hz, 5.0f, 18000.0f) * kInvSr;
+    const float w = 6.2831853f * std::clamp(cutoff_hz, 5.0f, 20000.0f) * kInvSr;
     return w / (1.0f + w);
 }
 
 inline double wrap_phase(double p) {
     return p - std::floor(p);
+}
+
+template <size_t N>
+inline float read_delay_linear(const std::array<float, N> &buf, unsigned int write_idx, float delay_samples) {
+    constexpr unsigned int kMask = static_cast<unsigned int>(N - 1);
+    const float clamped = std::clamp(delay_samples, 0.0f, static_cast<float>(N - 2));
+    const unsigned int i0 = static_cast<unsigned int>(clamped);
+    const float frac = clamped - static_cast<float>(i0);
+    const float s0 = buf[(write_idx - i0) & kMask];
+    const float s1 = buf[(write_idx - i0 - 1u) & kMask];
+    return s0 + (s1 - s0) * frac;
+}
+
+// Binaural 3D spatializer: pinna front/back + elevation timbre -> fractional Woodworth ITD -> far-ear head-shadow ILD.
+template <size_t N>
+inline void spatialize_binaural(
+    float mono_in,
+    std::array<float, N> &delay_buf, unsigned int &delay_idx,
+    float pan, float front, float elev, float depth01,
+    float &lp_front, float &lp_shadow_l, float &lp_shadow_r,
+    float &out_l, float &out_r
+) {
+    const float p = std::clamp(pan, -1.0f, 1.0f);
+    const float f = std::clamp(front, -1.0f, 1.0f);
+    const float e = std::clamp(elev, -1.0f, 1.0f);
+    const float d = std::clamp(depth01, 0.0f, 1.0f);
+
+    // Pinna front/back & overhead shelf: sounds behind head or sharply above/below lose upper crispness naturally.
+    const float pinna_cut = std::clamp(8800.0f + f * 5800.0f - std::abs(e) * 2400.0f, 2600.0f, 16500.0f);
+    lp_front += (mono_in - lp_front) * one_pole_alpha(pinna_cut);
+    const float back_blend = d * std::clamp(0.28f + 0.62f * (0.5f - 0.5f * f) + 0.25f * std::abs(e), 0.0f, 0.92f);
+    const float shaped = mono_in + (lp_front - mono_in) * back_blend;
+
+    constexpr unsigned int kMask = static_cast<unsigned int>(N - 1);
+    delay_idx = (delay_idx + 1u) & kMask;
+    delay_buf[delay_idx] = shaped;
+
+    // Fractional ITD up to ~0.60 ms (~28.8 samples @ 48 kHz), cosine-tapered at high elevation.
+    const float elev_cos = 1.0f - 0.16f * std::abs(e);
+    const float itd = 28.5f * p * d * elev_cos;
+    const float dl = (itd > 0.0f) ? (1.0f + itd) : 1.0f;
+    const float dr = (itd < 0.0f) ? (1.0f - itd) : 1.0f;
+    const float ear_l = read_delay_linear(delay_buf, delay_idx, dl);
+    const float ear_r = read_delay_linear(delay_buf, delay_idx, dr);
+
+    // Head-shadow diffraction ILD: contralateral ear rolls off highs down to ~2.3 kHz.
+    const float shadow_amt_l = std::clamp( std::max(0.0f,  p) * d, 0.0f, 1.0f);
+    const float shadow_amt_r = std::clamp( std::max(0.0f, -p) * d, 0.0f, 1.0f);
+    lp_shadow_l += (ear_l - lp_shadow_l) * one_pole_alpha(15500.0f - shadow_amt_l * 13200.0f);
+    lp_shadow_r += (ear_r - lp_shadow_r) * one_pole_alpha(15500.0f - shadow_amt_r * 13200.0f);
+    const float filt_l = ear_l + (lp_shadow_l - ear_l) * (shadow_amt_l * 0.85f);
+    const float filt_r = ear_r + (lp_shadow_r - ear_r) * (shadow_amt_r * 0.85f);
+
+    // Constant-power + ILD level asymmetry.
+    const float pan_eff = p * d * 0.86f;
+    const float gain_l = std::sqrt(0.5f * (1.0f - pan_eff)) * 1.41421356f;
+    const float gain_r = std::sqrt(0.5f * (1.0f + pan_eff)) * 1.41421356f;
+    out_l = filt_l * gain_l;
+    out_r = filt_r * gain_r;
 }
 
 } // namespace
@@ -96,15 +155,42 @@ void AudioEngine::SynthState::render_stereo(const AudioState &st, int16_t *out, 
     }
     if (st.lightning_flash > 0.25f && prev_lightning <= 0.25f) {
         thunder_env = std::max(thunder_env, std::clamp(st.lightning_flash, 0.45f, 1.0f));
+        thunder_pan = std::clamp(next_noise() * 0.78f, -0.78f, 0.78f);
     }
     prev_lightning = st.lightning_flash;
 
-    // Spatial attenuation & stereo pan for engine/prop relative to camera.
+    // Spatial attenuation, Doppler shift, air absorption & binaural coordinates.
     const float dist = std::max(0.0f, st.aircraft_dist_m);
-    const float ac_atten = (st.in_cockpit && !st.walking) ? 1.0f : (1.0f / (1.0f + dist * 0.065f));
-    const float pan = (st.in_cockpit && !st.walking) ? 0.0f : std::clamp(st.aircraft_pan, -1.0f, 1.0f);
-    const float pan_l = std::sqrt(0.5f * (1.0f - pan));
-    const float pan_r = std::sqrt(0.5f * (1.0f + pan));
+    const float ac_atten = (st.in_cockpit && !st.walking) ? 1.0f : (1.0f / (1.0f + dist * 0.055f));
+    const float target_pan = std::clamp(st.aircraft_pan, -1.0f, 1.0f);
+    const float target_front = std::clamp(st.aircraft_front, -1.0f, 1.0f);
+    const float target_elev = std::clamp(st.aircraft_elev, -1.0f, 1.0f);
+    const float target_wind_pan = std::clamp(st.wind_pan, -1.0f, 1.0f);
+    const float target_doppler = (st.in_cockpit && !st.walking)
+        ? 1.0f
+        : (340.0f / std::clamp(340.0f - st.aircraft_rel_speed_mps, 235.0f, 445.0f));
+
+    const bool traffic_audible = (st.traffic_rpm > 50.0f && st.traffic_dist_m < 2400.0f);
+    const float target_tr_atten = traffic_audible
+        ? ((st.in_cockpit && !st.walking ? 0.34f : 0.72f) / (1.0f + std::max(0.0f, st.traffic_dist_m) * 0.022f))
+        : 0.0f;
+    const float target_tr_pan = std::clamp(st.traffic_pan, -1.0f, 1.0f);
+    const float target_tr_front = std::clamp(st.traffic_front, -1.0f, 1.0f);
+    const float target_tr_doppler = 340.0f / std::clamp(340.0f - st.traffic_rel_speed_mps, 220.0f, 460.0f);
+
+    const float stall_pan = std::clamp(st.cockpit_stall_pan, -1.0f, 1.0f);
+    const float stall_l = std::sqrt(0.5f * (1.0f - stall_pan * 0.75f)) * 1.4142f;
+    const float stall_r = std::sqrt(0.5f * (1.0f + stall_pan * 0.75f)) * 1.4142f;
+    const float avn_pan = std::clamp(st.cockpit_avionics_pan, -1.0f, 1.0f);
+    const float avn_l = std::sqrt(0.5f * (1.0f - avn_pan * 0.70f)) * 1.4142f;
+    const float avn_r = std::sqrt(0.5f * (1.0f + avn_pan * 0.70f)) * 1.4142f;
+    const float flap_pan = std::clamp(st.cockpit_flaps_pan, -1.0f, 1.0f);
+    const float flap_l = std::sqrt(0.5f * (1.0f - flap_pan * 0.70f)) * 1.4142f;
+    const float flap_r = std::sqrt(0.5f * (1.0f + flap_pan * 0.70f)) * 1.4142f;
+
+    const float wb = std::clamp(st.wheel_bias, -0.65f, 0.65f);
+    const float gnd_l = std::sqrt(0.5f * (1.0f - wb * 0.55f)) * 1.4142f;
+    const float gnd_r = std::sqrt(0.5f * (1.0f + wb * 0.55f)) * 1.4142f;
 
     const float turb = std::clamp(st.turb_rms, 0.0f, 1.5f);
     const float rough = std::clamp(st.ground_roughness, 0.02f, 0.6f);
@@ -113,6 +199,7 @@ void AudioEngine::SynthState::render_stereo(const AudioState &st, int16_t *out, 
     const float walk_spd = st.walking ? std::clamp(st.walk_speed_mps, 0.0f, 6.0f) : 0.0f;
 
     const float slew = 1.0f - std::exp(-kInvSr * 18.0f);
+    const float spatial_slew = 1.0f - std::exp(-kInvSr * 26.0f);
     const float gain_slew = 1.0f - std::exp(-kInvSr * 35.0f);
 
     for (unsigned int i = 0; i < frames; ++i) {
@@ -124,10 +211,23 @@ void AudioEngine::SynthState::render_stereo(const AudioState &st, int16_t *out, 
         sm_gnd += (target_gnd - sm_gnd) * slew;
         sm_gain += (target_gain - sm_gain) * gain_slew;
         sm_cabin += (target_cabin - sm_cabin) * slew;
+        sm_pan += (target_pan - sm_pan) * spatial_slew;
+        sm_front += (target_front - sm_front) * spatial_slew;
+        sm_elev += (target_elev - sm_elev) * spatial_slew;
+        sm_wind_pan += (target_wind_pan - sm_wind_pan) * spatial_slew;
+        sm_doppler += (target_doppler - sm_doppler) * slew;
+        sm_tr_pan += (target_tr_pan - sm_tr_pan) * spatial_slew;
+        sm_tr_front += (target_tr_front - sm_tr_front) * spatial_slew;
+        sm_tr_gain += (target_tr_atten - sm_tr_gain) * slew;
+        sm_tr_doppler += (target_tr_doppler - sm_tr_doppler) * slew;
 
         const float w_noise = next_noise();
+        const float w_side = next_noise();
+        // Equal-variance decorrelated L/R noise for enveloping cabin airflow, rain & thunder width.
+        const float n_l = 0.65f * w_noise + 0.76f * w_side;
+        const float n_r = 0.65f * w_noise - 0.76f * w_side;
 
-        // 1. Flat-4 360 4-cylinder 4-stroke piston engine + 2-blade fixed-pitch propeller.
+        // 1. Flat-4 360 4-cylinder 4-stroke piston engine + 2-blade fixed-pitch propeller (with Doppler + air absorption).
         float eng = 0.0f;
         if (sm_rpm > 20.0f) {
             if (st.sputtering) {
@@ -140,8 +240,8 @@ void AudioEngine::SynthState::render_stereo(const AudioState &st, int16_t *out, 
                 sputter_gain += (1.0f - sputter_gain) * (kInvSr * 25.0f);
             }
 
-            // 4-stroke 4-cyl fires twice per crankshaft rev (same fundamental as 2-blade prop!).
-            const double f_fire = static_cast<double>(sm_rpm) * (2.0 / 60.0);
+            // 4-stroke 4-cyl fires twice per crankshaft rev; external Doppler shifts frequency naturally.
+            const double f_fire = static_cast<double>(sm_rpm) * (2.0 / 60.0) * static_cast<double>(sm_doppler);
             phase_fire = wrap_phase(phase_fire + f_fire * kInvSr);
             phase_sub = wrap_phase(phase_sub + 0.5 * f_fire * kInvSr);
 
@@ -158,13 +258,14 @@ void AudioEngine::SynthState::render_stereo(const AudioState &st, int16_t *out, 
                       + 0.10f * load * std::sin(4.0 * p1 + 0.2)
                       + 0.06f * rpm01 * std::sin(6.0 * p1);
 
-            // Idle chug modulation & prop tip air-wash pulses.
             const float idle_chug = 1.0f + (1.0f - std::clamp(rpm01, 0.0f, 1.0f)) * 0.25f * static_cast<float>(std::sin(ps));
             const float prop_chop = (0.04f + 0.16f * rpm01 * load) * (0.55f + 0.45f * static_cast<float>(std::sin(p1))) * w_noise;
             raw = std::tanh(raw * (1.25f + 0.85f * load)) * idle_chug + prop_chop;
 
-            // Warm cabin low-pass (~980 Hz inside) vs crisp open-air exhaust (~5200 Hz outside).
-            const float cutoff = 5200.0f - sm_cabin * (4220.0f - 480.0f * rpm01);
+            // Warm cabin muffling inside vs atmospheric distance air absorption outside.
+            const float air_cut = std::clamp(11500.0f / (1.0f + dist * 0.0085f), 460.0f, 11500.0f);
+            const float cabin_cut = 980.0f + 480.0f * rpm01;
+            const float cutoff = cabin_cut + (air_cut - cabin_cut) * (1.0f - sm_cabin);
             lp_engine += (raw - lp_engine) * one_pole_alpha(cutoff);
             const float eng_amp = (0.14f + 0.28f * rpm01 + 0.10f * load) * sputter_gain;
             eng = lp_engine * eng_amp;
@@ -181,67 +282,133 @@ void AudioEngine::SynthState::render_stereo(const AudioState &st, int16_t *out, 
             eng += whine * comp * 0.16f;
         }
 
-        // 3. Airframe slipstream, cabin wind & outdoor valley breeze.
-        lp_wind1 += (w_noise - lp_wind1) * one_pole_alpha(480.0f + sm_ias * 9.0f);
-        lp_wind2 += (lp_wind1 - lp_wind2) * one_pole_alpha(190.0f + sm_ias * 4.0f);
-        const float ias_norm = std::clamp((sm_ias - 24.0f) / 110.0f, 0.0f, 1.5f);
-        const float gust_mod = 1.0f + turb * 0.38f * std::clamp(lp_wind2 * 2.4f, -0.5f, 0.8f);
-        float wind_sig = (lp_wind1 * 0.65f + lp_wind2 * 0.85f) * (ias_norm * ias_norm * 0.24f) * gust_mod;
-        if (st.walking || !st.in_cockpit) {
-            const float outdoor_w = std::clamp(sm_wind / 16.0f, 0.05f, 1.2f);
-            wind_sig += (lp_wind1 * 0.55f + lp_wind2 * 0.70f) * outdoor_w * 0.14f;
+        // Binaural spatialization for player engine/prop (cockpit head-tracked OR 3D exterior sphere) + cabin early reflection.
+        float ac_l = 0.0f, ac_r = 0.0f;
+        const float ac_mix = eng * ac_atten;
+        const float spatial_depth = 0.65f + 0.35f * (1.0f - sm_cabin);
+        spatialize_binaural(ac_mix, eng_delay_, eng_delay_idx_,
+                            sm_pan, sm_front, sm_elev, spatial_depth,
+                            lp_eng_front, lp_eng_shadow_l, lp_eng_shadow_r, ac_l, ac_r);
+        if (sm_cabin > 0.02f) {
+            // 4.4 ms damped aluminum cabin bounce adds acoustic cockpit space without blurring head-turn panning.
+            constexpr unsigned int kCabinMask = SynthState::kCabinBufSize - 1u;
+            cabin_refl_idx_ = (cabin_refl_idx_ + 1u) & kCabinMask;
+            cabin_refl_[cabin_refl_idx_] = ac_mix;
+            const float refl_tap = cabin_refl_[(cabin_refl_idx_ - 211u) & kCabinMask];
+            lp_cabin_refl += (refl_tap - lp_cabin_refl) * one_pole_alpha(1350.0f);
+            const float refl_mix = lp_cabin_refl * (0.11f * sm_cabin);
+            ac_l += refl_mix;
+            ac_r += refl_mix;
         }
 
-        // 4. Rain drumming on windscreen/cabin roof + thunder rumble.
-        float wx_sig = 0.0f;
+        // 2b. Nearby AI traffic aircraft spatialized flyby (Doppler + air absorption + binaural pan).
+        float tr_l = 0.0f, tr_r = 0.0f;
+        if (sm_tr_gain > 0.002f && st.traffic_rpm > 50.0f) {
+            const double tr_harm = st.traffic_is_airliner ? 3.8 : (2.0 / 60.0);
+            const double tr_f = static_cast<double>(st.traffic_rpm) * tr_harm * static_cast<double>(sm_tr_doppler);
+            phase_tr_fire = wrap_phase(phase_tr_fire + tr_f * kInvSr);
+            phase_tr_sub = wrap_phase(phase_tr_sub + 0.5 * tr_f * kInvSr);
+            const float tr_raw = st.traffic_is_airliner
+                ? (0.28f * static_cast<float>(std::sin(phase_tr_fire * kTwoPi)) + 0.42f * lp_wind_l1)
+                : (0.45f * static_cast<float>(std::sin(phase_tr_fire * kTwoPi))
+                   + 0.25f * static_cast<float>(std::sin(phase_tr_sub * kTwoPi))
+                   + 0.18f * static_cast<float>(std::sin(phase_tr_fire * 2.0 * kTwoPi)));
+            const float tr_cut = std::clamp(8000.0f / (1.0f + std::max(0.0f, st.traffic_dist_m) * 0.0095f), 260.0f, 8000.0f);
+            lp_tr_eng += (tr_raw - lp_tr_eng) * one_pole_alpha(tr_cut);
+            spatialize_binaural(lp_tr_eng * sm_tr_gain * 0.22f, tr_delay_, tr_delay_idx_,
+                                sm_tr_pan, sm_tr_front, 0.0f, 1.0f,
+                                lp_tr_front, lp_tr_shadow_l, lp_tr_shadow_r, tr_l, tr_r);
+        }
+
+        // 3. Stereo decorrelated airframe slipstream, crosswind bearing & outdoor breeze.
+        const float wind_cut1 = 480.0f + sm_ias * 9.0f;
+        const float wind_cut2 = 190.0f + sm_ias * 4.0f;
+        lp_wind_l1 += (n_l - lp_wind_l1) * one_pole_alpha(wind_cut1);
+        lp_wind_r1 += (n_r - lp_wind_r1) * one_pole_alpha(wind_cut1);
+        lp_wind_l2 += (lp_wind_l1 - lp_wind_l2) * one_pole_alpha(wind_cut2);
+        lp_wind_r2 += (lp_wind_r1 - lp_wind_r2) * one_pole_alpha(wind_cut2);
+        const float ias_norm = std::clamp((sm_ias - 24.0f) / 110.0f, 0.0f, 1.5f);
+        const float gust_mod_l = 1.0f + turb * 0.38f * std::clamp(lp_wind_l2 * 2.2f, -0.5f, 0.8f);
+        const float gust_mod_r = 1.0f + turb * 0.38f * std::clamp(lp_wind_r2 * 2.2f, -0.5f, 0.8f);
+        const float wbias_l = 1.0f - 0.26f * sm_wind_pan;
+        const float wbias_r = 1.0f + 0.26f * sm_wind_pan;
+        float wind_l = (lp_wind_l1 * 0.65f + lp_wind_l2 * 0.85f) * (ias_norm * ias_norm * 0.24f) * gust_mod_l * wbias_l;
+        float wind_r = (lp_wind_r1 * 0.65f + lp_wind_r2 * 0.85f) * (ias_norm * ias_norm * 0.24f) * gust_mod_r * wbias_r;
+        if (st.walking || !st.in_cockpit) {
+            const float outdoor_w = std::clamp(sm_wind / 16.0f, 0.05f, 1.2f);
+            wind_l += (lp_wind_l1 * 0.55f + lp_wind_l2 * 0.70f) * outdoor_w * 0.14f * wbias_l;
+            wind_r += (lp_wind_r1 * 0.55f + lp_wind_r2 * 0.70f) * outdoor_w * 0.14f * wbias_r;
+        }
+
+        // 4. Stereo rain drumming on windscreen/cabin roof + spatial rolling thunder.
+        float wx_l = 0.0f, wx_r = 0.0f;
         if (sm_rain > 0.01f) {
-            // High-passed hiss + randomized droplet taps.
-            hp_rain_out = 0.86f * (hp_rain_out + w_noise - hp_rain_prev);
-            hp_rain_prev = w_noise;
-            lp_rain += (hp_rain_out - lp_rain) * one_pole_alpha(sm_cabin > 0.5f ? 2800.0f : 5200.0f);
-            const float drop_hit = (std::abs(w_noise) > (0.988f - 0.014f * std::min(sm_rain, 1.0f)))
-                ? (w_noise * 0.45f) : 0.0f;
-            wx_sig += (lp_rain * 0.14f + drop_hit * (0.10f + 0.10f * sm_cabin)) * sm_rain;
+            hp_rain_out_l = 0.86f * (hp_rain_out_l + n_l - hp_rain_prev_l);
+            hp_rain_prev_l = n_l;
+            hp_rain_out_r = 0.86f * (hp_rain_out_r + n_r - hp_rain_prev_r);
+            hp_rain_prev_r = n_r;
+            const float rain_cut = sm_cabin > 0.5f ? 2950.0f : 5200.0f;
+            lp_rain_l += (hp_rain_out_l - lp_rain_l) * one_pole_alpha(rain_cut);
+            lp_rain_r += (hp_rain_out_r - lp_rain_r) * one_pole_alpha(rain_cut);
+            const float drop_thresh = 0.986f - 0.014f * std::min(sm_rain, 1.0f);
+            const float drop_l = (std::abs(n_l) > drop_thresh) ? (n_l * 0.42f) : 0.0f;
+            const float drop_r = (std::abs(n_r) > drop_thresh) ? (n_r * 0.42f) : 0.0f;
+            const float r_bias_l = 1.0f - 0.18f * sm_wind_pan;
+            const float r_bias_r = 1.0f + 0.18f * sm_wind_pan;
+            wx_l += (lp_rain_l * 0.14f + drop_l * (0.10f + 0.10f * sm_cabin)) * sm_rain * r_bias_l;
+            wx_r += (lp_rain_r * 0.14f + drop_r * (0.10f + 0.10f * sm_cabin)) * sm_rain * r_bias_r;
         }
         if (thunder_env > 0.002f) {
-            lp_thunder += (w_noise - lp_thunder) * one_pole_alpha(95.0f);
-            wx_sig += std::tanh(lp_thunder * 4.5f) * thunder_env * 0.38f;
+            lp_thunder += (w_noise - lp_thunder) * one_pole_alpha(96.0f);
+            lp_thunder_r += ((0.7f * w_noise + 0.7f * w_side) - lp_thunder_r) * one_pole_alpha(82.0f);
+            const float th_l = std::tanh(lp_thunder * 4.5f) * thunder_env * 0.38f * std::sqrt(0.5f * (1.0f - thunder_pan)) * 1.4142f;
+            const float th_r = std::tanh(lp_thunder_r * 4.5f) * thunder_env * 0.38f * std::sqrt(0.5f * (1.0f + thunder_pan)) * 1.4142f;
+            wx_l += th_l;
+            wx_r += th_r;
             thunder_env *= std::exp(-kInvSr * 0.55f);
         }
 
-        // 5. Cockpit alerts, flap servo, avionics fan/gyro, ground roll, touchdown & footsteps.
-        float cockpit_sig = 0.0f;
+        // 5. Head-tracked cockpit alerts, flap servo, avionics fan/gyro, ground roll, touchdown & footsteps.
+        float ckpt_l = 0.0f, ckpt_r = 0.0f;
         if (st.stall_warn && !st.on_ground && sm_ias > 18.0f && st.in_cockpit && !st.walking) {
             phase_stall = wrap_phase(phase_stall + 2760.0 * kInvSr);
             const float reed = static_cast<float>(std::sin(phase_stall * kTwoPi))
                              + 0.42f * static_cast<float>(std::sin(phase_stall * 2.0 * kTwoPi))
                              + 0.18f * static_cast<float>(std::sin(phase_stall * 3.0 * kTwoPi));
-            cockpit_sig += std::tanh(reed * 0.9f) * 0.13f;
+            const float s_sig = std::tanh(reed * 0.9f) * 0.13f;
+            ckpt_l += s_sig * stall_l;
+            ckpt_r += s_sig * stall_r;
         }
         if (st.flaps_moving && st.in_cockpit && !st.walking) {
             phase_flap = wrap_phase(phase_flap + 315.0 * kInvSr);
-            cockpit_sig += (0.65f * static_cast<float>(std::sin(phase_flap * kTwoPi)) +
-                            0.35f * static_cast<float>(std::sin(phase_flap * 3.0 * kTwoPi))) * 0.045f;
+            const float f_sig = (0.65f * static_cast<float>(std::sin(phase_flap * kTwoPi)) +
+                                 0.35f * static_cast<float>(std::sin(phase_flap * 3.0 * kTwoPi))) * 0.045f;
+            ckpt_l += f_sig * flap_l;
+            ckpt_r += f_sig * flap_r;
         }
         if (st.avionics_powered && st.in_cockpit && !st.walking) {
             phase_gyro = wrap_phase(phase_gyro + 1480.0 * kInvSr);
-            cockpit_sig += (0.012f * static_cast<float>(std::sin(phase_gyro * kTwoPi)) + 0.006f * lp_wind1);
+            const float a_sig = (0.012f * static_cast<float>(std::sin(phase_gyro * kTwoPi)) + 0.006f * lp_wind_l1);
+            ckpt_l += a_sig * avn_l;
+            ckpt_r += a_sig * avn_r;
         }
 
-        // Ground roll & braking rumble.
+        // Ground roll & braking rumble with asymmetric main-gear weight bias.
         if (sm_gnd > 0.015f) {
             lp_gnd += (w_noise - lp_gnd) * one_pole_alpha(85.0f + rough * 220.0f);
-            cockpit_sig += lp_gnd * sm_gnd * (0.20f + rough * 0.45f);
-            if (brake > 0.12f) {
-                cockpit_sig += lp_wind1 * brake * sm_gnd * 0.09f;
-            }
+            float g_sig = lp_gnd * sm_gnd * (0.20f + rough * 0.45f);
+            if (brake > 0.12f) g_sig += (0.5f * (lp_wind_l1 + lp_wind_r1)) * brake * sm_gnd * 0.09f;
+            ckpt_l += g_sig * gnd_l;
+            ckpt_r += g_sig * gnd_r;
         }
         // Touchdown thump & brief tire chirp.
         if (td_env > 0.002f) {
             phase_td = wrap_phase(phase_td + (78.0 + 38.0 * td_env) * kInvSr);
             const float thump = static_cast<float>(std::sin(phase_td * kTwoPi)) * td_env * 0.42f * td_strength;
-            const float chirp = (td_env > 0.65f) ? (lp_wind1 * (td_env - 0.65f) * 0.55f * td_strength) : 0.0f;
-            cockpit_sig += thump + chirp;
+            const float chirp_l = (td_env > 0.65f) ? (lp_wind_l1 * (td_env - 0.65f) * 0.55f * td_strength) : 0.0f;
+            const float chirp_r = (td_env > 0.65f) ? (lp_wind_r1 * (td_env - 0.65f) * 0.55f * td_strength) : 0.0f;
+            ckpt_l += (thump + chirp_l) * gnd_l;
+            ckpt_r += (thump + chirp_r) * gnd_r;
             td_env *= std::exp(-kInvSr * 7.5f);
         }
         // Walkaround footsteps on grass/gravel.
@@ -251,15 +418,14 @@ void AudioEngine::SynthState::render_stereo(const AudioState &st, int16_t *out, 
             if (phase_step < prev_step) step_env = 1.0f;
         }
         if (step_env > 0.003f) {
-            cockpit_sig += (lp_wind1 * 0.45f + lp_gnd * 0.55f) * step_env * 0.18f;
+            ckpt_l += (lp_wind_l1 * 0.45f + lp_gnd * 0.55f) * step_env * 0.18f;
+            ckpt_r += (lp_wind_r1 * 0.45f + lp_gnd * 0.55f) * step_env * 0.18f;
             step_env *= std::exp(-kInvSr * 18.0f);
         }
 
-        // Stereo mix + soft limiting (prevents any harsh digital clipping).
-        const float ac_mix = eng * ac_atten;
-        const float mono_env = wind_sig + wx_sig + cockpit_sig;
-        const float left = std::tanh((mono_env + ac_mix * pan_l * 1.4142f) * sm_gain);
-        const float right = std::tanh((mono_env + ac_mix * pan_r * 1.4142f) * sm_gain);
+        // Binaural stereo mix + soft limiting (prevents any harsh digital clipping).
+        const float left = std::tanh((ac_l + tr_l + wind_l + wx_l + ckpt_l) * sm_gain);
+        const float right = std::tanh((ac_r + tr_r + wind_r + wx_r + ckpt_r) * sm_gain);
 
         out[i * 2 + 0] = static_cast<int16_t>(std::clamp(left * 32000.0f, -32767.0f, 32767.0f));
         out[i * 2 + 1] = static_cast<int16_t>(std::clamp(right * 32000.0f, -32767.0f, 32767.0f));
@@ -477,6 +643,39 @@ bool AudioEngine::run_selftest() {
     if (!(rms_idle > 0.01 && rms_takeoff > rms_idle && rms_takeoff < 0.99 && rms_muted < 0.002)) {
         std::fprintf(stderr, "[FAIL] AudioEngine selftest rms idle=%.4f takeoff=%.4f muted=%.4f\n",
                      rms_idle, rms_takeoff, rms_muted);
+        return false;
+    }
+
+    // Spatial stereo divergence check: pan right -> R > L; pan left -> L > R.
+    auto measure_lr = [&](float pan_val, double &out_l, double &out_r) {
+        SynthState sp_synth;
+        AudioState ext = idle;
+        ext.in_cockpit = false;
+        ext.aircraft_dist_m = 12.0f;
+        ext.aircraft_pan = pan_val;
+        ext.aircraft_front = 0.25f;
+        for (int w = 0; w < 4; ++w) sp_synth.render_stereo(ext, buf.data(), kPeriodFrames);
+        double sq_l = 0.0, sq_r = 0.0;
+        int n = 0;
+        for (int b = 0; b < 6; ++b) {
+            sp_synth.render_stereo(ext, buf.data(), kPeriodFrames);
+            for (unsigned int f = 0; f < kPeriodFrames; ++f) {
+                const double vl = static_cast<double>(buf[f * 2 + 0]) / 32768.0;
+                const double vr = static_cast<double>(buf[f * 2 + 1]) / 32768.0;
+                sq_l += vl * vl;
+                sq_r += vr * vr;
+                ++n;
+            }
+        }
+        out_l = std::sqrt(sq_l / std::max(1, n));
+        out_r = std::sqrt(sq_r / std::max(1, n));
+    };
+    double l_right = 0.0, r_right = 0.0, l_left = 0.0, r_left = 0.0;
+    measure_lr(0.90f, l_right, r_right);
+    measure_lr(-0.90f, l_left, r_left);
+    if (!(r_right > l_right * 1.35 && l_left > r_left * 1.35)) {
+        std::fprintf(stderr, "[FAIL] AudioEngine spatial check R(%.4f,%.4f) L(%.4f,%.4f)\n",
+                     l_right, r_right, l_left, r_left);
         return false;
     }
     return true;

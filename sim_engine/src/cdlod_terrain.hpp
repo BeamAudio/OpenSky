@@ -57,7 +57,9 @@ public:
         int season, float snowline_m, int lod_distance_percent = 100,
         const TerrainGrassZone &grass_zone = {},
         const Vec4 &wx_env = {0.0f, 0.0f, 0.0f, 0.0f},
-        int terrain_detail = -1, int veg_detail = -1
+        int terrain_detail = -1, int veg_detail = -1,
+        float lod_scale = 1.0f,
+        float debug_lod_alpha = 0.0f
     );
     void set_anisotropy(int max_aniso);
 
@@ -109,7 +111,7 @@ private:
         GLint vp = -1, cam_alt = -1, cam_agl = -1, sun_dir = -1, haze_cool = -1, haze_warm = -1;
         GLint haze_density = -1, cloud_cov = -1, time = -1, detail_strength = -1, wind_en = -1, quality = -1, veg_detail = -1;
         GLint season = -1, snowline_m = -1;
-        GLint grass_zone = -1, grass_zone_bounds = -1, wx_env = -1;
+        GLint grass_zone = -1, grass_zone_bounds = -1, wx_env = -1, debug_lod = -1;
     } u_{};
     GLuint vao_ = 0;
     GLuint vbo_ = 0;

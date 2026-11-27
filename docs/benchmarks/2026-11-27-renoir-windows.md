@@ -2,12 +2,14 @@
 
 Tested the native Windows WGL build on a Ryzen 7 5700U with AMD Radeon Graphics, driver 31.0.14076.3, Balanced Windows power plan, and 1920×1080 output on a 60 Hz display. Each route has 239 measured intervals after warmup. The flight dynamics run at 120 Hz. The 350-knot leg uses scripted slew. These routes stay within Aragón. In the separate crossing attempt, the scripted pilot made terrain contact before reaching Catalunya, so continuous boundary frame pacing remains unmeasured.
 
-| Route | F2 pack imagery FPS | p95 / p99 ms | F2 online PNOA storm FPS | p95 / p99 ms | Final LOD, pack / online |
+| Route | F2 pack imagery FPS (`v0.3.2` final) | p95 / p99 ms | F2 online PNOA storm FPS | p95 / p99 ms | Final LOD, pack / online |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Castejón de Sos | 60.0 | 16.69 / 16.88 | 60.0 | 16.71 / 16.88 | 9 / 9 |
-| Zaragoza | 60.0 | 16.71 / 16.76 | 60.0 | 16.73 / 16.81 | 9 / 9 |
-| Embalse de Mediano | 60.0 | 16.70 / 16.72 | 60.0 | 17.18 / 17.65 | 9 / 5 |
-| 350-knot streaming | 60.0 | 16.70 / 16.74 | 60.0 | 16.79 / 17.53 | 9 / 9 |
+| Castejón de Sos | 60.0 | 16.81 / 17.05 | 60.0 | 16.71 / 16.88 | 9 / 9 |
+| Zaragoza | 60.0 | 16.84 / 17.01 | 60.0 | 16.73 / 16.81 | 9 / 9 |
+| Embalse de Mediano | 60.0 | 16.84 / 16.96 | 60.0 | 17.18 / 17.65 | 9 / 5 |
+| 350-knot streaming | 59.7 | 17.95 / 20.12 | 60.0 | 16.79 / 17.53 | 9 / 9 |
+
+Note (`v0.3.2` final): Balanced was re-verified in the borderless `1728×972` monitor work-area footprint on `AMD Radeon(TM) Graphics` (`1920×1080` native output cockpit, `--online-ortho off`, weather-coupled 3D volumetric clouds with 60 Hz interpolated mesoscale advection + dynamic `2/3/4`-tap sun light marching + crest depth fusion + `256x160` windshield/side-glass fluid PDE + `44%` adaptive floor), scaling internally between `1273×716` and `1357×763` within Aragón (without region boundary crossing; 0 frames > 33.3 ms across all 956 intervals, 0 frames > 20 ms across Castejón/Zaragoza/Mediano, and 3 frames > 20 ms in 350 kt stress).
 
 The initial Castejón capture with the machine's saved custom settings averaged 46.5 FPS with a 26.32 ms p95. It ended at L9. The original Zaragoza capture stayed at L3 because the test jumped to Zaragoza while retaining a Pyrenees terrain anchor. The updated quick profile reanchors before warming each route. Under WGL VSync, Zaragoza dropped to 54.0 FPS on an earlier Balanced run. The Windows laptop presets now use a 60 FPS software deadline before the swap, with an explicit VSync setting available.
 

@@ -199,6 +199,7 @@ public:
     GLuint local_terrain_tex() const { return local_terrain_tex_; }
     Vec4 local_domain_bounds() const;
     void sync_region(double lat_deg, double lon_deg);
+    bool poll_pending_initialization();
     void finish_pending_initialization();
     void shutdown();
 
@@ -246,7 +247,9 @@ public:
 
     GLuint field_tex() const { return field_tex_; }
     GLuint terrain_field_tex() const { return terrain_field_tex_; }
+    uint64_t uploaded_weather_generation() const { return uploaded_weather_generation_; }
     Vec4 domain_bounds() const {
+        if (!weather_textures_ready_) return {};
         return {static_cast<float>(min_e_), static_cast<float>(min_n_),
                 static_cast<float>(1.0 / std::max(1.0, span_e_)),
                 static_cast<float>(1.0 / std::max(1.0, span_n_))};
@@ -278,11 +281,22 @@ private:
         float temp_c = 10.0f, pressure_hpa = 950.0f;
         float rain_mm_hr = 0.0f, cloud_fraction = 0.0f, tke = 0.1f;
     };
+    struct CloudSimCell {
+        float mass = 0.0f;       // [0..1.6] vertically integrated simulated cloud liquid/ice path
+        float top_h = 0.45f;     // [0.15..1.0] convective turret height fraction
+        float base_off = 0.0f;   // [-0.18..+0.25] LCL condensation level offset
+        float anvil = 0.0f;      // [0..1.0] upper-level anvil / stratiform detrainment
+        float precip_age = 0.0f; // [0..1.0] Kessler glaciation & rain-shaft maturity
+        float shear_e = 0.0f;    // vertical wind shear u_top - u_base (m/s)
+        float shear_n = 0.0f;    // vertical wind shear v_top - v_base (m/s)
+        float turb_bub = 0.12f;  // [0.05..1.0] sub-grid convective boiling & entrainment
+    };
 
     struct WeatherSolver {
         int grid_w_ = GRID_W, grid_h_ = GRID_H;
         bool suppress_dynamic_advance_ = false;
         std::vector<SimWeatherCell> weather_grid_, weather_next_;
+        std::vector<CloudSimCell> cloud_sim_, cloud_sim_next_;
         std::vector<float> weather_rain_flux_, terrain_height_, terrain_slope_e_, terrain_slope_n_;
         std::vector<float> flow_slope_e_, flow_slope_n_;
         std::vector<float> terrain_ridge_exposure_, terrain_valley_basin_, weather_worker_climate_field_;
@@ -300,6 +314,8 @@ private:
         void spawn_dynamic_cell(DynamicCell &c, bool initial_spread);
         void seed_dynamic_cells();
         void advance_dynamic_cells(float dt, float solar);
+        void seed_cloud_sim();
+        void step_cloud_sim(float dt, float solar, float dx, float dy);
         bool step(float dt, const Vec3 &sun_dir, const WeatherSnapshot &forcing,
                   const std::atomic<bool> *stop_requested = nullptr);
     };
@@ -413,6 +429,7 @@ private:
     uint64_t outlook_request_id_ = 0;
     bool outlook_requested_ = false;
     bool weather_model_ready_ = false;
+    bool weather_textures_ready_ = false;
     double weather_model_time_ = -1.0;
     double weather_model_accum_ = 0.0;
     double weather_anchor_lat_ = 0.0, weather_anchor_lon_ = 0.0;

@@ -1365,16 +1365,19 @@ void GameFrontend::draw_settings(AircraftAndHud &ui, int &time_of_day, RegionalA
     if (button(ui, {886, 274, 251, 34}, "Max Dedicated GPU",  true, s.quality_preset == 3)) { apply_graphics_profile(s, 3); changed = true; }
 
     auto setting = [&](int row, const char *name, const char *value) {
-        const int y = 320 + row * 39;
-        ui.hud_rect(91,y+34,1046,1,.21f,.32f,.39f,.85f);
-        label(ui, 91, y+6, 17, name);
-        label(ui, 756, y+6, 16, value);
-        if (button(ui, {697,y,42,30}, "<")) { changed = true; return -1; }
-        if (button(ui, {1095,y,42,30}, ">")) { changed = true; return 1; }
+        const int y = 320 + row * 36;
+        ui.hud_rect(91,y+32,1046,1,.21f,.32f,.39f,.85f);
+        label(ui, 91, y+5, 17, name);
+        label(ui, 756, y+5, 16, value);
+        if (button(ui, {697,y,42,29}, "<")) { changed = true; return -1; }
+        if (button(ui, {1095,y,42,29}, ">")) { changed = true; return 1; }
         return 0;
     };
     static const char *presets[] = {"Laptop / Battery (F1)", "Balanced 60 FPS (F2)", "High Quality (F3)", "Max Dedicated GPU (F4)"};
-    static const char *weather[] = {"Follow preset", "Low (Fastest)", "Medium", "High", "Ultra (Max Clouds)"};
+    static const char *weather[] = {
+        "Follow preset", "Very Low", "Low", "Medium",
+        "Medium-High", "High", "Very High", "Ultra (Max Clouds)"
+    };
     static const char *surf[] = {"Follow preset", "Fast (Ortho only)", "Balanced", "High (PBR relief)", "Extreme (Full PBR)"};
     static const char *world[] = {"Follow preset", "Sparse (Laptop)", "Medium", "High", "Max (Dense Cities)"};
     static const char *veg[] = {"Follow preset", "Minimal", "Standard", "High", "Dense Forest"};
@@ -1399,20 +1402,29 @@ void GameFrontend::draw_settings(AircraftAndHud &ui, int &time_of_day, RegionalA
     std::snprintf(value, sizeof(value), "%d%%", s.terrain_lod_percent);
     s.terrain_lod_percent = std::clamp(s.terrain_lod_percent + 25 * setting(4, "Terrain mesh distance", value), 50, 250);
     s.terrain_detail = (s.terrain_detail + setting(5, "Terrain surface detail", surf[s.terrain_detail]) + 5) % 5;
-    s.weather_detail = (s.weather_detail + setting(6, "Cloud & sky quality", weather[s.weather_detail]) + 5) % 5;
-    s.world_detail = (s.world_detail + setting(7, "Cities & road traffic", world[s.world_detail]) + 5) % 5;
-    s.vegetation_detail = (s.vegetation_detail + setting(8, "Forest & tree detail", veg[s.vegetation_detail]) + 5) % 5;
-    if (setting(9, "Cockpit detail / native res", s.cockpit_native ? (s.aircraft_detail ? "Native + High" : "Native + Std") : "Scaled (Laptop)")) {
+    s.weather_detail = (s.weather_detail + setting(6, "Cloud & sky quality", weather[s.weather_detail]) + 8) % 8;
+    if (s.cloud_res_percent <= 0) std::snprintf(value, sizeof(value), "Auto (Preset)");
+    else std::snprintf(value, sizeof(value), "%d%% scene scale", s.cloud_res_percent);
+    if (int cd = setting(7, "Cloud resolution", value)) {
+        if (s.cloud_res_percent <= 0) s.cloud_res_percent = (cd > 0) ? 35 : 100;
+        else {
+            const int nxt = s.cloud_res_percent + 5 * cd;
+            s.cloud_res_percent = (nxt < 35 || nxt > 100) ? 0 : nxt;
+        }
+    }
+    s.world_detail = (s.world_detail + setting(8, "Cities & road traffic", world[s.world_detail]) + 5) % 5;
+    s.vegetation_detail = (s.vegetation_detail + setting(9, "Forest & tree detail", veg[s.vegetation_detail]) + 5) % 5;
+    if (setting(10, "Cockpit detail / native res", s.cockpit_native ? (s.aircraft_detail ? "Native + High" : "Native + Std") : "Scaled (Laptop)")) {
         if (!s.cockpit_native) { s.cockpit_native = true; s.aircraft_detail = 0; }
         else if (s.aircraft_detail == 0) { s.aircraft_detail = 1; }
         else { s.cockpit_native = false; s.aircraft_detail = 0; }
     }
-    s.atmosphere_clarity = (s.atmosphere_clarity + setting(10, "Atmosphere clarity", clarity[s.atmosphere_clarity]) + 3) % 3;
-    if (setting(11, "Online PNOA streaming", s.terrain_streaming ? "On / IGN PNOA" : "Off / installed packs"))
+    s.atmosphere_clarity = (s.atmosphere_clarity + setting(11, "Atmosphere clarity", clarity[s.atmosphere_clarity]) + 3) % 3;
+    if (setting(12, "Online PNOA streaming", s.terrain_streaming ? "On / IGN PNOA" : "Off / installed packs"))
         s.terrain_streaming = !s.terrain_streaming;
     static const char *display_modes[] = {"Windowed", "Fullscreen", "Fullscreen windowed"};
-    s.display_mode = (s.display_mode + setting(12, "Display mode", display_modes[s.display_mode]) + 3) % 3;
-    if (setting(13, "VSync", s.vsync ? "On (Tear-free)" : "Off (Low latency)"))
+    s.display_mode = (s.display_mode + setting(13, "Display mode", display_modes[s.display_mode]) + 3) % 3;
+    if (setting(14, "VSync", s.vsync ? "On (Tear-free)" : "Off (Low latency)"))
         s.vsync = !s.vsync;
     static constexpr int kFpsLimits[] = {30, 45, 60, 75, 90, 120, 144, 0};
     constexpr int kFpsCount = static_cast<int>(sizeof(kFpsLimits) / sizeof(kFpsLimits[0]));
@@ -1424,7 +1436,7 @@ void GameFrontend::draw_settings(AircraftAndHud &ui, int &time_of_day, RegionalA
     }
     if (s.fps_limit > 0) std::snprintf(value, sizeof(value), "%d FPS", s.fps_limit);
     else std::snprintf(value, sizeof(value), "Unlimited");
-    if (int delta = setting(14, "FPS limit", value))
+    if (int delta = setting(15, "FPS limit", value))
         s.fps_limit = kFpsLimits[(fps_idx + delta + kFpsCount) % kFpsCount];
     label(ui, 91, 914, 13, "Display mode applies after restart; quality sliders, VSync & FPS limit apply live.", true);
 

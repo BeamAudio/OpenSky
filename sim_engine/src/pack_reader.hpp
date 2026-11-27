@@ -243,6 +243,7 @@ public:
 
     // Pre-bake whole-corridor 50km planetary DEM 10-time-of-day horizon shadows + 8-dir Valley Sky AO (uint32 packed!)
     uint32_t sample_baked_gi_u32_en(double east_m, double north_m) const;
+    uint32_t sample_baked_gi_u32_en(const WorldFrame &frame, double east_m, double north_m) const;
     void fill_corridor_gi_rg8(float phase10, std::vector<uint8_t> &out_rg) const;
     const std::vector<uint32_t> &corridor_gi_u32() const { return world_frame_->lighting; }
 

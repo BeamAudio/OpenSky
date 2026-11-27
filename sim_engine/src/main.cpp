@@ -287,6 +287,8 @@ int run_selftest(const PackReader &pack) {
     }
     // Verify local weather refinement stays numerically stable and spatially coherent at both 192^2 and 384^2.
     for (int detail : {1, 2}) {
+        std::printf("[SELFTEST] Checking local weather refinement detail=%d...\n", detail);
+        std::fflush(stdout);
         RegionalAtmosphere local_atmo;
         local_atmo.set_solver_seed(0x4F50534Bu, true);
         if (!local_atmo.init(&pack, false, "", false)) {
@@ -604,14 +606,20 @@ int main(int argc, char **argv) {
     if (weather_refinement_override >= 0)
         graphics_settings.weather_grid_detail = weather_refinement_override;
     if (promo_only) {
-        // Promotional captures use Ultra quality and the 200% terrain radius
-        // without changing the user's saved settings.
-        graphics_settings.quality_preset = 3;
-        graphics_settings.pixel_percent = 100;
-        graphics_settings.aa_mode = 2;
-        graphics_settings.terrain_lod_percent = 200;
-        graphics_settings.weather_detail = 3;
-        graphics_settings.aircraft_detail = 1;
+        if (promo_clip == "engine_load_balancing") {
+            // Start in Ultra (F4) to expose heavy urban GPU load before switching live to Balanced (F2) & Low (F1)!
+            apply_graphics_profile(graphics_settings, 3);
+            graphics_settings.fps_limit = 60;
+        } else {
+            // Promotional captures use Ultra quality and the 200% terrain radius
+            // without changing the user's saved settings.
+            graphics_settings.quality_preset = 3;
+            graphics_settings.pixel_percent = 100;
+            graphics_settings.aa_mode = 2;
+            graphics_settings.terrain_lod_percent = 200;
+            graphics_settings.weather_detail = 7;
+            graphics_settings.aircraft_detail = 1;
+        }
     }
     const auto profile_file = interactive_run
         ? graphics_settings_path().parent_path() / "fleet.ini" : std::filesystem::path{};
@@ -720,8 +728,8 @@ int main(int argc, char **argv) {
     profiler.set_overlay(debug_overlays);
     profiler.startup_stage("window_and_gl");
 
-    int quality = (interactive_run || graphics_profile_override >= 0) ? graphics_settings.quality_preset : 2;
-    if (promo_only) quality = 3;
+    int quality = (interactive_run || graphics_profile_override >= 0 || promo_clip == "engine_load_balancing") ? graphics_settings.quality_preset : 2;
+    if (promo_only && promo_clip != "engine_load_balancing") quality = 3;
     int tod_slot = (quick_profile || !autotest_dir.empty() || !topdown_dir.empty() || !airport_qa_dir.empty()) ? 2 : graphics_settings.time_of_day;
     // CLI selection enables repeatable QA captures; N cycles the same states during play.
     float wx_advance = 0.28f; // 0.0=Clear, 0.28=Fair SCT, 0.60=Broken, 0.92=Overcast/Rain!
@@ -742,7 +750,8 @@ int main(int argc, char **argv) {
 
     const unsigned cpu_threads = std::thread::hardware_concurrency();
     const int terrain_workers = promo_only ? std::clamp(static_cast<int>(cpu_threads / 2), 3, 8)
-                                           : ((quality >= 3 && cpu_threads >= 8) ? 4 : 2);
+                                           : ((quality >= 3 && cpu_threads >= 8) ? 4
+                                              : ((quality >= 1 && cpu_threads >= 8) ? 3 : 2));
     const int page_capacity = promo_only ? 1024 : AsyncTerrainStreamer::MAX_PAGES;
     if (!streamer.init(&pack, terrain_workers, ortho_format, page_capacity)) return 1;
     profiler.startup_stage("terrain_streamer_allocate");
@@ -755,7 +764,7 @@ int main(int argc, char **argv) {
     profiler.startup_stage("terrain_resources");
     if (!sky_clouds.init(root + "/sim_engine/shaders", output_w, output_h, quality,
                          graphics_settings.pixel_percent, graphics_settings.aa_mode,
-                         graphics_settings.weather_detail)) return 1;
+                         graphics_settings.weather_detail, graphics_settings.cloud_res_percent)) return 1;
     profiler.startup_stage("sky_cloud_resources");
     if (!interactive_run) reg_atmo.set_solver_seed(0x1725);
     if (!reg_atmo.init(&pack, true, "", interactive_run && !no_live_weather)) return 1;
@@ -883,6 +892,8 @@ int main(int argc, char **argv) {
             async_cross.active = false;
             async_cross.stage2_streaming = false;
         }
+        objects.cancel_road_stream();
+        objects.cancel_staged_reanchor_upload();
         streamer.cancel_async_transition();
     };
     auto transition_world = [&](double lat, double lon, const char *loading_title = nullptr) {
@@ -891,6 +902,7 @@ int main(int argc, char **argv) {
         const auto next_frame = pack.prepare_world_frame(lat, lon, !promo_only);
         if (next_frame) {
             reg_atmo.finish_pending_initialization();
+            objects.cancel_road_stream();
             pack.commit_world_frame(next_frame);
             vegetation.invalidate();
             if (loading_title) show_loading(loading_title, "Streaming coarse terrain & IGN PNOA...", 0.50f);
@@ -901,20 +913,22 @@ int main(int argc, char **argv) {
             sky_clouds.reset_temporal_history();
         }
         reg_atmo.sync_region(lat, lon);
-        reg_atmo.update_field(sky_clouds.atmo().sun_dir, sim_time, false, wx_advance);
+        reg_atmo.update_field(sky_clouds.atmo().sun_dir, sim_time, true, wx_advance);
         return next_frame != nullptr;
     };
 
     auto step_flight_world_transition = [&](double lat, double lon, double vel_e = 0.0, double vel_n = 0.0) -> bool {
         if (async_cross.active && async_cross.stage2_streaming) {
+            objects.pump_staged_reanchor_upload();
+            if (!reg_atmo.poll_pending_initialization()) return false;
             const double elapsed = PlatformWindow::now_sec() - async_cross.start_wall_t;
-            if (!streamer.is_async_transition_ready(elapsed)) return false;
+            if (!streamer.is_async_transition_ready(elapsed) || !objects.staged_reanchor_upload_ready()) return false;
             if (async_cross.prepared.frame) {
-                reg_atmo.finish_pending_initialization();
+                objects.cancel_road_stream();
                 pack.commit_world_frame(async_cross.prepared.frame);
                 streamer.commit_async_transition();
                 vegetation.invalidate();
-                objects.commit_reanchor(std::move(async_cross.prepared.world_objs));
+                objects.commit_staged_reanchor_upload();
                 living_traffic.on_reanchor();
                 sky_clouds.reset_temporal_history();
                 reg_atmo.sync_region(pack.anchor_lat(), pack.anchor_lon());
@@ -933,6 +947,7 @@ int main(int argc, char **argv) {
                 async_cross.prepared = async_cross.cpu_future.get();
                 async_cross.cpu_future = {};
                 if (async_cross.prepared.frame) {
+                    objects.begin_staged_reanchor_upload(std::move(async_cross.prepared.world_objs));
                     async_cross.stage2_streaming = true;
                     streamer.begin_async_transition(async_cross.prepared.frame, sky_clouds.atmo().sun_dir,
                                                     lat, lon, vel_e, vel_n);
@@ -974,20 +989,23 @@ int main(int argc, char **argv) {
     double paced_fps = 0.0;
     FlightFrameBudget frame_budget;
     bool terrain_workers_limited = false;
+    double last_cpu_work_ms = 0.0;
+    int last_queued_jobs = 0;
     const auto pace_present = [&](int limit) {
         if (limit <= 0 || (active_vsync && limit >= win.refresh_hz() - 1.5)) {
             paced_fps = 0.0;
             return;
         }
         const double period = 1.0 / limit;
-        const double now = PlatformWindow::now_sec();
-        if (paced_fps != limit || present_deadline < now - period) present_deadline = now;
+        double now = PlatformWindow::now_sec();
+        if (paced_fps != limit || present_deadline < now - period * 0.5) present_deadline = now;
         paced_fps = limit;
         if (present_deadline > now) {
             glFlush();
-            PlatformWindow::sleep_sec(present_deadline - PlatformWindow::now_sec());
+            PlatformWindow::sleep_sec(present_deadline - now);
+            now = PlatformWindow::now_sec();
         }
-        present_deadline += period;
+        present_deadline = std::max(present_deadline + period, now + period * 0.45);
     };
 
     auto regime_fog_mult = [&]() -> float {
@@ -1038,9 +1056,25 @@ int main(int argc, char **argv) {
         if (!walking) reg_atmo.update_refinement_center(aircraft.lat_deg, aircraft.lon_deg);
         if (step_weather) reg_atmo.update_field(sky_clouds.atmo().sun_dir, sim_time, false, wx_advance);
         const WeatherSnapshot *bakedw = reg_atmo.has_weather() ? &reg_atmo.weather() : nullptr;
+        Vec2 steer_wind_en{0.0f, 0.0f};
+        bool have_steer_wind = false;
+        if (reg_atmo.has_model()) {
+            const double ref_e = (lon - pack.anchor_lon()) * pack.anchor_m_lon();
+            const double ref_n = (lat - pack.anchor_lat()) * pack.anchor_m_lat();
+            const auto l1 = reg_atmo.debug_sample(ref_e, ref_n, 1);
+            const auto l2 = reg_atmo.debug_sample(ref_e, ref_n, 2);
+            if (l1.valid && l2.valid) {
+                steer_wind_en = {
+                    0.56f * l1.wind_enu_mps.x + 0.44f * l2.wind_enu_mps.x,
+                    0.56f * l1.wind_enu_mps.y + 0.44f * l2.wind_enu_mps.y
+                };
+                have_steer_wind = true;
+            }
+        }
         sky_clouds.update_solar_and_weather(lat, lon, cam_ground, tod_slot, sim_time,
                                             regime_fog_mult(), wx_advance, bakedw, season_override,
-                                            std::max(0.0, PlatformWindow::now_sec() - cycle_clock_origin));
+                                            std::max(0.0, PlatformWindow::now_sec() - cycle_clock_origin),
+                                            have_steer_wind ? &steer_wind_en : nullptr);
         streamer.set_sun_direction(sky_clouds.atmo().sun_dir);
         if (dot(sky_clouds.atmo().sun_dir, last_stream_sun) < 0.996f) {
             last_stream_sun = sky_clouds.atmo().sun_dir;
@@ -1049,6 +1083,11 @@ int main(int argc, char **argv) {
         profiler.cpu_end(FlightProfiler::Weather, weather_start);
     };
 
+    PromoInspectMode promo_inspect_mode = PromoInspectMode::None;
+    const char *promo_inspect_stage = nullptr;
+    float promo_cdlod_debug_alpha = 0.0f;
+    std::vector<QuadKey> promo_resident_keys;
+
     auto render_one_frame = [&](bool draw_hud, int max_new_tree_cells = 1, const std::string &save_png = "", float fov_deg = 50.0f, bool replay_hud = false, bool weather_model_overlay = false) {
         frame_idx++;
         profiler.start_frame(frame_idx, quality);
@@ -1056,11 +1095,15 @@ int main(int argc, char **argv) {
         const FlightSimState &st = ac_hud.state();
         const GraphicsSettings &render_settings = ac_hud.graphics_settings();
         const bool adaptive = quality == 1 && render_settings.fps_limit == 60 &&
-                              (interactive_run || (quick_profile && !fixed_profile && !uncapped_profile));
+                              (interactive_run || promo_clip == "engine_load_balancing" || (quick_profile && !fixed_profile && !uncapped_profile));
+        const double pkg_temp_c = adaptive ? FlightProfiler::sample_package_temp_c() : -1.0;
         const int eff_pixel_pct = frame_budget.start(adaptive, render_settings.pixel_percent,
-                                                     PlatformWindow::now_sec(), frame_idx);
-        if (terrain_workers_limited != frame_budget.reduce_distant_detail()) {
-            terrain_workers_limited = frame_budget.reduce_distant_detail();
+                                                     PlatformWindow::now_sec(), frame_idx,
+                                                     last_cpu_work_ms, last_queued_jobs, pkg_temp_c);
+        const FlightBudgetDecision &budget_dec = frame_budget.decision();
+        const bool worker_limit = budget_dec.limit_terrain_workers;
+        if (terrain_workers_limited != worker_limit) {
+            terrain_workers_limited = worker_limit;
             streamer.limit_workers(terrain_workers_limited);
         }
         const bool walking = frontend.walking() && !route_play.active;
@@ -1075,7 +1118,8 @@ int main(int argc, char **argv) {
         if (!promo_only) pack.set_online_camera(lat, lon);
 
         sky_clouds.resize_if_needed(output_w, output_h, quality,
-                                    eff_pixel_pct, render_settings.aa_mode, render_settings.weather_detail);
+                                    eff_pixel_pct, render_settings.aa_mode,
+                                    render_settings.weather_detail, render_settings.cloud_res_percent);
         if (render_settings.anisotropy != active_aniso) {
             active_aniso = render_settings.anisotropy;
             streamer.set_anisotropy(active_aniso);
@@ -1090,9 +1134,10 @@ int main(int argc, char **argv) {
         // Frame-time-budgeted upload cap; drains PBO staging bursts quickly without long frame stalls.
         const int steady_up = (streamer.resident_pages() >= 200) ? 1 : 3;
         const int max_up = streamer.has_async_transition() ? (quality <= 1 ? 2 : 6) :
-                           (quality <= 1 ? 1 : (quality == 2 ? steady_up : 6));
-        const double up_budget_ms = quality <= 1 ? 0.55 :
-                                    (streamer.has_async_transition() ? 2.4 : (quality == 2 ? 0.65 : 2.2));
+                           (adaptive ? budget_dec.max_uploads : (quality <= 1 ? 1 : (quality == 2 ? steady_up : 6)));
+        const double up_budget_ms = adaptive ? (streamer.has_async_transition() ? 1.4 : budget_dec.upload_budget_ms) :
+                                    (quality <= 1 ? 0.55 :
+                                    (streamer.has_async_transition() ? 2.4 : (quality == 2 ? 0.65 : 2.2)));
         profiler.begin(FlightProfiler::Upload);
         streamer.pump_gpu_uploads(static_cast<float>(sim_time), max_up, up_budget_ms);
         profiler.end(FlightProfiler::Upload);
@@ -1213,9 +1258,9 @@ int main(int argc, char **argv) {
             ? quality : std::clamp(render_settings.terrain_detail - 1, 0, 3);
         const int eff_veg_q = render_settings.vegetation_detail == 0
             ? quality : std::clamp(render_settings.vegetation_detail - 1, 0, 3);
-        const int eff_world_q = frame_budget.reduce_distant_detail() ? 0 :
-            (render_settings.world_detail == 0 ? quality :
-             (render_settings.world_detail == 4 ? 4 : render_settings.world_detail - 1));
+        const int base_world_q = render_settings.world_detail == 0 ? quality :
+             (render_settings.world_detail == 4 ? 4 : render_settings.world_detail - 1);
+        const int eff_world_q = budget_dec.reduce_distant_detail ? 0 : base_world_q;
         terrain.update_and_render(
             streamer, vp, frustum,
             cam_e, cam_n, cam_alt, cam_agl,
@@ -1226,7 +1271,7 @@ int main(int argc, char **argv) {
             static_cast<float>(sim_time), local_wind_en, sky_clouds.refl_env_tex(), quality,
             reg_atmo.weather().season, reg_atmo.weather().snowline_m,
             render_settings.terrain_lod_percent, grass_zone, terrain_wx_env,
-            eff_terrain_q, eff_veg_q
+            eff_terrain_q, eff_veg_q, budget_dec.terrain_lod_scale, promo_cdlod_debug_alpha
         );
         profiler.end(FlightProfiler::Terrain);
         const double t_p2 = PlatformWindow::now_sec();
@@ -1243,14 +1288,15 @@ int main(int argc, char **argv) {
             objects.update_and_render(
                 vp, frustum, cam_e, cam_n, cam_alt,
                 sky_clouds.atmo(), static_cast<float>(sim_time), local_wind_en, sky_clouds.refl_env_tex(), quality,
-                max_new_tree_cells, eff_world_q
+                max_new_tree_cells, eff_world_q, budget_dec.city_dist_scale, base_world_q
             );
             if (topdown_dir.empty()) {
                 vegetation.update_around(pack, lat, lon, static_cast<float>(cam_agl));
                 vegetation.draw(
                     vp, Vec3{static_cast<float>(cam_e), static_cast<float>(cam_alt), static_cast<float>(cam_n)},
                     sky_clouds.atmo(), static_cast<float>(cam_agl), static_cast<float>(sim_time),
-                    local_wind_en, reg_atmo.weather().season, reg_atmo.weather().snowline_m, eff_veg_q
+                    local_wind_en, reg_atmo.weather().season, reg_atmo.weather().snowline_m, eff_veg_q,
+                    budget_dec.veg_density_scale
                 );
             }
         }
@@ -1298,7 +1344,8 @@ int main(int argc, char **argv) {
             terrain.cloud_noise_tex(), terrain.cloud_vol_tex(), terrain.cloud_detail_tex(), terrain.lut_tex(),
             reg_atmo.field_tex(), reg_atmo.terrain_field_tex(), reg_atmo.domain_bounds(),
             reg_atmo.local_field_tex(), reg_atmo.local_terrain_tex(), reg_atmo.local_domain_bounds(),
-            static_cast<float>(sim_time), cloud_wx_fx
+            static_cast<float>(sim_time), cloud_wx_fx, budget_dec.cloud_step_scale,
+            reg_atmo.uploaded_weather_generation()
         );
         profiler.end(FlightProfiler::CloudsPost);
 
@@ -1318,12 +1365,48 @@ int main(int argc, char **argv) {
 
         // 6. Crisp Aviation HUD & Live Streaming + Mesoscale Wind Profiler
         profiler.begin(FlightProfiler::Hud);
-        const StreamStats stream = draw_hud || profiler.enabled() ? streamer.stats() : StreamStats{};
+        const StreamStats stream = (draw_hud || profiler.enabled() || adaptive) ? streamer.stats() : StreamStats{};
+        last_queued_jobs = stream.queued_jobs;
         if (draw_hud && walking) frontend.draw_walk(ac_hud, win, &reg_atmo, &sky_clouds.atmo(), sim_time);
         else if (draw_hud) {
-            const bool debug_active = profiler.overlay() || weather_debug_level >= 0 || physics_debug;
-            const DebugOverlayView debug{profiler.overlay() ? &profiler : nullptr, weather_debug_level, physics_debug,
-                                         vp, ac_rot, cam_e, cam_n};
+            const bool debug_active = profiler.overlay() || weather_debug_level >= 0 || physics_debug ||
+                                      promo_inspect_mode != PromoInspectMode::None;
+            DebugOverlayView debug{};
+            debug.profiler = profiler.overlay() ? &profiler : nullptr;
+            debug.weather_level = weather_debug_level;
+            debug.physics = physics_debug;
+            debug.projection_view = vp;
+            debug.aircraft_rotation = ac_rot;
+            debug.east_m = cam_e;
+            debug.north_m = cam_n;
+            debug.simulation_time_s = sim_time;
+            debug.weather_volume_3d = weather_model_overlay;
+            debug.promo_mode = promo_inspect_mode;
+            debug.promo_stage = promo_inspect_stage;
+            debug.budget = &budget_dec;
+            debug.quality = quality;
+            debug.scene_w = sky_clouds.scene_w();
+            debug.scene_h = sky_clouds.scene_h();
+            debug.out_w = output_w;
+            debug.out_h = output_h;
+            debug.total_bldgs = objects.total_buildings();
+            debug.active_cars = objects.active_cars();
+            debug.city_regions = objects.active_city_regions();
+            debug.city_chunks = objects.streamed_city_chunks();
+            debug.pnoa_hits = pack.online_tiles_used();
+            debug.pnoa_new = pack.online_tiles_fetched();
+            debug.cur_fps = cur_fps;
+            debug.cur_avg_ms = cur_avg_ms;
+            debug.cur_p95_ms = cur_p95_ms;
+            const auto *reg_now = pack.find_region_at(lat, lon);
+            debug.region_id = reg_now ? reg_now->region_id.c_str() : "es_aragon_pyrenees";
+            debug.stream = stream;
+            debug.cdlod = terrain.last_stats();
+            debug.cdlod_debug_alpha = promo_cdlod_debug_alpha;
+            if (promo_inspect_mode == PromoInspectMode::TileStreaming) {
+                promo_resident_keys = streamer.resident_keys_snapshot();
+                debug.resident_keys = &promo_resident_keys;
+            }
             ac_hud.render_hud(
                 output_w, output_h, sky_clouds.atmo(), reg_atmo,
                 stream, terrain.last_stats(),
@@ -1333,7 +1416,8 @@ int main(int argc, char **argv) {
                 reg_atmo.regime_name(), reg_atmo.has_library() ? reg_atmo.library().provenance() : nullptr,
                 show_diagnostics, debug_active ? &debug : nullptr
             );
-            frontend.draw_navigation(ac_hud, win);
+            if (promo_inspect_mode == PromoInspectMode::None)
+                frontend.draw_navigation(ac_hud, win);
         }
         if (!walking && st.view_mode == 0 && !st.menu_open && !route_play.active) {
             const PixelRect pr = win.presentation_rect(GAME_OUTPUT_W, GAME_OUTPUT_H);
@@ -1349,15 +1433,33 @@ int main(int argc, char **argv) {
                 route_play.playing, route_play.speed, ac_hud.state().view_mode,
                 &route_play.seek_t);
         }
-        if (weather_model_overlay || weather_model_debug)
+        if ((weather_model_overlay || weather_model_debug) && promo_inspect_mode == PromoInspectMode::None)
             ac_hud.render_weather_model_overlay(output_w, output_h, reg_atmo, vp, cam_e, cam_n, sim_time);
         profiler.end(FlightProfiler::Hud);
         const double t_p6 = PlatformWindow::now_sec();
-        if ((t_p6 - t_p0) * 1000.0 > 45.0) {
+        last_cpu_work_ms = (t_p6 - t_p0) * 1000.0;
+        if (last_cpu_work_ms > 45.0) {
             std::printf("[SLOW-FRAME F%llu] total=%.1fms (sky=%.1f terr=%.1f world=%.1f cdepth=%.1f air+tr=%.1f cld+ckpt+hud=%.1f)\n",
                         static_cast<unsigned long long>(frame_idx), (t_p6 - t_p0) * 1000.0,
                         (t_p1 - t_p0) * 1000.0, (t_p2 - t_p1) * 1000.0, (t_p3 - t_p2) * 1000.0,
                         (t_p4 - t_p3) * 1000.0, (t_p5 - t_p4) * 1000.0, (t_p6 - t_p5) * 1000.0);
+        }
+        if (promo_only) {
+            frame_budget.finish();
+            if (adaptive) frame_budget.presented(PlatformWindow::now_sec());
+            double gpu_sum_ms = 0.0;
+            if (profiler.enabled()) {
+                const auto &gms = profiler.latest_gpu_ms();
+                for (int pi = 0; pi < FlightProfiler::PassCount; ++pi) {
+                    if (gms[pi] > 0.0) gpu_sum_ms += gms[pi];
+                }
+            }
+            const double meas_ms = (adaptive && budget_dec.gpu_ema_ms > 0.2) ? budget_dec.gpu_ema_ms : gpu_sum_ms;
+            if (meas_ms > 0.2) {
+                cur_avg_ms = cur_avg_ms * 0.72 + meas_ms * 0.28;
+                cur_fps = std::clamp(1000.0 / cur_avg_ms, 1.0, 60.0);
+                cur_p95_ms = std::max(cur_avg_ms * 1.04, meas_ms);
+            }
         }
         if (!save_png.empty()) {
             if (!PlatformWindow::save_framebuffer_png(save_png, output_w, output_h))
@@ -2418,12 +2520,12 @@ int main(int argc, char **argv) {
                                 pack.online_tiles_fetched(), terrain.last_stats().max_active_lod);
                 };
 
-                auto save_sim_frame = [&](bool draw_hud_flag = false) {
+                auto save_sim_frame = [&](bool draw_hud_flag = false, bool wx_overlay = false) {
                     char fp[512];
                     std::snprintf(fp, sizeof(fp), "%s/frame_%05d.ppm", frames_dir.string().c_str(), video_frame++);
                     const float fov = (ac_hud.state().view_mode == 0 && portrait_promo) ? 62.0f
                                     : (ac_hud.state().view_mode == 0 ? 54.0f : 50.0f);
-                    capture_frame(kFrameDt, draw_hud_flag, 96, fp, fov, false);
+                    capture_frame(kFrameDt, draw_hud_flag, 96, fp, fov, wx_overlay);
                 };
 
                 auto step_physics_frame = [&](double roll_c, double pitch_c, double thr_t, double brk_c) {
@@ -2792,6 +2894,367 @@ int main(int argc, char **argv) {
                         PlatformWindow::save_framebuffer_png(fp, output_w, output_h);
                         glFlush();
                     }
+                } else if (promo_clip == "engine_load_balancing") {
+                    season_override = 2; tod_slot = 2; wx_advance = 0.62f;
+                    reg_atmo.set_season(2); reg_atmo.set_regime(WindRegime::PYRENEAN_THERMAL);
+                    profiler.set_overlay(true);
+                    show_diagnostics = true;
+                    promo_inspect_mode = PromoInspectMode::LoadBalancing;
+                    // Fly over dense Zaragoza urban core + Ebro bridges + clouds under F4 Ultra -> F2 Balanced -> F1 Low
+                    const double lat0 = 41.6380, lon0 = -0.9020;
+                    warm_scene(lat0, lon0, 260.0, 28.0, 1400.0);
+                    ac_hud.systems().reset_to_running_default();
+                    ac_hud.reset_flight(lat0, lon0, pack.sample_elevation(lat0, lon0) + 260.0, 28.0, 108.0, false);
+                    auto &st = ac_hud.state();
+                    st.paused = false; st.view_mode = 1; st.chase_dist_m = 13.5f; st.throttle = 0.86; st.mixture = 0.88;
+                    st.ap_master = true; st.ap_hdg_hold = true; st.ap_alt_hold = true;
+                    st.ap_hdg_deg = 28.0; st.ap_alt_ft = std::round((st.alt_msl_m * 3.28084) / 100.0) * 100.0;
+                    auto set_tier = [&](int tier) {
+                        GraphicsSettings gs = ac_hud.graphics_settings();
+                        apply_graphics_profile(gs, tier);
+                        gs.fps_limit = 60;
+                        ac_hud.set_graphics_settings(gs);
+                        quality = gs.quality_preset;
+                        sky_clouds.reset_temporal_history();
+                    };
+                    set_tier(3); // F4 Ultra (Heavy 100% Native Zaragoza towers + clouds)
+                    for (int f = 0; f < 600 && !win.should_close(); ++f) {
+                        win.poll_events();
+                        if (f < 140) {
+                            promo_inspect_stage = "ULTRA F4 (100% NATIVE STRESS)";
+                        } else if (f == 140) {
+                            set_tier(1); // Switch to F2 Balanced (FlightFrameBudget engages live!)
+                            promo_inspect_stage = "BALANCED F2 (ADAPTIVE BUDGET)";
+                        } else if (f < 360) {
+                            promo_inspect_stage = "BALANCED F2 (ADAPTIVE BUDGET)";
+                        } else if (f == 360) {
+                            st.view_mode = 0;
+                            sky_clouds.reset_temporal_history();
+                            promo_inspect_stage = "SCALED SCENE + 100% COCKPIT";
+                        } else if (f < 480) {
+                            promo_inspect_stage = "SCALED SCENE + 100% COCKPIT";
+                        } else if (f == 480) {
+                            set_tier(0); // Switch to F1 Low iGPU for maximum frame headroom
+                            promo_inspect_stage = "LOW iGPU F1 (MAX HEADROOM)";
+                        } else {
+                            promo_inspect_stage = "LOW iGPU F1 (MAX HEADROOM)";
+                        }
+                        if (f < 360) {
+                            const double u = f / 359.0;
+                            const double sm = u * u * (3.0 - 2.0 * u);
+                            st.look_yaw_deg = static_cast<float>(std::lerp(-36.0, 44.0, sm));
+                            st.look_pitch_deg = static_cast<float>(std::lerp(-15.0, -7.0, sm));
+                        } else {
+                            const double u = (f - 360) / 239.0;
+                            const double sm = u * u * (3.0 - 2.0 * u);
+                            st.look_yaw_deg = static_cast<float>(std::lerp(-10.0, 10.0, sm));
+                            st.look_pitch_deg = -10.5f;
+                        }
+                        step_physics_frame(0.0, 0.0, 0.86, 0.0);
+                        save_sim_frame(true);
+                        push_audio(st.view_mode == 0);
+                    }
+                    promo_inspect_mode = PromoInspectMode::None;
+                    promo_inspect_stage = nullptr;
+                    profiler.set_overlay(false);
+                } else if (promo_clip == "engine_tile_loading") {
+                    season_override = 2; tod_slot = 2; wx_advance = 0.24f;
+                    reg_atmo.set_season(2); reg_atmo.set_regime(WindRegime::CIERZO_NW);
+                    profiler.set_overlay(true);
+                    show_diagnostics = true;
+                    promo_inspect_mode = PromoInspectMode::TileStreaming;
+                    // Part A (0..260): Castejon Pyrenees PNOA -> Full CDLOD Quadtree LOD & Morph Wireframe inspection
+                    const double lat_a = 42.5313, lon_a = 0.4768;
+                    warm_scene(lat_a, lon_a, 340.0, 198.0, 1200.0);
+                    ac_hud.systems().reset_to_running_default();
+                    ac_hud.reset_flight(lat_a, lon_a, pack.sample_elevation(lat_a, lon_a) + 340.0, 198.0, 115.0, false);
+                    auto &st = ac_hud.state();
+                    st.paused = false; st.view_mode = 1; st.chase_dist_m = 14.0f;
+                    for (int f = 0; f < 260 && !win.should_close(); ++f) {
+                        win.poll_events();
+                        if (f < 55) {
+                            promo_cdlod_debug_alpha = 0.0f;
+                            promo_inspect_stage = "PNOA ORTHO + BC7 STREAMING";
+                        } else if (f < 90) {
+                            promo_cdlod_debug_alpha = static_cast<float>(f - 55) / 35.0f * 0.90f;
+                            promo_inspect_stage = "CDLOD QUADTREE + GEOMORPH";
+                        } else {
+                            promo_cdlod_debug_alpha = 0.90f;
+                            promo_inspect_stage = "CDLOD QUADTREE + GEOMORPH";
+                        }
+                        const double u = f / 259.0;
+                        st.look_yaw_deg = static_cast<float>(std::lerp(-24.0, 28.0, u * u * (3.0 - 2.0 * u)));
+                        st.look_pitch_deg = -15.5f;
+                        step_physics_frame(0.0, 0.04, 0.90, 0.0);
+                        save_sim_frame(true);
+                        push_audio(false);
+                    }
+                    // Part B (260..600): 350-knot rapid terrain/city/traffic streaming into Zaragoza with quadtree radar & split overlay
+                    const double lat_b = 41.6120, lon_b = -0.9280;
+                    warm_scene(lat_b, lon_b, 380.0, 32.0, 2400.0);
+                    ac_hud.reset_flight(lat_b, lon_b, pack.sample_elevation(lat_b, lon_b) + 380.0, 32.0, 350.0, false);
+                    st.slew_fast = true; st.speed_mps = 180.0; st.view_mode = 1; st.chase_dist_m = 14.0f;
+                    sky_clouds.reset_temporal_history();
+                    for (int f = 0; f < 340 && !win.should_close(); ++f) {
+                        win.poll_events();
+                        if (f < 150) {
+                            promo_cdlod_debug_alpha = 0.82f;
+                            promo_inspect_stage = "350KT QUADTREE + CITY STREAM";
+                        } else if (f < 210) {
+                            promo_cdlod_debug_alpha = std::lerp(0.82f, 0.0f, static_cast<float>(f - 150) / 60.0f);
+                            promo_inspect_stage = "350KT LIVE PNOA + BUILDINGS";
+                        } else {
+                            promo_cdlod_debug_alpha = 0.45f * (0.5f + 0.5f * std::sin(static_cast<float>(f - 210) * 0.06f));
+                            promo_inspect_stage = "CITY CHUNKS + PBO RING";
+                        }
+                        const double u = f / 339.0;
+                        st.look_yaw_deg = static_cast<float>(std::lerp(-28.0, 38.0, u * u * (3.0 - 2.0 * u)));
+                        st.look_pitch_deg = -16.0f;
+                        step_physics_frame(0.0, 0.0, 0.85, 0.0);
+                        save_sim_frame(true);
+                        push_audio(false);
+                    }
+                    promo_cdlod_debug_alpha = 0.0f;
+                    promo_inspect_mode = PromoInspectMode::None;
+                    promo_inspect_stage = nullptr;
+                    profiler.set_overlay(false);
+                    st.slew_fast = false;
+                } else if (promo_clip == "engine_weather_cloud_terrain") {
+                    season_override = 2; tod_slot = 2; wx_advance = 0.50f;
+                    reg_atmo.set_season(2); reg_atmo.set_regime(WindRegime::CONVECTIVE_STORM);
+                    weather_refinement_override = 2;
+                    reg_atmo.set_grid_detail(2, 42.3400, 0.2200);
+                    show_diagnostics = true;
+                    promo_inspect_mode = PromoInspectMode::WeatherCloudsWindshield;
+                    // Act 1 (0..220): Panoramic 3D weather solver + RK2 streamlines condensing across Pyrenean ridges
+                    const double lat0 = 42.5150, lon0 = 0.4810;
+                    warm_scene(lat0, lon0, 320.0, 0.0, 1200.0);
+                    ac_hud.systems().reset_to_running_default();
+                    ac_hud.reset_flight(lat0, lon0, pack.sample_elevation(lat0, lon0) + 320.0, 0.0, 95.0, false);
+                    auto &st = ac_hud.state();
+                    st.paused = false; st.view_mode = 2; st.free_cam_off_m = {0.0f, 50.0f, 0.0f};
+                    for (int f = 0; f < 220 && !win.should_close(); ++f) {
+                        win.poll_events();
+                        const double u = f / 219.0;
+                        wx_advance = static_cast<float>(std::lerp(0.32, 0.88, u));
+                        promo_inspect_stage = "384x288x4 + LOCAL 8KM SOLVER";
+                        st.look_yaw_deg = static_cast<float>(std::lerp(-18.0, 18.0, u * u * (3.0 - 2.0 * u)));
+                        st.look_pitch_deg = -5.0f;
+                        step_physics_frame(0.0, 0.0, 0.78, 0.0);
+                        save_sim_frame(true, true);
+                        push_audio(false);
+                    }
+                    // Act 2 (220..390): Chase pass entering dense opaque storm cumulus bank (true zero-vis IMC!)
+                    wx_advance = 0.96f;
+                    warm_scene(42.5360, 0.4790, 1180.0, 340.0, 900.0);
+                    ac_hud.reset_flight(42.5360, 0.4790, pack.sample_elevation(42.5360, 0.4790) + 1180.0, 340.0, 102.0, false);
+                    st.paused = false; st.view_mode = 1; st.chase_dist_m = 13.0f;
+                    sky_clouds.reset_temporal_history();
+                    for (int f = 0; f < 170 && !win.should_close(); ++f) {
+                        win.poll_events();
+                        const double u = f / 169.0;
+                        promo_inspect_stage = "3D RAYMARCHED STORM CLOUDS";
+                        st.look_yaw_deg = static_cast<float>(std::lerp(-34.0, 30.0, u * u * (3.0 - 2.0 * u)));
+                        st.look_pitch_deg = -5.5f;
+                        step_physics_frame(0.08 * std::sin(PI_D * u), 0.02, 0.82, 0.0);
+                        save_sim_frame(true, true);
+                        push_audio(false);
+                    }
+                    // Act 3 (390..690): Storm Cockpit showing live 256x160 GL_RGBA16F Windshield PDE PiP + 3D Wipers + Airflow/Wind!
+                    wx_advance = 0.96f;
+                    sim_time += 45.0;
+                    reg_atmo.update_field(sky_clouds.atmo().sun_dir, sim_time, true, wx_advance);
+                    warm_scene(42.5313, 0.4768, 180.0, 160.0, 900.0);
+                    ac_hud.reset_flight(42.5313, 0.4768, pack.sample_elevation(42.5313, 0.4768) + 180.0, 160.0, 58.0, false);
+                    st.paused = false; st.view_mode = 0; st.throttle = 0.25; st.wiper_mode = 0;
+                    sky_clouds.reset_temporal_history();
+                    for (int f = 0; f < 300 && !win.should_close(); ++f) {
+                        win.poll_events();
+                        if (f < 80) promo_inspect_stage = "LOW SPEED WET FILM ACCUM";
+                        else if (f < 185) promo_inspect_stage = "3D PANTOGRAPH WIPER SWEEP";
+                        else promo_inspect_stage = "HIGH AIRSPEED + XWIND SHEAR";
+                        if (f == 75) st.wiper_mode = 3;
+                        const double thr = (f < 85) ? 0.30 : 1.0;
+                        const double rcmd = (f >= 150 && f <= 265) ? 0.32 : 0.0;
+                        st.look_yaw_deg = 0.0f; st.look_pitch_deg = -7.0f;
+                        step_physics_frame(rcmd, 0.0, thr, 0.0);
+                        save_sim_frame(true, false);
+                        push_audio(true);
+                    }
+                    promo_inspect_mode = PromoInspectMode::None;
+                    promo_inspect_stage = nullptr;
+                } else if (promo_clip == "engine_aircraft_systems") {
+                    const AirportInfo *es = pack.find_airport("ES-0205");
+                    if (!es) return 1;
+                    season_override = 2; tod_slot = 2; wx_advance = 0.25f;
+                    reg_atmo.set_season(2); reg_atmo.set_regime(WindRegime::PYRENEAN_THERMAL);
+                    show_diagnostics = true;
+                    promo_inspect_mode = PromoInspectMode::AircraftSystems;
+                    frontend.open_airport(*es);
+                    const auto spot = frontend.parking_spot();
+                    warm_scene(spot.lat, spot.lon, 25.0, spot.heading, 500.0);
+                    frontend.open_airport(*es);
+                    frontend.board(ac_hud, 14.0);
+                    ac_hud.systems().reset_cold_and_dark();
+                    ac_hud.systems().set_fuel_selector(nspain::FUEL_SEL_OFF);
+                    auto &st = ac_hud.state();
+                    st.paused = false; st.view_mode = 0; st.throttle = 0.0; st.mixture = 0.0; st.parking_brake = true;
+                    sky_clouds.reset_temporal_history();
+                    for (int f = 0; f < 600 && !win.should_close(); ++f) {
+                        win.poll_events();
+                        if (f < 110) promo_inspect_stage = "COLD & DARK -> MASTER BAT";
+                        else if (f < 255) promo_inspect_stage = "PRIME + STARTER BUS SAG";
+                        else if (f < 425) promo_inspect_stage = "LIVE BREAKER FAULT TRIP/RST";
+                        else promo_inspect_stage = "MAG DROP + FLAPS + PITOT";
+
+                        if (f == 30)  ac_hud.systems().set_fuel_selector(nspain::FUEL_SEL_BOTH);
+                        if (f == 50)  ac_hud.systems().set_master_battery(true);
+                        if (f == 75)  ac_hud.systems().set_master_alternator(true);
+                        if (f == 90)  { ac_hud.systems().set_light_switch(0, true); ac_hud.systems().set_light_switch(2, true); ac_hud.systems().set_light_switch(4, true); }
+                        if (f == 110) ac_hud.systems().set_avionics_master(true);
+                        if (f == 125) st.mixture = 1.0;
+                        if (f == 138 || f == 150) ac_hud.systems().actuate_primer();
+                        if (f == 160) st.throttle = 0.16;
+                        if (f >= 170 && f < 235) ac_hud.systems().set_magnetos(4); // Starter crank -> bus sags to ~18V
+                        if (f == 235) ac_hud.systems().set_magnetos(3);
+                        if (f == 255) {
+                            ac_hud.systems().tune_nav_standby(1, 116.40); ac_hud.systems().swap_nav(1);
+                            ac_hud.systems().set_pitot_heat_switch(true);
+                            ac_hud.systems().set_light_switch(1, true);
+                            ac_hud.systems().set_light_switch(3, true);
+                        }
+                        // Live breaker trip -> GNS430 & Landing Light physically go out on 3D cockpit + schematic!
+                        if (f == 280) {
+                            ac_hud.systems().trip_breaker(nspain::CB_AVIONICS_BUS_1);
+                            ac_hud.systems().trip_breaker(nspain::CB_LAND_LIGHT);
+                        }
+                        if (f == 370) {
+                            ac_hud.systems().set_breaker_pulled(nspain::CB_AVIONICS_BUS_1, false);
+                            ac_hud.systems().set_breaker_pulled(nspain::CB_LAND_LIGHT, false);
+                        }
+                        // Magneto check (BOTH -> R -> L -> BOTH), Tank Selector LEFT, Flaps 20 deg!
+                        if (f == 430) { st.throttle = 0.65; ac_hud.systems().set_fuel_selector(nspain::FUEL_SEL_LEFT); }
+                        if (f == 460) ac_hud.systems().set_magnetos(1); // R mag check
+                        if (f == 495) ac_hud.systems().set_magnetos(2); // L mag check
+                        if (f == 525) { ac_hud.systems().set_magnetos(3); ac_hud.systems().set_flaps_target_deg(20.0); }
+                        const double u = f / 599.0;
+                        const double sm = u * u * (3.0 - 2.0 * u);
+                        st.look_yaw_deg = static_cast<float>(std::lerp(12.0, -10.0, sm));
+                        st.look_pitch_deg = static_cast<float>(std::lerp(-22.0, -14.0, sm));
+                        step_physics_frame(0.0, 0.0, st.throttle, 1.0);
+                        save_sim_frame(true, false);
+                        push_audio(true);
+                    }
+                    promo_inspect_mode = PromoInspectMode::None;
+                    promo_inspect_stage = nullptr;
+                } else if (promo_clip == "engine_aircraft_physics") {
+                    const AirportInfo *es = pack.find_airport("ES-0205");
+                    const AirportInfo *leci = pack.find_airport("LECI");
+                    if (!es || !leci) return 1;
+                    season_override = 2; tod_slot = 2; wx_advance = 0.36f;
+                    reg_atmo.set_season(2); reg_atmo.set_regime(WindRegime::CIERZO_NW);
+                    physics_debug = true;
+                    show_diagnostics = true;
+                    promo_inspect_mode = PromoInspectMode::AircraftPhysics;
+                    // Act 1 (0..140): Rough grass strip ES-0205 takeoff roll -> strut unloading WOW 1/1/1 -> 0/0/0 -> climb!
+                    const double dn1 = (es->rwy_lat_b - es->rwy_lat_a) * 111132.0;
+                    const double de1 = (es->rwy_lon_b - es->rwy_lon_a) * 111320.0 * std::cos(es->lat * DEG2RAD_D);
+                    const double es_hdg = std::fmod(std::atan2(de1, dn1) * RAD2DEG_D + 360.0, 360.0);
+                    warm_scene(es->rwy_lat_a, es->rwy_lon_a, 60.0, es_hdg, 1100.0);
+                    ac_hud.systems().reset_to_running_default();
+                    ac_hud.systems().set_flaps_immediate_deg(10.0);
+                    auto &st = ac_hud.state();
+                    st.parking_brake = false;
+                    ac_hud.reset_flight(es->rwy_lat_a, es->rwy_lon_a, es->rwy_elev_a + 1.0, es_hdg, 34.0, true);
+                    st.paused = false; st.parking_brake = false; st.view_mode = 1; st.chase_dist_m = 13.0f; st.throttle = 1.0;
+                    sky_clouds.reset_temporal_history();
+                    for (int f = 0; f < 140 && !win.should_close(); ++f) {
+                        win.poll_events();
+                        const auto &fs = ac_hud.jsb_state();
+                        promo_inspect_stage = fs.on_ground ? "GRASS ROLLOUT (WOW 1/1/1)" : "ROTATION & CLIMB (WOW 0/0/0)";
+                        const double pcmd = (fs.ias_kt >= 52.0) ? 0.56 : 0.0;
+                        const double u = f / 139.0;
+                        st.look_yaw_deg = static_cast<float>(std::lerp(-34.0, 28.0, u * u * (3.0 - 2.0 * u)));
+                        st.look_pitch_deg = -10.5f;
+                        step_physics_frame(0.0, pcmd, 1.0, 0.0);
+                        save_sim_frame(true, false);
+                        push_audio(false);
+                    }
+                    // Act 2 (140..280): Intentional Power-Off Aerodynamic Stall (CL_max!) & Smooth Nose-Down Recovery
+                    warm_scene(42.5313, 0.4768, 950.0, 160.0, 1000.0);
+                    ac_hud.systems().set_flaps_immediate_deg(0.0);
+                    ac_hud.reset_flight(42.5313, 0.4768, pack.sample_elevation(42.5313, 0.4768) + 950.0, 160.0, 62.0, false);
+                    st.paused = false; st.view_mode = 1; st.chase_dist_m = 13.0f;
+                    sky_clouds.reset_temporal_history();
+                    for (int f = 0; f < 140 && !win.should_close(); ++f) {
+                        win.poll_events();
+                        const auto &fs = ac_hud.jsb_state();
+                        const bool recover = (f >= 90);
+                        promo_inspect_stage = recover ? "STALL RECOVERY (FULL PWR)" : (fs.stalled ? "STALLED AT CL_MAX!" : "APPROACH TO STALL (AoA UP)");
+                        const double thr = recover ? 1.0 : 0.0;
+                        const double pcmd = recover ? -0.35 : 0.92;
+                        const double u = f / 139.0;
+                        st.look_yaw_deg = static_cast<float>(std::lerp(42.0, -30.0, u * u * (3.0 - 2.0 * u)));
+                        st.look_pitch_deg = -7.0f;
+                        step_physics_frame(0.0, pcmd, thr, 0.0);
+                        save_sim_frame(true, false);
+                        push_audio(false);
+                    }
+                    // Act 3 (280..1100): Stabilized Flapped Approach, Flare & Wet Asphalt Oleo Strut Compression + Braking at LECI!
+                    wx_advance = 0.64f;
+                    reg_atmo.set_regime(WindRegime::PYRENEAN_THERMAL);
+                    reg_atmo.update_field(sky_clouds.atmo().sun_dir, sim_time, true, wx_advance);
+                    const double dn2 = (leci->rwy_lat_b - leci->rwy_lat_a) * 111132.0;
+                    const double de2 = (leci->rwy_lon_b - leci->rwy_lon_a) * 111320.0 * std::cos(leci->lat * DEG2RAD_D);
+                    const double leci_hdg = std::fmod(std::atan2(de2, dn2) * RAD2DEG_D + 360.0, 360.0);
+                    const double leci_rad = leci_hdg * DEG2RAD_D;
+                    const double rwy_len_m = std::max(400.0, std::hypot(de2, dn2));
+                    double mlat = 111132.0, mlon = 82000.0;
+                    nspain::meters_per_degree(leci->rwy_lat_a, mlat, mlon);
+                    const double app_lat = leci->rwy_lat_a + std::cos(leci_rad) * 40.0 / mlat;
+                    const double app_lon = leci->rwy_lon_a + std::sin(leci_rad) * 40.0 / mlon;
+                    warm_scene(app_lat, app_lon, 35.0, leci_hdg, 900.0);
+                    ac_hud.systems().reset_to_running_default();
+                    ac_hud.systems().set_flaps_immediate_deg(0.0);
+                    st.parking_brake = false;
+                    ac_hud.reset_flight(app_lat, app_lon, pack.sample_elevation(app_lat, app_lon) + 35.0, leci_hdg, 80.0, false);
+                    ac_hud.systems().set_flaps_target_deg(20.0);
+                    st.paused = false; st.view_mode = 1; st.chase_dist_m = 13.0f; st.throttle = 0.22;
+                    bool td = false;
+                    for (int f = 0; f < 820 && !win.should_close(); ++f) {
+                        win.poll_events();
+                        const auto &fs = ac_hud.jsb_state();
+                        if (fs.on_ground) td = true;
+                        promo_inspect_stage = td ? "ASPHALT STRUT + BRAKE" : "CROSSWIND APPROACH & FLARE";
+                        const double rel_n = (fs.lat_deg - leci->rwy_lat_a) * 111132.0;
+                        const double rel_e = (fs.lon_deg - leci->rwy_lon_a) * 111320.0 * std::cos(leci->rwy_lat_a * DEG2RAD_D);
+                        const double along = rel_e * std::sin(leci_rad) + rel_n * std::cos(leci_rad);
+                        const double xtrack = rel_e * std::cos(leci_rad) - rel_n * std::sin(leci_rad);
+                        double thr = 0.20, brk = 0.0, pcmd = 0.0, rcmd = 0.0;
+                        if (!td) {
+                            const double aim_hdg = leci_hdg - std::atan2(xtrack, 220.0) * RAD2DEG_D;
+                            rcmd = std::clamp(std::remainder(aim_hdg - fs.heading_deg, 360.0) * 0.035, -0.25, 0.25);
+                            const double rwy_frac = std::clamp(along / rwy_len_m, 0.0, 1.0);
+                            const double rwy_msl_here = leci->rwy_elev_a * (1.0 - rwy_frac) + leci->rwy_elev_b * rwy_frac + 0.35;
+                            const double h_rwy = fs.alt_msl_m - rwy_msl_here;
+                            thr = (h_rwy < 7.5) ? 0.0 : std::clamp(0.16 + (64.0 - fs.ias_kt) * 0.025, 0.0, 0.40);
+                            const double tgt_vsi = std::lerp(-0.85, -3.3, std::clamp((h_rwy - 1.3) / 8.5, 0.0, 1.0));
+                            pcmd = std::clamp((tgt_vsi - fs.vsi_mps) * 0.20, -0.35, 0.42);
+                        } else {
+                            thr = 0.0; pcmd = 0.0;
+                            brk = (fs.ground_speed_mps > 1.8) ? 0.78 : 1.0;
+                            const double herr = std::remainder(leci_hdg - fs.heading_deg, 360.0);
+                            rcmd = std::clamp(herr * 0.06, -0.35, 0.35);
+                        }
+                        const double u = f / 819.0;
+                        st.look_yaw_deg = static_cast<float>(std::lerp(24.0, -32.0, u * u * (3.0 - 2.0 * u)));
+                        st.look_pitch_deg = -10.0f;
+                        step_physics_frame(rcmd, pcmd, thr, brk);
+                        save_sim_frame(true, false);
+                        push_audio(false);
+                    }
+                    promo_inspect_mode = PromoInspectMode::None;
+                    promo_inspect_stage = nullptr;
                 } else {
                     std::fprintf(stderr, "[PROMO-CLIP] Unknown clip '%s'\n", promo_clip.c_str());
                     return 2;
@@ -3189,28 +3652,115 @@ int main(int argc, char **argv) {
         }
         prev_audio_grounded = jsb.on_ground;
         as.touchdown_seq = audio_td_seq;
+        as.wheel_bias = static_cast<float>(std::clamp(st.roll_deg / 12.0 + st.aileron * 0.25, -0.5, 0.5));
+
+        const Mat4 ac_rot = Mat4::rotate_yxz(
+            static_cast<float>(-st.heading_deg * DEG2RAD_D),
+            static_cast<float>(st.pitch_deg * DEG2RAD_D),
+            static_cast<float>(-st.roll_deg * DEG2RAD_D)
+        );
+        Mat4 ear_rot = ac_rot;
+        double listener_lat = st.lat_deg, listener_lon = st.lon_deg, listener_alt = st.alt_msl_m;
+        Vec3 listener_vel_enu{static_cast<float>(jsb.vel_east_mps), static_cast<float>(jsb.vsi_mps), -static_cast<float>(jsb.vel_north_mps)};
 
         if (as.walking) {
             const auto &w = frontend.walker();
             const auto &p = frontend.parking_spot();
             const double de = (p.lon - w.lon) * pack.anchor_m_lon();
             const double dn = (p.lat - w.lat) * pack.anchor_m_lat();
-            as.aircraft_dist_m = static_cast<float>(std::hypot(de, dn));
-            const double hdg_r = w.heading * DEG2RAD_D;
-            const double right_e = std::cos(hdg_r), right_n = -std::sin(hdg_r);
-            const double denom = std::max(1.0, std::hypot(de, dn));
-            as.aircraft_pan = static_cast<float>(std::clamp((de * right_e + dn * right_n) / denom, -1.0, 1.0));
+            const double du = p.alt - w.alt;
+            const Vec3 to_ac{static_cast<float>(de), static_cast<float>(du), static_cast<float>(-dn)};
+            const float dist = length(to_ac);
+            as.aircraft_dist_m = dist;
+            ear_rot = Mat4::rotate_yxz(float(-w.heading * DEG2RAD_D), float(w.pitch * DEG2RAD_D), 0.0f);
+            const Vec3 r_ear{ear_rot.m[0], ear_rot.m[1], ear_rot.m[2]};
+            const Vec3 u_ear{ear_rot.m[4], ear_rot.m[5], ear_rot.m[6]};
+            const Vec3 f_ear{-ear_rot.m[8], -ear_rot.m[9], -ear_rot.m[10]};
+            const Vec3 dir = (dist > 0.2f) ? (to_ac / dist) : f_ear;
+            as.aircraft_pan = std::clamp(dot(dir, r_ear), -1.0f, 1.0f);
+            as.aircraft_elev = std::clamp(dot(dir, u_ear), -1.0f, 1.0f);
+            as.aircraft_front = std::clamp(dot(dir, f_ear), -1.0f, 1.0f);
+            listener_lat = w.lat;
+            listener_lon = w.lon;
+            listener_alt = w.alt;
             if (prev_walk_valid && dt_sec > 1e-4) {
                 const double we = (w.lon - prev_walk_lon) * pack.anchor_m_lon();
                 const double wn = (w.lat - prev_walk_lat) * pack.anchor_m_lat();
-                as.walk_speed_mps = static_cast<float>(std::hypot(we, wn) / dt_sec);
+                const Vec3 w_vel{static_cast<float>(we / dt_sec), 0.0f, static_cast<float>(-wn / dt_sec)};
+                as.walk_speed_mps = length(w_vel);
+                as.aircraft_rel_speed_mps = dot(w_vel, dir);
+                listener_vel_enu = w_vel;
             }
             prev_walk_lat = w.lat;
             prev_walk_lon = w.lon;
             prev_walk_valid = true;
         } else {
             prev_walk_valid = false;
-            as.aircraft_dist_m = (st.view_mode == 0) ? 0.0f : (st.view_mode == 1 ? st.chase_dist_m : length(st.free_cam_off_m));
+            const Vec3 look_feel = (st.view_mode == 0 && !st.paused && ac_hud.graphics_settings().head_motion_mode > 0)
+                ? ac_hud.cockpit_look_feel() : Vec3{0.0f, 0.0f, 0.0f};
+            const Mat4 look_rot = Mat4::rotate_yxz(
+                (st.look_yaw_deg + look_feel.x) * DEG2RAD_F,
+                (st.look_pitch_deg + look_feel.y) * DEG2RAD_F,
+                0.0f
+            );
+            ear_rot = ac_rot * look_rot;
+            if (st.view_mode == 0) {
+                as.aircraft_dist_m = 0.0f;
+                const Vec3 r_h{look_rot.m[0], look_rot.m[1], look_rot.m[2]};
+                const Vec3 u_h{look_rot.m[4], look_rot.m[5], look_rot.m[6]};
+                const Vec3 f_h{-look_rot.m[8], -look_rot.m[9], -look_rot.m[10]};
+                const Vec3 nose_dir = normalize(Vec3{0.0f, -0.18f, -1.0f});
+                as.aircraft_pan = std::clamp(dot(nose_dir, r_h), -1.0f, 1.0f);
+                as.aircraft_elev = std::clamp(dot(nose_dir, u_h), -1.0f, 1.0f);
+                as.aircraft_front = std::clamp(dot(nose_dir, f_h), -1.0f, 1.0f);
+                as.cockpit_stall_pan = std::clamp(dot(normalize(Vec3{-0.10f, 0.85f, -0.52f}), r_h), -1.0f, 1.0f);
+                as.cockpit_avionics_pan = std::clamp(dot(normalize(Vec3{0.38f, -0.15f, -0.91f}), r_h), -1.0f, 1.0f);
+                as.cockpit_flaps_pan = std::clamp(dot(normalize(Vec3{0.20f, 0.70f, 0.68f}), r_h), -1.0f, 1.0f);
+                as.aircraft_rel_speed_mps = 0.0f;
+            } else {
+                const Vec4 cam_off4 = (st.view_mode == 1)
+                    ? ear_rot.mul({0.0f, 1.65f, st.chase_dist_m, 0.0f})
+                    : ac_rot.mul({st.free_cam_off_m.x, st.free_cam_off_m.y, st.free_cam_off_m.z, 0.0f});
+                const Vec4 nose_w4 = ac_rot.mul({0.0f, -0.05f, -1.8f, 0.0f});
+                const Vec3 to_nose{nose_w4.x - cam_off4.x, nose_w4.y - cam_off4.y, nose_w4.z - cam_off4.z};
+                const float d_ext = length(to_nose);
+                as.aircraft_dist_m = d_ext;
+                const Vec3 r_e{ear_rot.m[0], ear_rot.m[1], ear_rot.m[2]};
+                const Vec3 u_e{ear_rot.m[4], ear_rot.m[5], ear_rot.m[6]};
+                const Vec3 f_e{-ear_rot.m[8], -ear_rot.m[9], -ear_rot.m[10]};
+                const Vec3 dir = (d_ext > 0.2f) ? (to_nose / d_ext) : f_e;
+                as.aircraft_pan = std::clamp(dot(dir, r_e), -1.0f, 1.0f);
+                as.aircraft_elev = std::clamp(dot(dir, u_e), -1.0f, 1.0f);
+                as.aircraft_front = std::clamp(dot(dir, f_e), -1.0f, 1.0f);
+                // Free-camera stays world-anchored relative to flight velocity at flyby offset.
+                if (st.view_mode == 2) {
+                    as.aircraft_rel_speed_mps = std::clamp(dot(listener_vel_enu, -dir), -90.0f, 90.0f);
+                } else {
+                    as.aircraft_rel_speed_mps = 0.0f;
+                }
+            }
+        }
+        // Wind direction across listener ears + nearest AI aircraft 3D spatial flyby.
+        const Vec3 r_ear_w{ear_rot.m[0], ear_rot.m[1], ear_rot.m[2]};
+        const Vec3 f_ear_w{-ear_rot.m[8], -ear_rot.m[9], -ear_rot.m[10]};
+        const Vec3 wind_enu{static_cast<float>(air.wind_east_mps), 0.0f, static_cast<float>(-air.wind_north_mps)};
+        const float w_mag = length(wind_enu);
+        as.wind_pan = (w_mag > 0.4f) ? std::clamp(-dot(wind_enu / w_mag, r_ear_w), -1.0f, 1.0f) : 0.0f;
+
+        if (!cockpit_qa) {
+            const auto tr = living_traffic.nearest_aircraft(listener_lat, listener_lon, listener_alt);
+            if (tr.valid) {
+                const Vec3 to_tr{tr.rel_east_m, tr.rel_up_m, -tr.rel_north_m};
+                const float td = std::max(1.0f, tr.dist_m);
+                const Vec3 tr_dir = to_tr / td;
+                const Vec3 tr_vel{tr.vel_east_mps, tr.vel_up_mps, -tr.vel_north_mps};
+                as.traffic_dist_m = td;
+                as.traffic_pan = std::clamp(dot(tr_dir, r_ear_w), -1.0f, 1.0f);
+                as.traffic_front = std::clamp(dot(tr_dir, f_ear_w), -1.0f, 1.0f);
+                as.traffic_rel_speed_mps = std::clamp(dot(tr_vel - listener_vel_enu, -tr_dir), -120.0f, 120.0f);
+                as.traffic_rpm = tr.rpm_hint;
+                as.traffic_is_airliner = tr.is_airliner;
+            }
         }
         audio.update_state(as);
     };

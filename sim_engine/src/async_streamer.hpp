@@ -124,6 +124,7 @@ public:
     GLuint surf_array_tex() const { return surf_arr_; }
     StreamStats stats() const;
     int resident_pages() const { return static_cast<int>(key_to_slot_.size()); }
+    std::vector<QuadKey> resident_keys_snapshot() const;
 
     static void quad_bounds_en(QuadKey k, double &out_center_e, double &out_center_n, double &out_half_span);
 

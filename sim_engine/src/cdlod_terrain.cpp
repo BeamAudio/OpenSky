@@ -162,22 +162,75 @@ bool CdlodTerrain::load_cloud_vol_3d(const std::string &atlas_path) {
         if (pix) stbi_image_free(pix);
         return false;
     }
-    // Unpack 4x4 16-slice 2D atlas directly into native hardware GL_TEXTURE_3D (128x128x16) for 1-tap trilinear wrap!
-    int sw = w / 4, sh = h / 4;
-    std::vector<uint8_t> vol(static_cast<size_t>(sw) * sh * 16 * 4);
-    for (int z = 0; z < 16; z++) {
-        int row = z / 4, col = z % 4;
-        for (int y = 0; y < sh; y++) {
-            const uint8_t *src = pix + (static_cast<size_t>(row * sh + y) * w + col * sw) * 4;
-            uint8_t *dst = vol.data() + (static_cast<size_t>(z * sh + y) * sw) * 4;
-            std::memcpy(dst, src, static_cast<size_t>(sw) * 4);
+    // Upsample the 4x4 16-slice atlas smoothly via cyclic Catmull-Rom in Z into a true
+    // isotropic 64x64x64 mipmapped 3D Perlin-Worley volume (eliminates 16-slice horizontal Z-kinks!).
+    const int sw = w / 4, sh = h / 4;
+    auto sample_atlas = [&](int z_slice, float u, float v, int comp) -> float {
+        const int sz = ((z_slice % 16) + 16) % 16;
+        const int row = sz / 4, col = sz % 4;
+        const float fx = u * sw - 0.5f, fy = v * sh - 0.5f;
+        const int ix0 = static_cast<int>(std::floor(fx)), iy0 = static_cast<int>(std::floor(fy));
+        const float tx = fx - ix0, ty = fy - iy0;
+        auto px = [&](int dx, int dy) -> float {
+            const int x = ((ix0 + dx) % sw + sw) % sw;
+            const int y = ((iy0 + dy) % sh + sh) % sh;
+            return pix[(static_cast<size_t>(row * sh + y) * w + (col * sw + x)) * 4 + comp] * (1.0f / 255.0f);
+        };
+        return std::lerp(std::lerp(px(0, 0), px(1, 0), tx), std::lerp(px(0, 1), px(1, 1), tx), ty);
+    };
+    auto vnoise3 = [&](float x, float y, float z, int cells, uint32_t seed) -> float {
+        const float sx = x * cells, sy = y * cells, sz = z * cells;
+        const int ix = static_cast<int>(std::floor(sx)), iy = static_cast<int>(std::floor(sy)), iz = static_cast<int>(std::floor(sz));
+        const float fx = sx - ix, fy = sy - iy, fz = sz - iz;
+        const float ux = fx * fx * (3.0f - 2.0f * fx);
+        const float uy = fy * fy * (3.0f - 2.0f * fy);
+        const float uz = fz * fz * (3.0f - 2.0f * fz);
+        auto hval = [&](int dx, int dy, int dz) {
+            return (hash3_tile(ix + dx, iy + dy, iz + dz, cells, seed) & 0xFFFFu) * (1.0f / 65535.0f);
+        };
+        const float x00 = std::lerp(hval(0, 0, 0), hval(1, 0, 0), ux);
+        const float x10 = std::lerp(hval(0, 1, 0), hval(1, 1, 0), ux);
+        const float x01 = std::lerp(hval(0, 0, 1), hval(1, 0, 1), ux);
+        const float x11 = std::lerp(hval(0, 1, 1), hval(1, 1, 1), ux);
+        return std::lerp(std::lerp(x00, x10, uy), std::lerp(x01, x11, uy), uz);
+    };
+
+    constexpr int VD = 64;
+    std::vector<uint8_t> vol(static_cast<size_t>(VD) * VD * VD * 4);
+    for (int z = 0; z < VD; ++z) {
+        const float fz = (z + 0.5f) / VD;
+        const float zpos = fz * 16.0f;
+        const int z1 = static_cast<int>(std::floor(zpos));
+        const float tz = zpos - z1;
+        const float tz2 = tz * tz, tz3 = tz2 * tz;
+        const float w0 = -0.5f * tz + tz2 - 0.5f * tz3;
+        const float w1 = 1.0f - 2.5f * tz2 + 1.5f * tz3;
+        const float w2 = 0.5f * tz + 2.0f * tz2 - 1.5f * tz3;
+        const float w3 = -0.5f * tz2 + 0.5f * tz3;
+        for (int y = 0; y < VD; ++y) {
+            const float fy = (y + 0.5f) / VD;
+            for (int x = 0; x < VD; ++x) {
+                const float fx = (x + 0.5f) / VD;
+                const size_t idx = ((static_cast<size_t>(z) * VD + y) * VD + x) * 4;
+                const float fbm_lo = vnoise3(fx, fy, fz, 3, 0x41a729u) * 0.62f + vnoise3(fx, fy, fz, 6, 0x9b3185u) * 0.38f;
+                const float fbm_hi = vnoise3(fx, fy, fz, 5, 0xc7041fu) * 0.58f + vnoise3(fx, fy, fz, 10, 0x2f8e6du) * 0.42f;
+                for (int c = 0; c < 4; ++c) {
+                    const float cat = w0 * sample_atlas(z1 - 1, fx, fy, c) + w1 * sample_atlas(z1, fx, fy, c)
+                                    + w2 * sample_atlas(z1 + 1, fx, fy, c) + w3 * sample_atlas(z1 + 2, fx, fy, c);
+                    float val = (c == 0) ? std::lerp(cat, fbm_lo, 0.38f)
+                              : (c == 1) ? std::lerp(cat, fbm_hi, 0.35f)
+                              : (c == 3) ? fbm_lo : cat;
+                    vol[idx + c] = static_cast<uint8_t>(std::clamp(val, 0.0f, 1.0f) * 255.0f + 0.5f);
+                }
+            }
         }
     }
     glCreateTextures(GL_TEXTURE_3D, 1, &cloud_vol_tex_);
-    glTextureStorage3D(cloud_vol_tex_, 1, GL_RGBA8, sw, sh, 16);
+    glTextureStorage3D(cloud_vol_tex_, 7, GL_RGBA8, VD, VD, VD);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glTextureSubImage3D(cloud_vol_tex_, 0, 0, 0, 0, sw, sh, 16, GL_RGBA, GL_UNSIGNED_BYTE, vol.data());
-    glTextureParameteri(cloud_vol_tex_, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTextureSubImage3D(cloud_vol_tex_, 0, 0, 0, 0, VD, VD, VD, GL_RGBA, GL_UNSIGNED_BYTE, vol.data());
+    glGenerateTextureMipmap(cloud_vol_tex_);
+    glTextureParameteri(cloud_vol_tex_, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
     glTextureParameteri(cloud_vol_tex_, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTextureParameteri(cloud_vol_tex_, GL_TEXTURE_WRAP_S, GL_REPEAT);
     glTextureParameteri(cloud_vol_tex_, GL_TEXTURE_WRAP_T, GL_REPEAT);
@@ -227,10 +280,10 @@ void CdlodTerrain::build_procedural_cloud_and_micro_tex() {
             for (int x = 0; x < DN; ++x) {
                 const size_t i = ((static_cast<size_t>(z) * DN + y) * DN + x) * 4;
                 const float fx = (x + 0.5f) / DN, fy = (y + 0.5f) / DN, fz = (z + 0.5f) / DN;
-                cloud_detail[i + 0] = static_cast<uint8_t>(worley3_tile(fx * 32.0f, fy * 32.0f, fz * 32.0f, 32, 0x3812a5u) * 255.0f + 0.5f);
-                cloud_detail[i + 1] = static_cast<uint8_t>(worley3_tile(fx * 16.0f, fy * 16.0f, fz * 16.0f, 16, 0x95c317u) * 255.0f + 0.5f);
-                cloud_detail[i + 2] = static_cast<uint8_t>(worley3_tile(fx * 8.0f, fy * 8.0f, fz * 8.0f, 8, 0x6a09e6u) * 255.0f + 0.5f);
-                cloud_detail[i + 3] = static_cast<uint8_t>(worley3_tile(fx * 4.0f, fy * 4.0f, fz * 4.0f, 4, 0xbb67aeu) * 255.0f + 0.5f);
+                cloud_detail[i + 0] = static_cast<uint8_t>(worley3_tile(fx * 14.0f, fy * 14.0f, fz * 14.0f, 14, 0x3812a5u) * 255.0f + 0.5f);
+                cloud_detail[i + 1] = static_cast<uint8_t>(worley3_tile(fx * 7.0f, fy * 7.0f, fz * 7.0f, 7, 0x95c317u) * 255.0f + 0.5f);
+                cloud_detail[i + 2] = static_cast<uint8_t>(worley3_tile(fx * 4.0f, fy * 4.0f, fz * 4.0f, 4, 0x6a09e6u) * 255.0f + 0.5f);
+                cloud_detail[i + 3] = static_cast<uint8_t>(worley3_tile(fx * 2.0f, fy * 2.0f, fz * 2.0f, 2, 0xbb67aeu) * 255.0f + 0.5f);
             }
         }
     }
@@ -296,6 +349,7 @@ bool CdlodTerrain::init(const std::string &asset_root, const std::string &shader
     u_.grass_zone      = glGetUniformLocation(prog_, "u_grass_zone");
     u_.grass_zone_bounds = glGetUniformLocation(prog_, "u_grass_zone_bounds");
     u_.wx_env          = glGetUniformLocation(prog_, "u_wx_env");
+    u_.debug_lod       = glGetUniformLocation(prog_, "u_debug_lod");
 
     if (!load_sat_array_16(asset_root + "/pbr/sat_detail_atlas.jpg")) return false;
     if (!load_cloud_vol_3d(asset_root + "/pbr/cloud_vol_3d.png")) return false;
@@ -581,7 +635,9 @@ void CdlodTerrain::update_and_render(
     const TerrainGrassZone &grass_zone,
     const Vec4 &wx_env,
     int terrain_detail,
-    int veg_detail
+    int veg_detail,
+    float lod_scale,
+    float debug_lod_alpha
 ) {
     visible_.clear();
     stats_ = {};
@@ -599,7 +655,8 @@ void CdlodTerrain::update_and_render(
 
     // Balanced LOD distance scale keeps sharp L8/L9 near camera while hitting 60 FPS on Renoir iGPUs
     float q_mult = (quality == 0) ? 2.25f : (quality == 1 ? 2.25f : (quality == 2 ? 2.25f : 3.45f));
-    q_mult *= std::clamp(lod_distance_percent, 75, MAX_LOD_DISTANCE_PERCENT) / 100.0f;
+    q_mult *= (std::clamp(lod_distance_percent, 75, MAX_LOD_DISTANCE_PERCENT) / 100.0f) *
+              std::clamp(lod_scale, 0.70f, 1.15f);
     for (int l = 1; l <= AsyncTerrainStreamer::MAX_LOD; l++) {
         double quad_size = AsyncTerrainStreamer::WORLD_SPAN_M / static_cast<double>(1u << l);
         lod_ranges_[l] = static_cast<float>(quad_size * q_mult);
@@ -648,6 +705,7 @@ void CdlodTerrain::update_and_render(
     glUniform4f(u_.grass_zone_bounds, grass_zone.half_length_m, grass_zone.outer_half_width_m,
                 grass_zone.runway_half_width_m, grass_zone.grass_runway ? 1.0f : 0.0f);
     glUniform4f(u_.wx_env, wx_env.x, wx_env.y, wx_env.z, wx_env.w);
+    if (u_.debug_lod >= 0) glUniform1f(u_.debug_lod, std::clamp(debug_lod_alpha, 0.0f, 1.0f));
 
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, inst_ssbo_);
     glBindTextureUnit(0, streamer.height_array_tex());

@@ -44,6 +44,16 @@ These scenes use preset inputs to the regional weather model. The first view exp
 |---|---|
 | ![3D wind vectors across four published weather-model layers over the Pyrenees](docs/images/promo_weather_clouds.png) | ![Rain on the 172S windshield near Castejón de Sos](docs/images/promo_weather_rain.png) |
 
+### Engine showcase videos (`1080×1920` vertical @ 60 FPS)
+
+Five `1080×1920` vertical @ 60 FPS technical clips recorded directly from the simulator (`OpenSky.exe --promo-clip ...`) with live synchronized stereo audio:
+
+- [Load balancing & adaptive resolution (`FlightFrameBudget` keeping Balanced 60 FPS on integrated Radeon GPU)](docs/videos/opensky-engine-01-load-balancing.mp4)
+- [Async terrain & city streaming (`AsyncTerrainStreamer` CDLOD L7–L9 pages & 350 kt urban chunks)](docs/videos/opensky-engine-02-tile-loading.mp4)
+- [Weather, clouds, terrain & windshield rain (`384×384` solver, orographic clouds & 2D GPU water-film/wipers)](docs/videos/opensky-engine-03-weather-cloud-terrain.mp4)
+- [Aircraft systems simulation (cold & dark 28V electrical bus, starter voltage dip, avionics & checklist)](docs/videos/opensky-engine-04-aircraft-systems.mp4)
+- [Aircraft physics simulation (120 Hz JSBSim 6-DOF vectors, `WOW` strut compression, takeoff & braking)](docs/videos/opensky-engine-05-aircraft-physics.mp4)
+
 ### Promo flight videos
 
 All six 1080×1920 vertical regional promos below were captured at **60 fps** using real 120 Hz JSBSim physics, live streamed IGN PNOA ortho imagery, and in-game audio:

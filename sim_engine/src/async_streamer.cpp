@@ -1008,6 +1008,15 @@ StreamStats AsyncTerrainStreamer::stats() const {
     return s;
 }
 
+std::vector<QuadKey> AsyncTerrainStreamer::resident_keys_snapshot() const {
+    std::vector<QuadKey> out;
+    out.reserve(key_to_slot_.size());
+    for (const auto &kv : key_to_slot_) {
+        out.push_back(QuadKey::unpack(kv.first));
+    }
+    return out;
+}
+
 void AsyncTerrainStreamer::set_anisotropy(int max_aniso) {
     if (!ortho_arr_) return;
     float max_hw = 1.0f;

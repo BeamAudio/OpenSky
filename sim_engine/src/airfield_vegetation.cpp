@@ -338,7 +338,7 @@ void AirfieldVegetation::prepare_at(const PackReader &pack, const PackReader::Wo
 
 void AirfieldVegetation::draw(const Mat4 &vp, Vec3 camera_enu, const AtmosphereState &atmo,
                               float agl, float time_sec, Vec2 wind_en, int season, float snowline_m,
-                              int veg_detail) {
+                              int veg_detail, float density_scale) {
     {
         std::lock_guard<std::mutex> lk(mtx_);
         if (ready_upload_) {
@@ -353,12 +353,13 @@ void AirfieldVegetation::draw(const Mat4 &vp, Vec3 camera_enu, const AtmosphereS
             ready_data_.clear();
         }
     }
-    const float max_agl = (veg_detail >= 3) ? 520.0f : (veg_detail <= 0 ? 220.0f : 365.0f);
+    const float max_agl = (veg_detail >= 3) ? 520.0f : (veg_detail <= 0 ? 220.0f : (veg_detail == 1 ? 420.0f : 365.0f));
     if (!prog_ || count_ <= 0 || agl > max_agl) return;
     if (std::hypot(camera_enu.x - centre_.x, camera_enu.z - centre_.y) > 920.0f) return;
     int draw_count = count_;
     if (veg_detail <= 0) draw_count = std::max(1, count_ / 4);
-    else if (veg_detail == 1) draw_count = std::max(1, (count_ * 3) / 5);
+    else if (veg_detail == 1) draw_count = std::max(1, (count_ * 4) / 5);
+    draw_count = std::max(1, static_cast<int>(draw_count * std::clamp(density_scale, 0.35f, 1.0f)));
 
     glDisable(GL_CULL_FACE);
     glUseProgram(prog_);

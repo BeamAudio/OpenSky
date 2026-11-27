@@ -42,27 +42,59 @@ vec3 agx_tonemap(vec3 val) {
 }
 
 vec4 reconstruct_cloud(float scene_depth) {
+    ivec2 csize = textureSize(u_cloud_tex, 0);
     vec4 cloud = texture(u_cloud_tex, v_uv);
-    if (cloud.a < 0.004 || scene_depth <= 0.000001) return cloud;
+    if (cloud.a < 0.003) return cloud;
 
-    // Reject sky samples from the cloud grid where they would bleed over a
-    // nearer mountain. Preserve clouds on the same side of the depth edge.
+    // Edge-preserving 4-diagonal algebraic bilateral filter for smooth, noise-free cloud upscaling.
+    float cl = dot(cloud.rgb, vec3(0.299, 0.587, 0.114));
+    if (cloud.a > 0.002) {
+        vec2 px = 0.85 / vec2(csize);
+        vec4 n0 = texture(u_cloud_tex, v_uv + vec2( px.x,  px.y));
+        vec4 n1 = texture(u_cloud_tex, v_uv + vec2(-px.x,  px.y));
+        vec4 n2 = texture(u_cloud_tex, v_uv + vec2( px.x, -px.y));
+        vec4 n3 = texture(u_cloud_tex, v_uv + vec2(-px.x, -px.y));
+        float l0 = dot(n0.rgb, vec3(0.299, 0.587, 0.114));
+        float l1 = dot(n1.rgb, vec3(0.299, 0.587, 0.114));
+        float l2 = dot(n2.rgb, vec3(0.299, 0.587, 0.114));
+        float l3 = dot(n3.rgb, vec3(0.299, 0.587, 0.114));
+        float da0 = n0.a - cloud.a, rl0 = (l0 - cl) / max(0.35, max(cl, l0));
+        float da1 = n1.a - cloud.a, rl1 = (l1 - cl) / max(0.35, max(cl, l1));
+        float da2 = n2.a - cloud.a, rl2 = (l2 - cl) / max(0.35, max(cl, l2));
+        float da3 = n3.a - cloud.a, rl3 = (l3 - cl) / max(0.35, max(cl, l3));
+        float w0 = 1.0 / (1.0 + da0 * da0 * 14.0 + rl0 * rl0 * 3.2);
+        float w1 = 1.0 / (1.0 + da1 * da1 * 14.0 + rl1 * rl1 * 3.2);
+        float w2 = 1.0 / (1.0 + da2 * da2 * 14.0 + rl2 * rl2 * 3.2);
+        float w3 = 1.0 / (1.0 + da3 * da3 * 14.0 + rl3 * rl3 * 3.2);
+        vec4 smooth_c = (cloud + n0 * w0 + n1 * w1 + n2 * w2 + n3 * w3) / (1.0 + w0 + w1 + w2 + w3);
+        cloud = mix(cloud, smooth_c, 0.65);
+    }
+
+    if (scene_depth <= 0.000001) return cloud;
+
+    // Smooth depth-aware cloud-to-terrain crest fusion: preserve foreground occlusion without punching hard borders.
     vec4 depth = textureGather(u_cloud_depth, v_uv);
-    float bias = max(0.000001, scene_depth * 0.1);
+    float bias = max(0.000004, scene_depth * 0.22);
     vec4 weights = smoothstep(vec4(scene_depth - bias * 3.0), vec4(scene_depth - bias), depth);
     if (min(min(weights.x, weights.y), min(weights.z, weights.w)) >= 0.999) return cloud;
-    if (max(max(weights.x, weights.y), max(weights.z, weights.w)) <= 0.001) return vec4(0.0);
 
-    ivec2 limit = textureSize(u_cloud_tex, 0) - 1;
-    vec2 grid = v_uv * vec2(limit + 1) - 0.5;
+    // Only apply hard silhouette cutout for near/mid terrain (<~5km); distant ridges fuse smoothly with cloud mist.
+    float crest_mask = smoothstep(0.00015, 0.00075, scene_depth);
+    if (crest_mask <= 0.001) return cloud;
+    if (max(max(weights.x, weights.y), max(weights.z, weights.w)) <= 0.001) return cloud * (1.0 - crest_mask);
+
+    ivec2 limit = csize - 1;
+    vec2 grid = v_uv * vec2(csize) - 0.5;
     ivec2 p = ivec2(floor(grid));
     vec2 f = fract(grid);
     weights *= vec4((1.0 - f.x) * f.y, f.x * f.y, f.x * (1.0 - f.y), (1.0 - f.x) * (1.0 - f.y));
+    float wsum = dot(weights, vec4(1.0));
+    if (wsum <= 0.002) return cloud * (1.0 - crest_mask);
     vec4 filtered = texelFetch(u_cloud_tex, clamp(p + ivec2(0, 1), ivec2(0), limit), 0) * weights.x
                   + texelFetch(u_cloud_tex, clamp(p + ivec2(1, 1), ivec2(0), limit), 0) * weights.y
                   + texelFetch(u_cloud_tex, clamp(p + ivec2(1, 0), ivec2(0), limit), 0) * weights.z
                   + texelFetch(u_cloud_tex, clamp(p, ivec2(0), limit), 0) * weights.w;
-    return filtered / max(0.20, dot(weights, vec4(1.0)));
+    return mix(cloud, filtered / wsum, crest_mask);
 }
 
 void main() {
@@ -86,35 +118,32 @@ void main() {
     float strength = smoothstep(0.035, 0.16, edge / max(0.08, centre_luma));
     vec3 nb_lo = min(scene, min(min(north, south), min(east, west)));
     vec3 nb_hi = max(scene, max(max(north, south), max(east, west)));
-    if (u_aa_mode == 0 && strength > 0.10) {
-        // Filter along the measured edge angle. The diagonal taps are only
-        // needed on visible edges and reuse this composite pass.
-        vec2 gradient = vec2(grad_x, grad_y);
+    float d_here = texelFetch(u_scene_depth, coord, 0).r;
+    if ((u_aa_mode == 0 && strength > 0.10) || (d_here > 0.000001 && d_here < 0.00012 && strength > 0.16)) {
+        // Filter along high-contrast edges (including distant horizon mountain silhouettes) without adding a pass.
         float axis = max(abs(grad_x), abs(grad_y));
         if (axis > 0.0001) {
             vec2 span = vec2(-grad_y, grad_x) * (pixel * 0.58 / axis);
             vec3 edge_pair = 0.5 * (texture(u_scene_tex, v_uv + span).rgb +
                                     texture(u_scene_tex, v_uv - span).rgb);
-            scene = mix(scene, edge_pair, strength * 0.44);
+            float aa_blend = (u_aa_mode == 0) ? (strength * 0.44) : (strength * 0.36);
+            scene = mix(scene, edge_pair, aa_blend);
         }
     }
     if (u_aa_mode != 0) {
-        // Bounded reconstruction sharpening; crisp mode offsets the selected
-        // low internal pixel budget without a second full-screen texture pass.
-        // Reuse the FXAA neighborhood taps, so ortho detail is restored without
-        // another texture pass or amplifying values beyond the local sample range.
+        // Bounded reconstruction sharpening on near/mid detail (<15km); fade off at far horizon to avoid ridge aliasing.
         vec3 neighborhood = (north + south + east + west) * 0.25;
-        float sharpen_amount = u_aa_mode == 2 ? 0.48 : 0.26;
+        float dist_gate = smoothstep(0.000012, 0.00014, d_here);
+        float sharpen_amount = (u_aa_mode == 2 ? 0.48 : 0.26) * dist_gate;
         vec3 sharpened = scene + (scene - neighborhood) * (sharpen_amount * (1.0 - strength));
         scene = clamp(sharpened, nb_lo - vec3(0.012), nb_hi + vec3(0.012));
     }
-    float d_here = texelFetch(u_scene_depth, coord, 0).r;
     vec4 cld = reconstruct_cloud(d_here);
 
     // clouds_qres.frag already stops rays conservatively at static terrain depth;
-    // fade the distant cloud/rain veil off foreground objects (<~40m, e.g. chase/parked aircraft)
-    // using live Reverse-Z scene depth (near=0.18m => d=0.0045 at 40m).
-    float fg_clear = 1.0 - smoothstep(0.0022, 0.0065, d_here);
+    // fade the distant cloud/rain veil off close aircraft meshes (<~25m)
+    // using live Reverse-Z scene depth while keeping nearby terrain fully occluded in IMC clouds.
+    float fg_clear = 1.0 - smoothstep(0.0042, 0.0110, d_here);
     vec3 hdr = scene * (1.0 - cld.a * fg_clear) + cld.rgb * fg_clear;
 
     // A broad atmospheric glow uses the already sampled cloud and depth data.

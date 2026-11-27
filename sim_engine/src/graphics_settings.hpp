@@ -19,21 +19,22 @@ inline constexpr bool kLaptopVsync = true;
 
 struct GraphicsSettings {
     // Percentage of native output pixels shaded before the spatial/temporal resolve (35..150%).
-    int pixel_percent = 48;
+    int pixel_percent = 100;
     // 0 = spatial FXAA, 1 = balanced TAA, 2 = crisp TAA.
     int aa_mode = 1;
     // Multiplier for terrain mesh LOD transition distances (50..250%).
-    int terrain_lod_percent = 75;
+    int terrain_lod_percent = 100;
     // Render the cockpit after scene reconstruction at output resolution.
     bool cockpit_native = true;
     bool terrain_streaming = true;
     int aircraft_detail = 0; // Standard, High
-    int weather_detail = 0; // Follow preset, Low, Medium, High, Ultra
+    int weather_detail = 0; // Follow preset, Very Low, Low, Medium, Medium-High, High, Very High, Ultra
+    int cloud_res_percent = 0; // 0 = Auto (preset %), or 35..100% linear cloud buffer scale (4K-friendly)
     int weather_grid_detail = 0; // 0: regional only, 1: 192^2 local tile, 2: 384^2 local tile
-    int terrain_detail = 1; // 0 = Follow preset, 1 = Fast, 2 = Balanced, 3 = High, 4 = Extreme
+    int terrain_detail = 0; // 0 = Follow preset, 1 = Fast, 2 = Balanced, 3 = High, 4 = Extreme
     int world_detail = 0; // 0 = Follow preset, 1 = Sparse, 2 = Medium, 3 = High, 4 = Max Cities & Traffic
     int vegetation_detail = 0; // 0 = Follow preset, 1 = Minimal, 2 = Standard, 3 = High, 4 = Dense
-    int anisotropy = 4; // 1, 2, 4, 8, 16x anisotropic texture filtering
+    int anisotropy = 8; // 1, 2, 4, 8, 16x anisotropic texture filtering
     int time_of_day = -1; // -1 = advancing five-hour cycle, 0..10 = fixed solar preset
     int cockpit_fov_deg = 50; // 42..64 deg vertical cockpit POV
     int head_motion_mode = 2; // 0 = Off, 1 = Subtle, 2 = Realistic (G-inertia, turn-look, touchdown jolt)
@@ -61,7 +62,8 @@ inline void clamp_graphics_settings(GraphicsSettings &settings) {
     settings.aa_mode = std::clamp(settings.aa_mode, 0, 2);
     settings.terrain_lod_percent = std::clamp(settings.terrain_lod_percent, 50, 250);
     settings.aircraft_detail = std::clamp(settings.aircraft_detail, 0, 1);
-    settings.weather_detail = std::clamp(settings.weather_detail, 0, 4);
+    settings.weather_detail = std::clamp(settings.weather_detail, 0, 7);
+    settings.cloud_res_percent = settings.cloud_res_percent <= 0 ? 0 : std::clamp(settings.cloud_res_percent, 35, 100);
     settings.weather_grid_detail = std::clamp(settings.weather_grid_detail, 0, 2);
     settings.terrain_detail = std::clamp(settings.terrain_detail, 0, 4);
     settings.world_detail = std::clamp(settings.world_detail, 0, 4);
@@ -94,6 +96,7 @@ inline void apply_graphics_profile(GraphicsSettings &settings, int profile_id) {
         settings.cockpit_native = false;
         settings.aircraft_detail = 0;
         settings.weather_detail = 1;
+        settings.cloud_res_percent = 0;
         settings.weather_grid_detail = 0;
         settings.terrain_detail = 1;
         settings.world_detail = 1;
@@ -102,17 +105,18 @@ inline void apply_graphics_profile(GraphicsSettings &settings, int profile_id) {
         settings.vsync = kLaptopVsync;
         settings.fps_limit = 60;
     } else if (profile_id == 1) {
-        settings.pixel_percent = 48;
+        settings.pixel_percent = 100;
         settings.aa_mode = 1;
-        settings.terrain_lod_percent = 75;
+        settings.terrain_lod_percent = 100;
         settings.cockpit_native = true;
         settings.aircraft_detail = 0;
         settings.weather_detail = 0;
+        settings.cloud_res_percent = 0;
         settings.weather_grid_detail = 0;
-        settings.terrain_detail = 1;
+        settings.terrain_detail = 0;
         settings.world_detail = 0;
         settings.vegetation_detail = 0;
-        settings.anisotropy = 4;
+        settings.anisotropy = 8;
         settings.vsync = kLaptopVsync;
         settings.fps_limit = 60;
     } else if (profile_id == 2) {
@@ -122,7 +126,8 @@ inline void apply_graphics_profile(GraphicsSettings &settings, int profile_id) {
         settings.cockpit_native = true;
         settings.aircraft_detail = 1;
         settings.weather_detail = 0;
-        settings.weather_grid_detail = 0;
+        settings.cloud_res_percent = 0;
+        settings.weather_grid_detail = 1;
         settings.terrain_detail = 0;
         settings.world_detail = 0;
         settings.vegetation_detail = 0;
@@ -135,7 +140,8 @@ inline void apply_graphics_profile(GraphicsSettings &settings, int profile_id) {
         settings.terrain_lod_percent = 225;
         settings.cockpit_native = true;
         settings.aircraft_detail = 1;
-        settings.weather_detail = 4;
+        settings.weather_detail = 7;
+        settings.cloud_res_percent = 0;
         settings.weather_grid_detail = 2;
         settings.terrain_detail = 4;
         settings.world_detail = 4;
@@ -160,6 +166,7 @@ inline GraphicsSettings load_graphics_settings() {
         else if (key == "terrain_streaming") settings.terrain_streaming = value != 0;
         else if (key == "aircraft_detail") settings.aircraft_detail = value;
         else if (key == "weather_detail") settings.weather_detail = value;
+        else if (key == "cloud_res_percent") settings.cloud_res_percent = value;
         else if (key == "weather_grid_detail") settings.weather_grid_detail = value;
         else if (key == "terrain_detail") settings.terrain_detail = value;
         else if (key == "world_detail") settings.world_detail = value;
@@ -203,6 +210,7 @@ inline void save_graphics_settings(const GraphicsSettings &input) {
             << "terrain_streaming " << settings.terrain_streaming << '\n'
             << "aircraft_detail " << settings.aircraft_detail << '\n'
             << "weather_detail " << settings.weather_detail << '\n'
+            << "cloud_res_percent " << settings.cloud_res_percent << '\n'
             << "weather_grid_detail " << settings.weather_grid_detail << '\n'
             << "terrain_detail " << settings.terrain_detail << '\n'
             << "world_detail " << settings.world_detail << '\n'

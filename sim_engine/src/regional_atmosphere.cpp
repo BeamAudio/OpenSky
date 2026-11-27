@@ -282,6 +282,12 @@ void RegionalAtmosphere::sync_region(double lat_deg, double lon_deg) {
     }
     if (region_changed || min_e != min_e_ || min_n != min_n_ || span_e != span_e_ || span_n != span_n_ ||
         pack_->anchor_lat() != weather_anchor_lat_ || pack_->anchor_lon() != weather_anchor_lon_) {
+        if (weather_init_future_.valid()) {
+            weather_init_future_.wait();
+            try { weather_init_future_.get(); } catch (...) {}
+        }
+        weather_init_pending_ = false;
+        weather_terrain_upload_pending_ = false;
         stop_weather_worker();
         min_e_ = min_e;
         min_n_ = min_n;
@@ -289,6 +295,7 @@ void RegionalAtmosphere::sync_region(double lat_deg, double lon_deg) {
         span_n_ = span_n;
         dirty_ = true;
         weather_model_ready_ = false;
+        weather_textures_ready_ = false;
         weather_model_time_ = -1.0;
         weather_model_accum_ = 0.0;
         active_weather_ = {};
@@ -301,11 +308,6 @@ void RegionalAtmosphere::sync_region(double lat_deg, double lon_deg) {
         uploaded_weather_generation_ = 0;
         uploaded_local_weather_generation_ = 0;
         uploaded_local_terrain_generation_ = 0;
-        if (gpu_enabled_ && field_tex_ && terrain_field_tex_) {
-            const float zero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-            glClearTexImage(field_tex_, 0, GL_RGBA, GL_FLOAT, zero);
-            glClearTexImage(terrain_field_tex_, 0, GL_RED, GL_FLOAT, zero);
-        }
     }
     if (weather_grid_detail_ > 0) update_refinement_center(lat_deg, lon_deg);
 }
@@ -336,6 +338,7 @@ void RegionalAtmosphere::shutdown() {
     local_texture_grid_w_ = local_texture_grid_h_ = 0;
     lib_.shutdown();
     weather_model_ready_ = false;
+    weather_textures_ready_ = false;
     weather_model_time_ = -1.0;
     weather_model_accum_ = 0.0;
     solver_ = {};
@@ -362,6 +365,10 @@ void RegionalAtmosphere::finish_pending_initialization() {
     poll_weather_model_initialization();
 }
 
+bool RegionalAtmosphere::poll_pending_initialization() {
+    return poll_weather_model_initialization();
+}
+
 void RegionalAtmosphere::finish_weather_model_initialization() {
     weather_model_ready_ = true;
     if (gpu_enabled_ && terrain_field_tex_ && weather_terrain_upload_pending_ &&
@@ -372,6 +379,7 @@ void RegionalAtmosphere::finish_weather_model_initialization() {
     weather_terrain_upload_pending_ = false;
     latch_weather();
     upload_field();
+    weather_textures_ready_ = true;
 }
 
 void RegionalAtmosphere::live_weather_worker() {
@@ -702,7 +710,7 @@ void RegionalAtmosphere::upload_field() {
     bool uploaded_regional = false;
     if (frame_weather_.generation != uploaded_weather_generation_ && !field.empty()) {
         uploaded_weather_generation_ = frame_weather_.generation;
-        glTextureSubImage3D(field_tex_, 0, 0, 0, 0, grid_w_, grid_h_, nspain::NSWX_LEVELS + 1,
+        glTextureSubImage3D(field_tex_, 0, 0, 0, 0, grid_w_, grid_h_, nspain::NSWX_LEVELS + 3,
                             GL_RGBA, GL_HALF_FLOAT, field.data());
         ++field_uploads_;
         uploaded_regional = true;
@@ -712,7 +720,7 @@ void RegionalAtmosphere::upload_field() {
         (!uploaded_regional || local_initial)) {
         uploaded_local_weather_generation_ = frame_weather_.generation;
         glTextureSubImage3D(local_field_tex_, 0, 0, 0, 0, frame_weather_.local_grid_w,
-                            frame_weather_.local_grid_h, nspain::NSWX_LEVELS + 1,
+                            frame_weather_.local_grid_h, nspain::NSWX_LEVELS + 3,
                             GL_RGBA, GL_HALF_FLOAT, frame_weather_.local_field.data());
         if (local_initial) {
             uploaded_local_terrain_generation_ = frame_weather_.local_terrain_generation;
@@ -730,7 +738,7 @@ void RegionalAtmosphere::allocate_weather_textures() {
     if (field_tex_) glDeleteTextures(1, &field_tex_);
     if (terrain_field_tex_) glDeleteTextures(1, &terrain_field_tex_);
     glCreateTextures(GL_TEXTURE_2D_ARRAY, 1, &field_tex_);
-    glTextureStorage3D(field_tex_, 1, GL_RGBA16F, grid_w_, grid_h_, nspain::NSWX_LEVELS + 1);
+    glTextureStorage3D(field_tex_, 1, GL_RGBA16F, grid_w_, grid_h_, nspain::NSWX_LEVELS + 3);
     glTextureParameteri(field_tex_, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTextureParameteri(field_tex_, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTextureParameteri(field_tex_, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -763,7 +771,7 @@ void RegionalAtmosphere::allocate_local_weather_textures() {
     if (local_field_tex_) glDeleteTextures(1, &local_field_tex_);
     if (local_terrain_tex_) glDeleteTextures(1, &local_terrain_tex_);
     glCreateTextures(GL_TEXTURE_2D_ARRAY, 1, &local_field_tex_);
-    glTextureStorage3D(local_field_tex_, 1, GL_RGBA16F, width, height, nspain::NSWX_LEVELS + 1);
+    glTextureStorage3D(local_field_tex_, 1, GL_RGBA16F, width, height, nspain::NSWX_LEVELS + 3);
     glTextureParameteri(local_field_tex_, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTextureParameteri(local_field_tex_, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTextureParameteri(local_field_tex_, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -823,7 +831,7 @@ void RegionalAtmosphere::update_refinement_center(double aircraft_lat, double ai
 }
 
 Vec4 RegionalAtmosphere::local_domain_bounds() const {
-    if (frame_weather_.local_grid_w <= 0 || frame_weather_.local_span_e <= 0.0 ||
+    if (!weather_textures_ready_ || frame_weather_.local_grid_w <= 0 || frame_weather_.local_span_e <= 0.0 ||
         frame_weather_.local_span_n <= 0.0) return {};
     return {static_cast<float>(frame_weather_.local_min_e), static_cast<float>(frame_weather_.local_min_n),
             static_cast<float>(1.0 / frame_weather_.local_span_e),
@@ -862,10 +870,13 @@ void RegionalAtmosphere::build_weather_texture_field(const WeatherSolver &source
     const int width = source.grid_w_, height = source.grid_h_;
     const size_t cells = static_cast<size_t>(width) * height;
     const size_t rain_offset = cells * nspain::NSWX_LEVELS * 4;
-    out.resize(rain_offset + cells * 4);
+    const size_t sim_offset  = rain_offset + cells * 4;
+    const size_t dyn_offset  = sim_offset + cells * 4;
+    out.resize(dyn_offset + cells * 4);
     const float de = static_cast<float>(source.span_e_ / (width - 1.0));
     const float dn = static_cast<float>(source.span_n_ / (height - 1.0));
     const bool dawn_fog = source.regime_ == WindRegime::KATABATIC_DAWN;
+    const bool have_cloud_sim = (source.cloud_sim_.size() == cells);
     const float base_sev = std::clamp(
         std::max(source.synoptic_weather_.storm_int, source.synoptic_weather_.precip) * 0.75f +
         ((source.regime_ == WindRegime::CONVECTIVE_STORM) ? 0.65f :
@@ -910,11 +921,28 @@ void RegionalAtmosphere::build_weather_texture_field(const WeatherSolver &source
                 out[k * 4 + 0] = float_to_half(c.u);
                 out[k * 4 + 1] = float_to_half(c.v);
                 out[k * 4 + 2] = float_to_half(c.w + cell_w * rain_h);
-                out[k * 4 + 3] = float_to_half(std::clamp(
-                    (c_frac - source.weather_worker_active_.cloud_cov) * 0.92f + (level == 0 ? fog_add * 0.45f : 0.0f),
-                    -0.45f, 0.55f));
+                out[k * 4 + 3] = float_to_half(c_frac);
                 out[rain_offset + i * 4 + level] = float_to_half(std::clamp(c.rain_mm_hr + cell_rain * rain_h, 0.0f, 48.0f));
             }
+            const auto cs = have_cloud_sim
+                ? source.cloud_sim_[i]
+                : CloudSimCell{
+                      std::clamp(source.weather_grid_[cells + i].cloud_fraction, 0.0f, 1.0f),
+                      0.56f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.22f};
+            const float cell_storm = std::clamp(cell_rain / 16.0f, 0.0f, 1.0f);
+            const float sim_mass = std::clamp(std::max(cs.mass, cell_cloud * 0.90f), 0.0f, 1.2f);
+            const float sim_top = std::clamp(std::max(cs.top_h, cell_cloud * 0.95f), 0.14f, 1.0f);
+            const float sim_base = std::clamp(cs.base_off - cell_cloud * 0.08f, -0.20f, 0.25f);
+            const float sim_age = std::clamp(std::max(cs.precip_age, cell_storm), 0.0f, 1.0f);
+            const float sim_anvil = std::clamp(std::max(cs.anvil, cell_storm * 0.65f), 0.0f, 1.0f);
+            out[sim_offset + i * 4 + 0] = float_to_half(sim_mass);
+            out[sim_offset + i * 4 + 1] = float_to_half(sim_top);
+            out[sim_offset + i * 4 + 2] = float_to_half(sim_base);
+            out[sim_offset + i * 4 + 3] = float_to_half(sim_age);
+            out[dyn_offset + i * 4 + 0] = float_to_half(sim_anvil);
+            out[dyn_offset + i * 4 + 1] = float_to_half(cs.shear_e);
+            out[dyn_offset + i * 4 + 2] = float_to_half(cs.shear_n);
+            out[dyn_offset + i * 4 + 3] = float_to_half(std::clamp(cs.turb_bub + cell_storm * 0.35f, 0.05f, 1.0f));
         }
     }
 }
@@ -1128,6 +1156,8 @@ void RegionalAtmosphere::initialize_weather_model() {
     const size_t total = cells * nspain::NSWX_LEVELS;
     solver_.weather_grid_.assign(total, {});
     solver_.weather_next_.assign(total, {});
+    solver_.cloud_sim_.assign(cells, {});
+    solver_.cloud_sim_next_.assign(cells, {});
     solver_.weather_rain_flux_.assign(total, 0.0f);
     solver_.terrain_height_.assign(cells, 0.0f);
     solver_.terrain_slope_e_.assign(cells, 0.0f);
@@ -1298,6 +1328,7 @@ void RegionalAtmosphere::initialize_weather_model() {
     solver_.regime_ = regime_;
     solver_.solver_rng_.seed(solver_seed_ ? *solver_seed_ : hardware_entropy_seed(this));
     solver_.seed_dynamic_cells();
+    solver_.seed_cloud_sim();
     if (weather_grid_detail_ > 0) initialize_local_weather_model();
     else {
         local_solver_ = {};
@@ -1340,6 +1371,8 @@ void RegionalAtmosphere::initialize_local_weather_model() {
     const size_t local_total = local_cells * nspain::NSWX_LEVELS;
     local_solver_.weather_grid_.assign(local_total, {});
     local_solver_.weather_next_.assign(local_total, {});
+    local_solver_.cloud_sim_.assign(local_cells, {});
+    local_solver_.cloud_sim_next_.assign(local_cells, {});
     local_solver_.weather_rain_flux_.assign(local_total, 0.0f);
     local_solver_.terrain_slope_e_.assign(local_cells, 0.0f);
     local_solver_.terrain_slope_n_.assign(local_cells, 0.0f);
@@ -1465,9 +1498,32 @@ void RegionalAtmosphere::initialize_local_weather_model() {
                 cell.v = std::lerp(cell.v, dv, 0.72f);
                 local_solver_.weather_grid_[static_cast<size_t>(level) * local_cells + i] = cell;
             }
+            if (!solver_.cloud_sim_.empty()) {
+                const float gx = std::clamp(static_cast<float>((east - solver_.min_e_) / base_de), 0.0f, static_cast<float>(base_w - 1));
+                const float gy = std::clamp(static_cast<float>((north - solver_.min_n_) / base_dn), 0.0f, static_cast<float>(base_h - 1));
+                const int x0 = std::min(base_w - 2, static_cast<int>(gx));
+                const int y0 = std::min(base_h - 2, static_cast<int>(gy));
+                const float tx = gx - x0, ty = gy - y0;
+                const auto *a = solver_.cloud_sim_.data() + static_cast<size_t>(y0) * base_w + x0;
+                const auto *b = a + 1, *c = a + base_w, *d = c + 1;
+                auto cf = [&](float CloudSimCell::*m) {
+                    return std::lerp(std::lerp(a->*m, b->*m, tx), std::lerp(c->*m, d->*m, tx), ty);
+                };
+                CloudSimCell cs{};
+                cs.mass = cf(&CloudSimCell::mass);
+                cs.top_h = cf(&CloudSimCell::top_h);
+                cs.base_off = cf(&CloudSimCell::base_off);
+                cs.anvil = cf(&CloudSimCell::anvil);
+                cs.precip_age = cf(&CloudSimCell::precip_age);
+                cs.shear_e = cf(&CloudSimCell::shear_e);
+                cs.shear_n = cf(&CloudSimCell::shear_n);
+                cs.turb_bub = cf(&CloudSimCell::turb_bub);
+                local_solver_.cloud_sim_[i] = cs;
+            }
         }
     }
     local_solver_.weather_next_ = local_solver_.weather_grid_;
+    local_solver_.cloud_sim_next_ = local_solver_.cloud_sim_;
     local_solver_.dyn_cells_ = solver_.dyn_cells_;
     local_solver_.dyn_cell_count_ = solver_.dyn_cell_count_;
     refresh_local_refinement_climate();
@@ -1559,6 +1615,24 @@ void RegionalAtmosphere::sync_local_refinement_boundary() {
                 dst.tke = std::lerp(dst.tke, field(&SimWeatherCell::tke), w);
                 if (dist == 0)
                     local_solver_.weather_next_[static_cast<size_t>(level) * local_cells + li] = dst;
+            }
+            if (!solver_.cloud_sim_.empty() && !local_solver_.cloud_sim_.empty()) {
+                const auto *a = solver_.cloud_sim_.data() + gi;
+                const auto *b = a + 1, *c = a + base_w, *d = c + 1;
+                auto cf = [&](float CloudSimCell::*m) {
+                    return std::lerp(std::lerp(a->*m, b->*m, tx), std::lerp(c->*m, d->*m, tx), ty);
+                };
+                auto &dst_c = local_solver_.cloud_sim_[li];
+                dst_c.mass = std::lerp(dst_c.mass, cf(&CloudSimCell::mass), w);
+                dst_c.top_h = std::lerp(dst_c.top_h, cf(&CloudSimCell::top_h), w);
+                dst_c.base_off = std::lerp(dst_c.base_off, cf(&CloudSimCell::base_off), w);
+                dst_c.anvil = std::lerp(dst_c.anvil, cf(&CloudSimCell::anvil), w);
+                dst_c.precip_age = std::lerp(dst_c.precip_age, cf(&CloudSimCell::precip_age), w);
+                dst_c.shear_e = std::lerp(dst_c.shear_e, cf(&CloudSimCell::shear_e), w);
+                dst_c.shear_n = std::lerp(dst_c.shear_n, cf(&CloudSimCell::shear_n), w);
+                dst_c.turb_bub = std::lerp(dst_c.turb_bub, cf(&CloudSimCell::turb_bub), w);
+                if (dist == 0 && !local_solver_.cloud_sim_next_.empty())
+                    local_solver_.cloud_sim_next_[li] = dst_c;
             }
         }
     }
@@ -1738,6 +1812,173 @@ RegionalAtmosphere::SimWeatherCell RegionalAtmosphere::sample_weather_model(doub
     out.rain_mm_hr = blend(coarse.rain_mm_hr, fine.rain_mm_hr); out.cloud_fraction = blend(coarse.cloud_fraction, fine.cloud_fraction);
     out.tke = blend(coarse.tke, fine.tke);
     return out;
+}
+
+void RegionalAtmosphere::WeatherSolver::seed_cloud_sim() {
+    const size_t cells = static_cast<size_t>(grid_w_ * grid_h_);
+    if (cells == 0 || weather_grid_.size() < 4 * cells) return;
+    cloud_sim_.resize(cells);
+    const size_t l1_off = cells, l2_off = 2 * cells, l3_off = 3 * cells;
+    for (size_t i = 0; i < cells; ++i) {
+        const auto &l1 = weather_grid_[l1_off + i];
+        const auto &l2 = weather_grid_[l2_off + i];
+        const auto &l3 = weather_grid_[l3_off + i];
+        const float qsat1 = saturation_mixing_ratio_gkg(l1.temp_c, l1.pressure_hpa);
+        const float rh1 = std::clamp(l1.vapor_gkg / std::max(0.1f, qsat1), 0.05f, 1.15f);
+        const float w_col = 0.52f * l1.w + 0.48f * l2.w;
+        const float ridge = (i < terrain_ridge_exposure_.size()) ? terrain_ridge_exposure_[i] : 0.0f;
+        CloudSimCell &cs = cloud_sim_[i];
+        cs.mass = std::clamp(0.46f * l1.cloud_fraction + 0.54f * l2.cloud_fraction +
+                             0.18f * (l1.liquid_gkg + l2.liquid_gkg), 0.0f, 1.5f);
+        cs.top_h = std::clamp(0.32f + cs.mass * 0.44f + std::max(0.0f, w_col) * 0.08f + ridge * 0.10f, 0.16f, 0.98f);
+        cs.base_off = std::clamp((0.84f - rh1) * 0.38f - std::max(0.0f, w_col) * 0.03f, -0.18f, 0.24f);
+        cs.anvil = std::clamp(smooth01(0.68f, 0.96f, cs.top_h) * 0.55f + smooth01(4.0f, 18.0f, l1.rain_mm_hr) * 0.35f, 0.0f, 1.0f);
+        cs.precip_age = std::clamp(l1.rain_mm_hr / 14.0f, 0.0f, 1.0f);
+        cs.shear_e = std::clamp(l3.u - l1.u, -36.0f, 36.0f);
+        cs.shear_n = std::clamp(l3.v - l1.v, -36.0f, 36.0f);
+        cs.turb_bub = std::clamp(0.12f + l1.tke * 0.45f + std::max(0.0f, w_col) * 0.10f, 0.05f, 1.0f);
+    }
+    cloud_sim_next_ = cloud_sim_;
+}
+
+void RegionalAtmosphere::WeatherSolver::step_cloud_sim(float dt, float solar, float dx, float dy) {
+    const size_t cells = static_cast<size_t>(grid_w_ * grid_h_);
+    if (cells == 0 || grid_w_ < 3 || grid_h_ < 3 || cloud_sim_.size() != cells || weather_grid_.size() < 4 * cells)
+        return;
+    if (cloud_sim_next_.size() != cells) cloud_sim_next_ = cloud_sim_;
+    const size_t l0_off = 0, l1_off = cells, l2_off = 2 * cells, l3_off = 3 * cells;
+    const float back_e = dt / std::max(1.0f, dx);
+    const float back_n = dt / std::max(1.0f, dy);
+    const float inv_2dx = 1.0f / std::max(2.0f, 2.0f * dx);
+    const float inv_2dy = 1.0f / std::max(2.0f, 2.0f * dy);
+    const float inv_dz_12 = 1.0f / std::max(200.0f, nspain::NSWX_LEVEL_AGL_M[2] - nspain::NSWX_LEVEL_AGL_M[1]);
+    const float inv_dz_23 = 1.0f / std::max(300.0f, nspain::NSWX_LEVEL_AGL_M[3] - nspain::NSWX_LEVEL_AGL_M[2]);
+    const float max_gx = static_cast<float>(grid_w_ - 1);
+    const float max_gy = static_cast<float>(grid_h_ - 1);
+    const float lcl_alpha = std::clamp(dt / 12.0f, 0.0f, 0.10f);
+    const float mass_alpha = std::clamp(dt / 9.0f, 0.0f, 0.14f);
+    const float anvil_alpha = std::clamp(dt / 16.0f, 0.0f, 0.09f);
+    const float cf_alpha = std::clamp(dt / 11.0f, 0.0f, 0.07f);
+    const CloudSimCell * __restrict src_cs = cloud_sim_.data();
+    CloudSimCell * __restrict dst_cs = cloud_sim_next_.data();
+    const float * __restrict ridge_ptr = terrain_ridge_exposure_.size() == cells ? terrain_ridge_exposure_.data() : nullptr;
+
+    for (int y = 1; y < grid_h_ - 1; ++y) {
+        const size_t row_off = static_cast<size_t>(y) * grid_w_;
+        for (int x = 1; x < grid_w_ - 1; ++x) {
+            const size_t i = row_off + x;
+            SimWeatherCell &l0 = weather_grid_[l0_off + i];
+            SimWeatherCell &l1 = weather_grid_[l1_off + i];
+            SimWeatherCell &l2 = weather_grid_[l2_off + i];
+            const SimWeatherCell &l3 = weather_grid_[l3_off + i];
+            const SimWeatherCell &wl = weather_grid_[l1_off + i - 1], &wr = weather_grid_[l1_off + i + 1];
+            const SimWeatherCell &ws = weather_grid_[l1_off + i - grid_w_], &wn = weather_grid_[l1_off + i + grid_w_];
+            const SimWeatherCell &ul = weather_grid_[l3_off + i - 1], &ur = weather_grid_[l3_off + i + 1];
+            const SimWeatherCell &us = weather_grid_[l3_off + i - grid_w_], &un = weather_grid_[l3_off + i + grid_w_];
+
+            // Semi-Lagrangian transport of simulated cloud water & turret state by mid-cloud steering wind.
+            const float steer_u = 0.56f * l1.u + 0.44f * l2.u;
+            const float steer_v = 0.56f * l1.v + 0.44f * l2.v;
+            const float sx = std::clamp(x - steer_u * back_e, 0.0f, max_gx);
+            const float sy = std::clamp(y - steer_v * back_n, 0.0f, max_gy);
+            const int x0 = std::min(grid_w_ - 2, static_cast<int>(sx));
+            const int y0 = std::min(grid_h_ - 2, static_cast<int>(sy));
+            const float tx = sx - x0, ty = sy - y0;
+            const float w00 = (1.0f - tx) * (1.0f - ty), w10 = tx * (1.0f - ty);
+            const float w01 = (1.0f - tx) * ty,          w11 = tx * ty;
+            const CloudSimCell *a = src_cs + static_cast<size_t>(y0) * grid_w_ + x0;
+            const CloudSimCell *b = a + 1, *c = a + grid_w_, *d = c + 1;
+            CloudSimCell next_c{};
+            next_c.mass       = a->mass * w00       + b->mass * w10       + c->mass * w01       + d->mass * w11;
+            next_c.top_h      = a->top_h * w00      + b->top_h * w10      + c->top_h * w01      + d->top_h * w11;
+            next_c.base_off   = a->base_off * w00   + b->base_off * w10   + c->base_off * w01   + d->base_off * w11;
+            next_c.anvil      = a->anvil * w00      + b->anvil * w10      + c->anvil * w01      + d->anvil * w11;
+            next_c.precip_age = a->precip_age * w00 + b->precip_age * w10 + c->precip_age * w01 + d->precip_age * w11;
+
+            // Neighbor interaction: eddy cohesion + compensating dry subsidence & cold-pool gust-front wake!
+            const CloudSimCell &cl = src_cs[i - 1], &cr = src_cs[i + 1];
+            const CloudSimCell &cs_s = src_cs[i - grid_w_], &cn_n = src_cs[i + grid_w_];
+            const float nb_mass = 0.25f * (cl.mass + cr.mass + cs_s.mass + cn_n.mass);
+            const float nb_top = 0.25f * (cl.top_h + cr.top_h + cs_s.top_h + cn_n.top_h);
+            const float max_nb_top = std::max(std::max(cl.top_h, cr.top_h), std::max(cs_s.top_h, cn_n.top_h));
+            const float nb_precip = std::max(std::max(cl.precip_age, cr.precip_age), std::max(cs_s.precip_age, cn_n.precip_age));
+            next_c.mass = std::lerp(next_c.mass, nb_mass, 0.045f);
+            next_c.top_h = std::lerp(next_c.top_h, nb_top, 0.038f);
+
+            // Moisture convergence, CAPE/lapse buoyancy, Espy LCL height, and upper inversion cap stability!
+            const float conv = -((wr.u - wl.u) * inv_2dx + (wn.v - ws.v) * inv_2dy);
+            const float div_top = (ur.u - ul.u) * inv_2dx + (un.v - us.v) * inv_2dy;
+            const float qsat1 = saturation_mixing_ratio_gkg(l1.temp_c, l1.pressure_hpa);
+            const float rh1 = std::clamp(l1.vapor_gkg / std::max(0.1f, qsat1), 0.05f, 1.18f);
+            const float rh2 = std::clamp(0.55f + l2.cloud_fraction * 0.40f + l2.liquid_gkg * 0.25f, 0.20f, 1.10f);
+            const float w_col = 0.52f * l1.w + 0.48f * l2.w;
+            const float lapse_c_km = (l1.temp_c - l2.temp_c) * (inv_dz_12 * 1000.0f);
+            const float cap_lapse_km = (l2.temp_c - l3.temp_c) * (inv_dz_23 * 1000.0f);
+            const float inversion_cap = std::clamp((5.8f - cap_lapse_km) * 0.28f, -0.35f, 0.85f);
+            const float ridge = ridge_ptr ? ridge_ptr[i] : 0.0f;
+
+            // Compensating subsidence around taller towers carves blue sky canyons between cumulus streets!
+            const float subside = std::max(0.0f, max_nb_top - next_c.top_h - 0.14f) * 0.72f;
+            // Cold-pool outflow edges from nearby precipitating shafts ignite fresh flanking daughter towers!
+            const float gust_lift = std::max(0.0f, nb_precip - next_c.precip_age) * 0.28f;
+            const float buoy = std::clamp(
+                w_col * 0.38f + conv * 820.0f + (lapse_c_km - 7.5f) * 0.15f +
+                ridge * std::max(0.0f, l1.w) * 0.22f + (rh1 - 0.78f) * 1.48f +
+                solar * ridge * 0.12f + gust_lift - subside,
+                -1.2f, 1.9f);
+            const float target_base = std::clamp((0.86f - rh1) * 0.42f - std::max(0.0f, w_col) * 0.032f + next_c.precip_age * 0.06f, -0.18f, 0.24f);
+            next_c.base_off = std::lerp(next_c.base_off, target_base, lcl_alpha);
+
+            // Kessler condensation + dry entrainment + cold-pool dissipation + inversion stratocumulus spread!
+            const float cond_src = 0.48f * l1.liquid_gkg + 0.52f * l2.liquid_gkg;
+            const float entrain = std::max(0.0f, 0.86f - 0.5f * (rh1 + rh2)) * (0.28f + l1.tke) +
+                                  std::max(0.0f, -w_col) * 0.16f + subside * 0.22f;
+            const float target_mass = std::clamp(
+                0.36f * (l1.cloud_fraction + l2.cloud_fraction) + cond_src * 0.44f +
+                std::max(0.0f, buoy) * 0.30f - entrain * 0.36f,
+                0.0f, 1.5f);
+            next_c.mass = std::clamp(std::lerp(next_c.mass, target_mass, mass_alpha) +
+                                     (buoy > 0.10f ? buoy * 0.048f * dt : -entrain * 0.036f * dt), 0.0f, 1.05f);
+
+            const float auto_conv = std::max(0.0f, next_c.mass - 0.56f) * 0.24f + std::max(0.0f, l1.rain_mm_hr - 2.0f) * 0.013f;
+            next_c.precip_age = std::clamp(next_c.precip_age + (auto_conv - next_c.precip_age * 0.11f) * dt * 0.45f, 0.0f, 1.0f);
+            next_c.mass = std::max(0.0f, next_c.mass - next_c.precip_age * 0.018f * dt);
+
+            const float cap_clamp = std::max(0.28f, 0.99f - std::max(0.0f, inversion_cap) * 0.46f);
+            const float top_drive = (next_c.mass > 0.10f)
+                ? (std::max(0.0f, buoy) * 0.13f * (1.0f - 0.45f * next_c.precip_age) - entrain * 0.06f - next_c.precip_age * 0.03f)
+                : (-0.08f);
+            next_c.top_h = std::clamp(next_c.top_h + top_drive * dt * 0.35f, 0.16f, cap_clamp);
+            const float anvil_target = std::clamp(
+                smooth01(0.66f, 0.96f, next_c.top_h) * (0.44f + std::max(0.0f, div_top * 240.0f)) +
+                std::max(0.0f, inversion_cap) * smooth01(0.22f, 0.65f, next_c.mass) * 0.42f +
+                next_c.precip_age * 0.46f, 0.0f, 1.0f);
+            next_c.anvil = std::lerp(next_c.anvil, anvil_target, anvil_alpha);
+
+            next_c.shear_e = std::clamp(l3.u - l1.u, -36.0f, 36.0f);
+            next_c.shear_n = std::clamp(l3.v - l1.v, -36.0f, 36.0f);
+            const float ax = std::abs(next_c.shear_e), ay = std::abs(next_c.shear_n);
+            const float shear_mag = std::max(ax, ay) + 0.4142f * std::min(ax, ay);
+            next_c.turb_bub = std::clamp(0.14f + l1.tke * 0.46f + std::max(0.0f, buoy) * 0.36f +
+                                         shear_mag * 0.014f, 0.05f, 1.0f);
+            dst_cs[i] = next_c;
+
+            // Bidirectional feedback: simulated cumuli nudge buoyancy/downdraft w, cloud_fraction & rain fallout!
+            const float sim_cf = std::clamp(next_c.mass * 0.86f + next_c.anvil * 0.24f, 0.0f, 1.0f);
+            l1.cloud_fraction = std::clamp(std::lerp(l1.cloud_fraction, sim_cf, cf_alpha), 0.0f, 1.0f);
+            l2.cloud_fraction = std::clamp(std::lerp(l2.cloud_fraction, std::max(sim_cf * 0.90f, next_c.anvil), cf_alpha), 0.0f, 1.0f);
+            const float w_fb = (buoy > 0.14f && next_c.precip_age < 0.45f)
+                ? (buoy * 0.24f)
+                : (-next_c.precip_age * next_c.mass * 0.38f);
+            l1.w = std::clamp(l1.w + w_fb * cf_alpha, -10.0f, 10.0f);
+            const float rain_fb = next_c.precip_age * std::max(0.0f, next_c.mass - 0.26f) * 9.8f;
+            if (rain_fb > 0.05f) {
+                l1.rain_mm_hr = std::clamp(l1.rain_mm_hr + rain_fb * cf_alpha, 0.0f, 45.0f);
+                l0.rain_mm_hr = std::clamp(l0.rain_mm_hr + rain_fb * 0.85f * cf_alpha, 0.0f, 45.0f);
+            }
+        }
+    }
+    cloud_sim_.swap(cloud_sim_next_);
 }
 
 bool RegionalAtmosphere::WeatherSolver::step(
@@ -1985,6 +2226,7 @@ bool RegionalAtmosphere::WeatherSolver::step(
         }
     }
     if (!suppress_dynamic_advance_) advance_dynamic_cells(dt, solar);
+    step_cloud_sim(dt, solar, dx, dy);
 
     double mean_oat = 0.0, mean_cloud = 0.0, mean_rain = 0.0, mean_u = 0.0, mean_v = 0.0, mean_tke = 0.0;
     double cover_low = 0.0, cover_mid = 0.0, cover_high = 0.0;
@@ -2055,6 +2297,7 @@ void RegionalAtmosphere::update_field(const Vec3 &sun_dir, double sim_time_sec, 
          std::abs(pack_->anchor_lon() - weather_anchor_lon_) > 1e-7)) {
         stop_weather_worker();
         weather_model_ready_ = false;
+        weather_textures_ready_ = false;
         weather_model_time_ = -1.0;
         weather_model_accum_ = 0.0;
     }

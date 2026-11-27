@@ -203,6 +203,7 @@ bool world_check(PackReader &pack, bool gpu, bool full_outlook) {
         weather.sync_region(target->lat, target->lon);
         time += 1.0;
         weather.update_field(check_sun, time);
+        weather.finish_pending_initialization();
         const auto *region = pack.find_region_at(pack.anchor_lat(), pack.anchor_lon());
         if (!region || !weather.covers(target->lat, target->lon) ||
             weather.outlook().status != WeatherOutlook::Status::Idle ||

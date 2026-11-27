@@ -432,6 +432,11 @@ def main() -> int:
         action="store_true",
         help="confirm that every included model and data file is cleared for redistribution",
     )
+    parser.add_argument(
+        "--addons",
+        default="",
+        help="optional comma-separated list of add-on package names to build (default: all present in --packs-dir)",
+    )
     args = parser.parse_args()
 
     if not args.content_approved:
@@ -483,9 +488,11 @@ def main() -> int:
             temp_dir,
         )
 
+        addon_filter = {name.strip() for name in args.addons.split(",") if name.strip()}
         enabled_addons = [
             addon for addon in OPTIONAL_ADDONS
-            if all((packs_dir / fn).is_file() for fn in addon[2])
+            if (not addon_filter or addon[0] in addon_filter)
+            and all((packs_dir / fn).is_file() for fn in addon[2])
         ]
         recommends = ", ".join(f"{addon[0]} (= {args.version})" for addon in enabled_addons)
         rec_line = f"Recommends: {recommends}\n" if recommends else ""

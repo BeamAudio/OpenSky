@@ -372,7 +372,13 @@ void WorldObjects::update_city_region_transforms() {
     }
 }
 
+void WorldObjects::cancel_road_stream() {
+    if (road_stream_.job.valid()) road_stream_.job.wait();
+    road_stream_ = {};
+}
+
 void WorldObjects::reset_city_stream() {
+    cancel_road_stream();
     if (city_stream_.job.valid()) city_stream_.job.wait();
     if (city_stream_.vbo) glDeleteBuffers(1, &city_stream_.vbo);
     if (city_stream_.ebo) glDeleteBuffers(1, &city_stream_.ebo);
@@ -556,7 +562,7 @@ bool WorldObjects::load_textured_glb_append(
     return out_cmd.count > 0;
 }
 
-bool WorldObjects::load_colored_glb(const std::string &path, GlbMeshData &out) {
+bool WorldObjects::load_colored_glb(const std::string &path, GlbMeshData &out, bool keep_cpu_geom) {
     cgltf_options opts{};
     cgltf_data *data = nullptr;
     if (cgltf_parse_file(&opts, path.c_str(), &data) != cgltf_result_success) return false;
@@ -707,6 +713,10 @@ bool WorldObjects::load_colored_glb(const std::string &path, GlbMeshData &out) {
     glEnableVertexArrayAttrib(out.vao, 1); glVertexArrayAttribFormat(out.vao, 1, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float)); glVertexArrayAttribBinding(out.vao, 1, 0);
     glEnableVertexArrayAttrib(out.vao, 2); glVertexArrayAttribFormat(out.vao, 2, 4, GL_FLOAT, GL_FALSE, 6 * sizeof(float)); glVertexArrayAttribBinding(out.vao, 2, 0);
     glEnableVertexArrayAttrib(out.vao, 3); glVertexArrayAttribFormat(out.vao, 3, 2, GL_FLOAT, GL_FALSE, 10 * sizeof(float)); glVertexArrayAttribBinding(out.vao, 3, 0);
+    if (keep_cpu_geom) {
+        out.cpu_verts = std::move(verts);
+        out.cpu_indices = std::move(indices);
+    }
     return true;
 }
 
@@ -941,6 +951,7 @@ bool WorldObjects::init(const PackReader *pack, const std::string &asset_root, c
 }
 
 void WorldObjects::shutdown() {
+    cancel_staged_reanchor_upload();
     reset_city_stream();
     auto del_p = [](GLuint &p) { if (p) { glDeleteProgram(p); p = 0; } };
     auto del_v = [](GLuint &v) { if (v) { glDeleteVertexArrays(1, &v); v = 0; } };
@@ -1022,6 +1033,7 @@ WorldObjects::PreparedReanchor WorldObjects::prepare_reanchor_cpu(const PackRead
 }
 
 void WorldObjects::commit_reanchor(PreparedReanchor &&prep) {
+    cancel_staged_reanchor_upload();
     update_city_region_transforms();
     upload_buildings_gpu(prep.gpu_b);
     road_center_e_ = 1e12;
@@ -1029,6 +1041,105 @@ void WorldObjects::commit_reanchor(PreparedReanchor &&prep) {
     mtn_gi_phase_ = -10.0f;
     upload_runways_gpu(prep.rv);
     upload_landmarks_gpu(prep.lv);
+}
+
+void WorldObjects::begin_staged_reanchor_upload(PreparedReanchor &&prep) {
+    cancel_staged_reanchor_upload();
+    staged_reanchor_.data = std::move(prep);
+}
+
+void WorldObjects::pump_staged_reanchor_upload(size_t byte_budget) {
+    if (staged_reanchor_.phase >= 3 || byte_budget == 0) return;
+    auto stage_buffer = [&](GLuint &buffer, size_t &uploaded, size_t byte_count, size_t minimum_size,
+                           const void *source) {
+        if (!buffer) {
+            glCreateBuffers(1, &buffer);
+            const GLsizeiptr bytes = static_cast<GLsizeiptr>(std::max(minimum_size, byte_count));
+            glNamedBufferStorage(buffer, bytes, nullptr, GL_DYNAMIC_STORAGE_BIT);
+            uploaded = 0;
+        }
+        const size_t remaining = byte_count - uploaded;
+        const size_t chunk = std::min(remaining, byte_budget);
+        if (chunk > 0) {
+            glNamedBufferSubData(buffer, static_cast<GLintptr>(uploaded), static_cast<GLsizeiptr>(chunk),
+                                 static_cast<const uint8_t *>(source) + uploaded);
+            uploaded += chunk;
+            byte_budget -= chunk;
+        }
+        return uploaded >= byte_count;
+    };
+
+    while (staged_reanchor_.phase < 3 && byte_budget > 0) {
+        bool complete = false;
+        switch (staged_reanchor_.phase) {
+        case 0: {
+            const auto &data = staged_reanchor_.data.gpu_b;
+            const size_t bytes = data.size() * sizeof(BldgGpu);
+            complete = stage_buffer(staged_reanchor_.buildings, staged_reanchor_.buildings_uploaded,
+                                    bytes, sizeof(BldgGpu), data.data());
+            break;
+        }
+        case 1: {
+            const auto &data = staged_reanchor_.data.rv;
+            const size_t bytes = data.size() * sizeof(float);
+            complete = stage_buffer(staged_reanchor_.runways, staged_reanchor_.runways_uploaded,
+                                    bytes, 10 * sizeof(float), data.data());
+            break;
+        }
+        case 2: {
+            const auto &data = staged_reanchor_.data.lv;
+            const size_t bytes = data.size() * sizeof(float);
+            complete = stage_buffer(staged_reanchor_.landmarks, staged_reanchor_.landmarks_uploaded,
+                                    bytes, 12 * sizeof(float), data.data());
+            break;
+        }
+        default:
+            return;
+        }
+        if (!complete) return;
+        ++staged_reanchor_.phase;
+    }
+}
+
+void WorldObjects::commit_staged_reanchor_upload() {
+    if (!staged_reanchor_upload_ready()) return;
+    update_city_region_transforms();
+
+    GLuint old = bldg_all_ssbo_;
+    bldg_all_ssbo_ = staged_reanchor_.buildings;
+    staged_reanchor_.buildings = 0;
+    total_bldgs_ = static_cast<int>(staged_reanchor_.data.gpu_b.size());
+    if (old) glDeleteBuffers(1, &old);
+
+    old = rwy_vao_;
+    rwy_vao_ = create_runway_vao(staged_reanchor_.runways);
+    if (old) glDeleteVertexArrays(1, &old);
+    old = rwy_vbo_;
+    rwy_vbo_ = staged_reanchor_.runways;
+    staged_reanchor_.runways = 0;
+    if (old) glDeleteBuffers(1, &old);
+    rwy_vert_count_ = static_cast<int>(staged_reanchor_.data.rv.size() / 10);
+
+    old = lm_vao_;
+    lm_vao_ = create_landmark_vao(staged_reanchor_.landmarks);
+    if (old) glDeleteVertexArrays(1, &old);
+    old = lm_vbo_;
+    lm_vbo_ = staged_reanchor_.landmarks;
+    staged_reanchor_.landmarks = 0;
+    if (old) glDeleteBuffers(1, &old);
+    lm_vert_count_ = static_cast<int>(staged_reanchor_.data.lv.size() / 12);
+
+    road_center_e_ = 1e12;
+    road_center_n_ = 1e12;
+    mtn_gi_phase_ = -10.0f;
+    staged_reanchor_ = {};
+}
+
+void WorldObjects::cancel_staged_reanchor_upload() {
+    if (staged_reanchor_.buildings) glDeleteBuffers(1, &staged_reanchor_.buildings);
+    if (staged_reanchor_.runways) glDeleteBuffers(1, &staged_reanchor_.runways);
+    if (staged_reanchor_.landmarks) glDeleteBuffers(1, &staged_reanchor_.landmarks);
+    staged_reanchor_ = {};
 }
 
 void WorldObjects::on_reanchor() {
@@ -1261,15 +1372,21 @@ void WorldObjects::upload_runways_gpu(const std::vector<float> &rv) {
     if (rwy_vao_) { glDeleteVertexArrays(1, &rwy_vao_); rwy_vao_ = 0; }
     if (rwy_vbo_) { glDeleteBuffers(1, &rwy_vbo_); rwy_vbo_ = 0; }
     rwy_vert_count_ = static_cast<int>(rv.size() / 10);
-    glCreateVertexArrays(1, &rwy_vao_);
     glCreateBuffers(1, &rwy_vbo_);
     glNamedBufferStorage(rwy_vbo_, static_cast<GLsizeiptr>(std::max<size_t>(10, rv.size()) * sizeof(float)), rv.empty() ? nullptr : rv.data(), 0);
-    glVertexArrayVertexBuffer(rwy_vao_, 0, rwy_vbo_, 0, 10 * sizeof(float));
-    glEnableVertexArrayAttrib(rwy_vao_, 0); glVertexArrayAttribFormat(rwy_vao_, 0, 3, GL_FLOAT, GL_FALSE, 0); glVertexArrayAttribBinding(rwy_vao_, 0, 0);
-    glEnableVertexArrayAttrib(rwy_vao_, 1); glVertexArrayAttribFormat(rwy_vao_, 1, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float)); glVertexArrayAttribBinding(rwy_vao_, 1, 0);
-    glEnableVertexArrayAttrib(rwy_vao_, 2); glVertexArrayAttribFormat(rwy_vao_, 2, 2, GL_FLOAT, GL_FALSE, 6 * sizeof(float)); glVertexArrayAttribBinding(rwy_vao_, 2, 0);
-    glEnableVertexArrayAttrib(rwy_vao_, 3); glVertexArrayAttribFormat(rwy_vao_, 3, 1, GL_FLOAT, GL_FALSE, 8 * sizeof(float)); glVertexArrayAttribBinding(rwy_vao_, 3, 0);
-    glEnableVertexArrayAttrib(rwy_vao_, 4); glVertexArrayAttribFormat(rwy_vao_, 4, 1, GL_FLOAT, GL_FALSE, 9 * sizeof(float)); glVertexArrayAttribBinding(rwy_vao_, 4, 0);
+    rwy_vao_ = create_runway_vao(rwy_vbo_);
+}
+
+GLuint WorldObjects::create_runway_vao(GLuint vbo) {
+    GLuint vao = 0;
+    glCreateVertexArrays(1, &vao);
+    glVertexArrayVertexBuffer(vao, 0, vbo, 0, 10 * sizeof(float));
+    glEnableVertexArrayAttrib(vao, 0); glVertexArrayAttribFormat(vao, 0, 3, GL_FLOAT, GL_FALSE, 0); glVertexArrayAttribBinding(vao, 0, 0);
+    glEnableVertexArrayAttrib(vao, 1); glVertexArrayAttribFormat(vao, 1, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float)); glVertexArrayAttribBinding(vao, 1, 0);
+    glEnableVertexArrayAttrib(vao, 2); glVertexArrayAttribFormat(vao, 2, 2, GL_FLOAT, GL_FALSE, 6 * sizeof(float)); glVertexArrayAttribBinding(vao, 2, 0);
+    glEnableVertexArrayAttrib(vao, 3); glVertexArrayAttribFormat(vao, 3, 1, GL_FLOAT, GL_FALSE, 8 * sizeof(float)); glVertexArrayAttribBinding(vao, 3, 0);
+    glEnableVertexArrayAttrib(vao, 4); glVertexArrayAttribFormat(vao, 4, 1, GL_FLOAT, GL_FALSE, 9 * sizeof(float)); glVertexArrayAttribBinding(vao, 4, 0);
+    return vao;
 }
 
 std::vector<float> WorldObjects::build_landmarks_cpu(const PackReader::WorldFrame &frame) const {
@@ -1549,14 +1666,20 @@ void WorldObjects::upload_landmarks_gpu(const std::vector<float> &lv) {
     if (lm_vao_) { glDeleteVertexArrays(1, &lm_vao_); lm_vao_ = 0; }
     if (lm_vbo_) { glDeleteBuffers(1, &lm_vbo_); lm_vbo_ = 0; }
     lm_vert_count_ = static_cast<int>(lv.size() / 12);
-    glCreateVertexArrays(1, &lm_vao_);
     glCreateBuffers(1, &lm_vbo_);
     glNamedBufferStorage(lm_vbo_, static_cast<GLsizeiptr>(std::max<size_t>(12, lv.size()) * sizeof(float)), lv.empty() ? nullptr : lv.data(), 0);
-    glVertexArrayVertexBuffer(lm_vao_, 0, lm_vbo_, 0, 12 * sizeof(float));
-    glEnableVertexArrayAttrib(lm_vao_, 0); glVertexArrayAttribFormat(lm_vao_, 0, 3, GL_FLOAT, GL_FALSE, 0); glVertexArrayAttribBinding(lm_vao_, 0, 0);
-    glEnableVertexArrayAttrib(lm_vao_, 1); glVertexArrayAttribFormat(lm_vao_, 1, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float)); glVertexArrayAttribBinding(lm_vao_, 1, 0);
-    glEnableVertexArrayAttrib(lm_vao_, 2); glVertexArrayAttribFormat(lm_vao_, 2, 4, GL_FLOAT, GL_FALSE, 6 * sizeof(float)); glVertexArrayAttribBinding(lm_vao_, 2, 0);
-    glEnableVertexArrayAttrib(lm_vao_, 3); glVertexArrayAttribFormat(lm_vao_, 3, 2, GL_FLOAT, GL_FALSE, 10 * sizeof(float)); glVertexArrayAttribBinding(lm_vao_, 3, 0);
+    lm_vao_ = create_landmark_vao(lm_vbo_);
+}
+
+GLuint WorldObjects::create_landmark_vao(GLuint vbo) {
+    GLuint vao = 0;
+    glCreateVertexArrays(1, &vao);
+    glVertexArrayVertexBuffer(vao, 0, vbo, 0, 12 * sizeof(float));
+    glEnableVertexArrayAttrib(vao, 0); glVertexArrayAttribFormat(vao, 0, 3, GL_FLOAT, GL_FALSE, 0); glVertexArrayAttribBinding(vao, 0, 0);
+    glEnableVertexArrayAttrib(vao, 1); glVertexArrayAttribFormat(vao, 1, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float)); glVertexArrayAttribBinding(vao, 1, 0);
+    glEnableVertexArrayAttrib(vao, 2); glVertexArrayAttribFormat(vao, 2, 4, GL_FLOAT, GL_FALSE, 6 * sizeof(float)); glVertexArrayAttribBinding(vao, 2, 0);
+    glEnableVertexArrayAttrib(vao, 3); glVertexArrayAttribFormat(vao, 3, 2, GL_FLOAT, GL_FALSE, 10 * sizeof(float)); glVertexArrayAttribBinding(vao, 3, 0);
+    return vao;
 }
 
 void WorldObjects::build_car_mesh() {
@@ -1604,29 +1727,81 @@ void WorldObjects::build_car_mesh() {
 
 void WorldObjects::rebuild_local_roads_and_traffic(double cam_e, double cam_n, int quality) {
     if (pack_->roads().empty()) return;
-    double move = std::hypot(cam_e - road_center_e_, cam_n - road_center_n_);
-    if (move < 600.0 && quality == road_last_q_) return;
-    road_center_e_ = cam_e;
-    road_center_n_ = cam_n;
-    road_last_q_ = quality;
 
-    double rad_m = (quality <= 0) ? 1600.0 : (quality == 1 ? 2200.0 : (quality == 2 ? 2900.0 : (quality == 3 ? 3600.0 : 4800.0)));
-    double cam_lat = pack_->anchor_lat() + cam_n / pack_->anchor_m_lat();
-    double cam_lon = pack_->anchor_lon() + cam_e / pack_->anchor_m_lon();
-    double dlat = rad_m / pack_->anchor_m_lat();
-    double dlon = rad_m / pack_->anchor_m_lon();
+    auto commit_roads = [&](PreparedRoads &&res) {
+        road_center_e_ = res.ce;
+        road_center_n_ = res.cn;
+        road_last_q_ = res.q;
+        road_vert_count_ = static_cast<int>(res.rv.size());
+        if (road_vert_count_ > 0) {
+            glNamedBufferSubData(road_vbo_, 0, static_cast<GLsizeiptr>(res.rv.size() * sizeof(RoadVert)), res.rv.data());
+        }
+        active_segs_ = std::move(res.segs);
+        road_adj_ = std::move(res.adj);
+        agents_ = std::move(res.agents);
+        car_gpu_buf_.resize(agents_.size());
+        active_cars_ = static_cast<int>(agents_.size());
+        prev_traffic_t_ = -1.0f;
+    };
+
+    if (road_stream_.pending) {
+        if (road_stream_.job.valid() &&
+            road_stream_.job.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+            PreparedRoads ready = road_stream_.job.get();
+            road_stream_ = {};
+            commit_roads(std::move(ready));
+        } else {
+            return;
+        }
+    }
+
+    double move = std::hypot(cam_e - road_center_e_, cam_n - road_center_n_);
+    if (move < 750.0 && quality == road_last_q_) return;
+
+    const auto frame = pack_->world_frame();
+    if (!frame) return;
+
+    if (road_last_q_ < 0 || std::abs(road_center_e_) > 1e11) {
+        PreparedRoads init_res = build_roads_cpu(pack_, frame, cam_e, cam_n, quality);
+        commit_roads(std::move(init_res));
+        return;
+    }
+
+    road_stream_.pending = true;
+    road_stream_.ce = cam_e;
+    road_stream_.cn = cam_n;
+    road_stream_.q = quality;
+    const PackReader *pack_ptr = pack_;
+    road_stream_.job = std::async(std::launch::async, [pack_ptr, frame, cam_e, cam_n, quality]() {
+        return build_roads_cpu(pack_ptr, frame, cam_e, cam_n, quality);
+    });
+}
+
+WorldObjects::PreparedRoads WorldObjects::build_roads_cpu(
+    const PackReader *pack_ptr, std::shared_ptr<const PackReader::WorldFrame> frame_ptr,
+    double cam_e, double cam_n, int quality) {
+    PreparedRoads out;
+    out.ce = cam_e;
+    out.cn = cam_n;
+    out.q = quality;
+    const PackReader::WorldFrame &frame = *frame_ptr;
+
+    double rad_m = (quality <= 0) ? 1800.0 : (quality == 1 ? 2400.0 : (quality == 2 ? 3000.0 : (quality == 3 ? 3600.0 : 4800.0)));
+    double cam_lat = frame.anchor_lat + cam_n / frame.metres_lat;
+    double cam_lon = frame.anchor_lon + cam_e / frame.metres_lon;
+    double dlat = rad_m / frame.metres_lat;
+    double dlon = rad_m / frame.metres_lon;
 
     std::vector<uint32_t> r_idxs;
-    pack_->query_roads_in_box(cam_lat - dlat, cam_lat + dlat, cam_lon - dlon, cam_lon + dlon, r_idxs);
-    // Prioritize motorways/avenues/main streets first so dense city centers NEVER drop arteries!
-    const auto &all_roads = pack_->roads();
-    const auto &all_pts = pack_->road_pts();
+    pack_ptr->query_roads_in_box(cam_lat - dlat, cam_lat + dlat, cam_lon - dlon, cam_lon + dlon, r_idxs);
+    const auto &all_roads = pack_ptr->roads();
+    const auto &all_pts = pack_ptr->road_pts();
     std::sort(r_idxs.begin(), r_idxs.end(), [&](uint32_t a, uint32_t b) { return all_roads[a].kind < all_roads[b].kind; });
 
-    std::vector<RoadVert> rv;
+    auto &rv = out.rv;
     rv.reserve(std::min<size_t>(MAX_ROAD_VERTS, r_idxs.size() * 18));
-    active_segs_.clear();
-    active_segs_.reserve(6144);
+    auto &segs = out.segs;
+    segs.reserve(6144);
 
     static constexpr float kHalfW[4]    = {8.8f, 6.4f, 4.7f, 3.4f};
     static constexpr float kLaneOff[4]  = {3.9f, 2.5f, 1.7f, 1.1f};
@@ -1635,8 +1810,8 @@ void WorldObjects::rebuild_local_roads_and_traffic(double cam_e, double cam_n, i
     auto sample_road_y = [&](double e, double n, float baked_gnd, uint8_t kind, bool need_dem) -> float {
         double h = static_cast<double>(baked_gnd);
         if (need_dem || h < 1.0) {
-            double dh = pack_->sample_elevation(pack_->anchor_lat() + n / pack_->anchor_m_lat(),
-                                                pack_->anchor_lon() + e / pack_->anchor_m_lon());
+            double dh = pack_ptr->sample_elevation(frame.anchor_lat + n / frame.metres_lat,
+                                                   frame.anchor_lon + e / frame.metres_lon);
             h = (h < 1.0) ? dh : std::max(h, dh);
         }
         return static_cast<float>(h + kLiftM[kind]);
@@ -1652,10 +1827,10 @@ void WorldObjects::rebuild_local_roads_and_traffic(double cam_e, double cam_n, i
         for (uint16_t pi = 0; pi + 1 < rr.count; pi++) {
             const RoadPt &p0 = all_pts[rr.offset + pi];
             const RoadPt &p1 = all_pts[rr.offset + pi + 1];
-            double e0 = (p0.lon_e6 * 1e-6 - pack_->anchor_lon()) * pack_->anchor_m_lon();
-            double n0 = (p0.lat_e6 * 1e-6 - pack_->anchor_lat()) * pack_->anchor_m_lat();
-            double e1 = (p1.lon_e6 * 1e-6 - pack_->anchor_lon()) * pack_->anchor_m_lon();
-            double n1 = (p1.lat_e6 * 1e-6 - pack_->anchor_lat()) * pack_->anchor_m_lat();
+            double e0 = (p0.lon_e6 * 1e-6 - frame.anchor_lon) * frame.metres_lon;
+            double n0 = (p0.lat_e6 * 1e-6 - frame.anchor_lat) * frame.metres_lat;
+            double e1 = (p1.lon_e6 * 1e-6 - frame.anchor_lon) * frame.metres_lon;
+            double n1 = (p1.lat_e6 * 1e-6 - frame.anchor_lat) * frame.metres_lat;
             double mid_e = 0.5 * (e0 + e1), mid_n = 0.5 * (n0 + n1);
             double mid_d = std::hypot(mid_e - cam_e, mid_n - cam_n);
             if (mid_d > rad_m || (k == 3 && mid_d > 1600.0)) continue;
@@ -1665,13 +1840,13 @@ void WorldObjects::rebuild_local_roads_and_traffic(double cam_e, double cam_n, i
             if (seg_len < 2.0) continue;
             double ue = de / seg_len, un = dn / seg_len;
 
-            // Inside dense lowland cities (Z16/Z17 PNOA): let real satellite streets + baked 10-TOD shadows & RT night pools shine cleanly;
-            // in mountain villages (>620m, Z14/Z15 PNOA) and all highways/rural roads, render full PBR 10-TOD roads!
-            if (is_dense_urban_en(mid_e, mid_n) && p0.ground_m < 620.0f) {
-                if (seg_len > 6.0 && mid_d < 2000.0 && (k <= 1 || (k == 2 && active_segs_.size() < 2600)) && active_segs_.size() < 6000) {
+            if (p0.ground_m < 620.0f && pack_ptr->is_near_building(frame,
+                    frame.anchor_lat + mid_n / frame.metres_lat,
+                    frame.anchor_lon + mid_e / frame.metres_lon, 18.0)) {
+                if (seg_len > 6.0 && mid_d < 2000.0 && (k <= 1 || (k == 2 && segs.size() < 2600)) && segs.size() < 6000) {
                     float y0 = p0.ground_m + 0.12f;
                     float y1 = p1.ground_m + 0.12f;
-                    active_segs_.push_back({
+                    segs.push_back({
                         static_cast<float>(e0), y0, static_cast<float>(n0),
                         static_cast<float>(e1), y1, static_cast<float>(n1),
                         static_cast<float>(seg_len), static_cast<float>(std::atan2(ue, -un)), kLaneOff[k], k
@@ -1681,20 +1856,20 @@ void WorldObjects::rebuild_local_roads_and_traffic(double cam_e, double cam_n, i
             }
             if (static_cast<int>(rv.size()) + 48 >= MAX_ROAD_VERTS) continue;
 
-            double rx = un * hw, rn = -ue * hw; // Right-hand curb vector
+            double rx = un * hw, rn = -ue * hw;
             int steps = std::clamp(static_cast<int>(std::ceil(seg_len / 34.0)), 1, 12);
             if (static_cast<int>(rv.size()) + steps * 6 >= MAX_ROAD_VERTS) break;
 
             double prev_e = e0, prev_n = n0;
             float prev_y = sample_road_y(prev_e, prev_n, p0.ground_m, k, false);
-            uint32_t prev_gi = pack_->sample_baked_gi_u32_en(prev_e, prev_n);
+            uint32_t prev_gi = pack_ptr->sample_baked_gi_u32_en(frame, prev_e, prev_n);
             for (int st = 1; st <= steps; st++) {
                 double t = static_cast<double>(st) / steps;
                 double cur_e = e0 + de * t;
                 double cur_n = n0 + dn * t;
                 float g_interp = p0.ground_m + (p1.ground_m - p0.ground_m) * static_cast<float>(t);
                 float cur_y = sample_road_y(cur_e, cur_n, g_interp, k, steps > 1 && st < steps);
-                uint32_t cur_gi = pack_->sample_baked_gi_u32_en(cur_e, cur_n);
+                uint32_t cur_gi = pack_ptr->sample_baked_gi_u32_en(frame, cur_e, cur_n);
                 float sub_len = static_cast<float>(seg_len / steps);
                 float v0 = v_accum;
                 float v1 = v_accum + sub_len;
@@ -1710,8 +1885,8 @@ void WorldObjects::rebuild_local_roads_and_traffic(double cam_e, double cam_n, i
                 push(cur_e  + rx, cur_y,  cur_n  + rn, 1.0f, v1, cur_gi);
                 push(cur_e  - rx, cur_y,  cur_n  - rn, 0.0f, v1, cur_gi);
 
-                if (sub_len > 18.0f && mid_d < 2200.0 && k <= 2 && active_segs_.size() < 4000) {
-                    active_segs_.push_back({
+                if (sub_len > 18.0f && mid_d < 2200.0 && k <= 2 && segs.size() < 4000) {
+                    segs.push_back({
                         static_cast<float>(prev_e), prev_y, static_cast<float>(prev_n),
                         static_cast<float>(cur_e),  cur_y,  static_cast<float>(cur_n),
                         sub_len, static_cast<float>(std::atan2(ue, -un)), kLaneOff[k], k
@@ -1722,51 +1897,41 @@ void WorldObjects::rebuild_local_roads_and_traffic(double cam_e, double cam_n, i
         }
     }
 
-    road_vert_count_ = static_cast<int>(rv.size());
-    if (road_vert_count_ > 0) {
-        glNamedBufferSubData(road_vbo_, 0, static_cast<GLsizeiptr>(rv.size() * sizeof(RoadVert)), rv.data());
-    }
-
-    // Build connected local OSM road graph (2.5 m endpoint snap) so every vehicle
-    // drives an individual acyclic A->B street/highway route rather than looping on 1 segment.
-    road_adj_.clear();
-    if (!active_segs_.empty()) {
+    auto &adj = out.adj;
+    if (!segs.empty()) {
         std::unordered_map<int64_t, uint32_t> node_map;
-        node_map.reserve(active_segs_.size() * 2);
+        node_map.reserve(segs.size() * 2);
         auto get_node = [&](float e, float n) -> uint32_t {
             int32_t qe = static_cast<int32_t>(std::lround(e * 0.4f));
             int32_t qn = static_cast<int32_t>(std::lround(n * 0.4f));
             int64_t key = pack_tc(qe, qn);
             auto it = node_map.find(key);
             if (it != node_map.end()) return it->second;
-            uint32_t nid = static_cast<uint32_t>(road_adj_.size());
+            uint32_t nid = static_cast<uint32_t>(adj.size());
             node_map.emplace(key, nid);
-            road_adj_.emplace_back();
+            adj.emplace_back();
             return nid;
         };
-        for (uint32_t si = 0; si < static_cast<uint32_t>(active_segs_.size()); ++si) {
-            RoadSeg &sg = active_segs_[si];
+        for (uint32_t si = 0; si < static_cast<uint32_t>(segs.size()); ++si) {
+            RoadSeg &sg = segs[si];
             sg.node_a = get_node(sg.e0, sg.n0);
             sg.node_b = get_node(sg.e1, sg.n1);
             if (sg.node_a == sg.node_b) continue;
-            road_adj_[sg.node_a].push_back((si << 1u) | 0u); // a -> b
-            road_adj_[sg.node_b].push_back((si << 1u) | 1u); // b -> a
+            adj[sg.node_a].push_back((si << 1u) | 0u);
+            adj[sg.node_b].push_back((si << 1u) | 1u);
         }
     }
 
-    // Spawn compact, naturally spaced moving traffic with individual multi-segment routes!
-    agents_.clear();
-    if (!active_segs_.empty()) {
+    if (!segs.empty()) {
         int target = (quality <= 0) ? 110 : (quality == 1 ? 210 : (quality == 2 ? 340 : (quality == 3 ? 520 : 820)));
-        target = std::min(target, std::max(8, static_cast<int>(active_segs_.size()) / 3));
+        target = std::min(target, std::max(8, static_cast<int>(segs.size()) / 3));
         target = std::min(target, MAX_CARS);
-        agents_.reserve(target);
+        out.agents.reserve(target);
         for (int i = 0; i < target; i++) {
             uint32_t h = static_cast<uint32_t>(i) * 2654435761u ^ 0x9E3779B9u;
             TrafficAgent ag{};
             ag.rng = h | 1u;
             ag.speed_scale = 0.84f + 0.32f * static_cast<float>((h >> 16) & 0xFFu) / 255.0f;
-            // Compact, realistic European car dimensions (84% compact sedans/hatchbacks, 16% compact vans)
             uint32_t vt = (h >> 24) % 100u;
             if (vt < 84u) {
                 ag.w = 1.42f; ag.h = 1.02f; ag.l = 3.25f;
@@ -1774,16 +1939,21 @@ void WorldObjects::rebuild_local_roads_and_traffic(double cam_e, double cam_n, i
                 ag.w = 1.54f; ag.h = 1.28f; ag.l = 3.75f;
             }
             ag.col_id = static_cast<float>((h >> 4) & 7u);
-            plan_vehicle_route(ag, true);
-            if (!ag.route.empty()) agents_.push_back(std::move(ag));
+            plan_vehicle_route_on(segs, adj, ag, true);
+            if (!ag.route.empty()) out.agents.push_back(std::move(ag));
         }
     }
-    car_gpu_buf_.resize(agents_.size());
-    active_cars_ = static_cast<int>(agents_.size());
-    prev_traffic_t_ = -1.0f;
+    return out;
 }
 
 void WorldObjects::plan_vehicle_route(TrafficAgent &ag, bool random_progress) {
+    plan_vehicle_route_on(active_segs_, road_adj_, ag, random_progress);
+}
+
+void WorldObjects::plan_vehicle_route_on(
+    const std::vector<RoadSeg> &active_segs_,
+    const std::vector<std::vector<uint32_t>> &road_adj_,
+    TrafficAgent &ag, bool random_progress) {
     ag.route.clear();
     ag.step = 0;
     ag.dist_m = 0.0f;
@@ -1884,9 +2054,12 @@ void WorldObjects::update_and_render(
     const Mat4 &vp, const Frustum &frustum,
     double cam_east_m, double cam_north_m, double cam_alt_m,
     const AtmosphereState &atmo, float time_sec, const Vec2 &wind_en_mps, GLuint refl_env_tex, int quality,
-    int max_new_tree_cells, int world_detail
+    int max_new_tree_cells, int world_detail,
+    float dist_scale, int road_quality
 ) {
     const int wq = (world_detail < 0) ? std::clamp(quality, 0, 3) : std::clamp(world_detail, 0, 4);
+    const int base_rq = (road_quality < 0) ? wq : std::clamp(road_quality, 0, 4);
+    const float ds = std::clamp(dist_scale, 0.65f, 1.15f);
     const float phase10 = sun_dir_to_phase10(atmo.sun_dir);
     if (mtn_gi_tex_ && std::abs(phase10 - mtn_gi_phase_) > 0.04f) {
         mtn_gi_phase_ = phase10;
@@ -1924,8 +2097,8 @@ void WorldObjects::update_and_render(
         glDisable(GL_BLEND);
     }
 
-    // 2. Real OpenStreetMap Streets, Avenues, Motorways & Sidewalks (streamed around camera!)
-    rebuild_local_roads_and_traffic(cam_east_m, cam_north_m, wq);
+    // 2. Real OpenStreetMap Streets, Avenues, Motorways & Sidewalks (streamed asynchronously around camera!)
+    rebuild_local_roads_and_traffic(cam_east_m, cam_north_m, base_rq);
     if (road_vert_count_ > 0) {
         glUseProgram(road_prog_);
         glUniformMatrix4fv(u_road_vp_, 1, GL_FALSE, vp.m);
@@ -2068,10 +2241,10 @@ void WorldObjects::update_and_render(
     // 4b. Map-Wide Pre-Baked Exact-Polygon Populated Zones (streamed per region + 4km macro grid cull + Early-Z!)
     if (!city_regions_.empty()) {
         ensure_city_regions_for_camera(cam_east_m, cam_north_m);
-        static constexpr float kCityMaxD[5] = {10500.0f, 14500.0f, 17500.0f, 22500.0f, 28000.0f};
+        static constexpr float kCityMaxD[5] = {10500.0f, 15000.0f, 17500.0f, 22500.0f, 28000.0f};
         static constexpr float kCityNear[5] = {  450.0f,   680.0f,   720.0f,  2200.0f,  3500.0f};
-        float max_city_d = kCityMaxD[wq];
-        float near_cut   = kCityNear[wq];
+        float max_city_d = kCityMaxD[wq] * ds;
+        float near_cut   = kCityNear[wq] * std::clamp(ds, 0.80f, 1.05f);
         float max_d2 = max_city_d * max_city_d;
         float near_cut2 = near_cut * near_cut;
 
@@ -2123,8 +2296,8 @@ void WorldObjects::update_and_render(
             std::sort(far_ch.begin(), far_ch.end(), [](const VisChunk &a, const VisChunk &b) { return a.d2 < b.d2; });
             // Per-frame index budget keeps dense megacities (Barcelona) within iGPU frame time
             // while pulling far-fade smoothly to the farthest included chunk distance.
-            static constexpr size_t kCityMaxIdx[5] = {950000u, 1600000u, 2100000u, 6000000u, 9000000u};
-            const size_t max_city_idx = kCityMaxIdx[wq];
+            static constexpr size_t kCityMaxIdx[5] = {950000u, 1700000u, 2200000u, 6000000u, 9000000u};
+            const size_t max_city_idx = static_cast<size_t>(kCityMaxIdx[wq] * std::clamp(ds * ds, 0.50f, 1.15f));
             size_t used_idx = 0;
             for (const VisChunk &vc : near_ch) used_idx += cr.chunks[vc.idx].index_count;
             float eff_far_d = max_city_d;
@@ -2210,8 +2383,8 @@ void WorldObjects::update_and_render(
 
     // 5. GPU-Driven 2-Tier Building LOD (Rural Towns & Villages 0..22km!) + Directional Ground Shadows & Contact AO!
     if (total_bldgs_ > 0) {
-        static constexpr float kBldgRad[5] = {2400.0f, 3200.0f, 2600.0f, 5800.0f, 7500.0f};
-        float b_rad = kBldgRad[wq];
+        static constexpr float kBldgRad[5] = {2400.0f, 3300.0f, 2800.0f, 5800.0f, 7500.0f};
+        float b_rad = kBldgRad[wq] * ds;
         float far_rad = wq >= 4 ? 26000.0f : 22000.0f;
         glNamedBufferSubData(bldg_cmd_ssbo_, 0, sizeof(bldg_base_cmds_), bldg_base_cmds_);
         glNamedBufferSubData(bldg_sh_cmd_ssbo_, 0, sizeof(bldg_sh_base_cmds_), bldg_sh_base_cmds_);

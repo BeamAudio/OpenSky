@@ -115,6 +115,7 @@ KeyCode map_vk(WPARAM vk) {
         case 'H': return KEY_H;
         case 'N': return KEY_N;
         case 'U': return KEY_U;
+        case 'J': return KEY_J;
         case 'X': return KEY_X;
         case VK_RETURN: return KEY_ENTER;
         case VK_HOME: return KEY_HOME;
@@ -631,6 +632,7 @@ KeyCode map_keysym(KeySym ks) {
         case XK_h: case XK_H: return KEY_H;
         case XK_n: case XK_N: return KEY_N;
         case XK_u: case XK_U: return KEY_U;
+        case XK_j: case XK_J: return KEY_J;
         case XK_x: case XK_X: return KEY_X;
         case XK_Return: case XK_KP_Enter: return KEY_ENTER;
         case XK_Home: case XK_KP_Home: return KEY_HOME;
@@ -1125,8 +1127,8 @@ void PlatformWindow::sleep_sec(double seconds) {
     for (;;) {
         const double rem = deadline - now_sec();
         if (rem <= 0.0) break;
-        if (rem > 0.0018) {
-            const double wait_s = rem - 0.0012;
+        if (rem > 0.00085) {
+            const double wait_s = rem - 0.00045;
             if (timer.h) {
                 LARGE_INTEGER due{};
                 due.QuadPart = -static_cast<LONGLONG>(wait_s * 1.0e7);
@@ -1138,7 +1140,7 @@ void PlatformWindow::sleep_sec(double seconds) {
             const DWORD ms = static_cast<DWORD>(wait_s * 1000.0);
             if (ms > 0) Sleep(ms);
             else SwitchToThread();
-        } else if (rem > 0.0003) {
+        } else if (rem > 0.00018) {
             SwitchToThread();
         } else {
             YieldProcessor();

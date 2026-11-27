@@ -2014,6 +2014,11 @@ float PackReader::sample_global_shadow(const WorldFrame &frame, double east_m, d
 }
 
 uint32_t PackReader::sample_baked_gi_u32_en(double east_m, double north_m) const {
+    const auto frame = world_frame();
+    return frame ? sample_baked_gi_u32_en(*frame, east_m, north_m) : pack_tod10_u32(std::array<float, 10>{1,1,1,1,1,1,1,1,1,1}.data(), 1.0f, 0.0f);
+}
+
+uint32_t PackReader::sample_baked_gi_u32_en(const WorldFrame &frame, double east_m, double north_m) const {
     float vis[10] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
     float sky_ao = 1.0f;
     float night_l = 0.0f;
@@ -2047,14 +2052,14 @@ uint32_t PackReader::sample_baked_gi_u32_en(double east_m, double north_m) const
     };
 
     // 1. Whole-corridor 50km 10-TOD mountain horizon shadows + valley Sky AO
-    if (!world_frame_->lighting.empty()) {
-        double fx = std::clamp((east_m  - world_frame_->min_e) / world_frame_->span_e, 0.0, 0.9999) * (SH_W - 1);
-        double fy = std::clamp((north_m - world_frame_->min_n) / world_frame_->span_n, 0.0, 0.9999) * (SH_H - 1);
-        sample_grid_bilerp(world_frame_->lighting.data(), SH_W, SH_H, fx, fy, false);
+    if (!frame.lighting.empty()) {
+        double fx = std::clamp((east_m  - frame.min_e) / frame.span_e, 0.0, 0.9999) * (SH_W - 1);
+        double fy = std::clamp((north_m - frame.min_n) / frame.span_n, 0.0, 0.9999) * (SH_H - 1);
+        sample_grid_bilerp(frame.lighting.data(), SH_W, SH_H, fx, fy, false);
     }
     // 2. Populated-zone 3.9m/px 10-TOD building shadows + street-canyon Sky AO + RT Night Local Lights!
-    double pt_lat = world_frame_->anchor_lat + north_m / world_frame_->metres_lat;
-    double pt_lon = world_frame_->anchor_lon + east_m / world_frame_->metres_lon;
+    double pt_lat = frame.anchor_lat + north_m / frame.metres_lat;
+    double pt_lon = frame.anchor_lon + east_m / frame.metres_lon;
     if (const LoadedRegion *sr = find_sh_region_at_ll(pt_lat, pt_lon)) {
         double re = (pt_lon - sr->anchor_lon) * sr->m_lon;
         double rn = (pt_lat - sr->anchor_lat) * sr->m_lat;

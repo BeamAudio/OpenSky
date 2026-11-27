@@ -1,9 +1,11 @@
 #include "volumetric_clouds.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <ctime>
+#include <vector>
 
 namespace nsim {
 
@@ -12,6 +14,77 @@ inline float smooth01(float lo, float hi, float v) {
     float t = std::clamp((v - lo) / std::max(1e-5f, hi - lo), 0.0f, 1.0f);
     return t * t * (3.0f - 2.0f * t);
 }
+
+// Synthesizes a 64x64 tileable isotropic Void-and-Cluster Blue Noise mask (zero horizontal/Bayer bias).
+std::vector<uint8_t> build_void_and_cluster_64() {
+    constexpr int N = 64, N2 = N * N, R = 4, K = 9;
+    float kern[K][K]{};
+    for (int dy = -R; dy <= R; ++dy) {
+        for (int dx = -R; dx <= R; ++dx) {
+            kern[dy + R][dx + R] = std::exp(-static_cast<float>(dx * dx + dy * dy) / (2.0f * 1.5f * 1.5f));
+        }
+    }
+    auto splat = [&](std::vector<float> &en, int px, int py, float s) {
+        for (int dy = -R; dy <= R; ++dy) {
+            const int yy = (py + dy + N) & 63;
+            for (int dx = -R; dx <= R; ++dx) {
+                const int xx = (px + dx + N) & 63;
+                en[static_cast<size_t>(yy) * N + xx] += s * kern[dy + R][dx + R];
+            }
+        }
+    };
+    std::vector<uint8_t> st(N2, 0), st_dn(N2, 0);
+    std::vector<float> en(N2, 0.0f), en_dn(N2, 0.0f);
+    std::vector<int> ranks(N2, 0);
+    uint32_t rng = 0x51a9d3u;
+    auto rnd = [&]() {
+        rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+        return static_cast<int>(rng & 4095u);
+    };
+    constexpr int INIT_PTS = 512;
+    int placed = 0;
+    while (placed < INIT_PTS) {
+        const int p = rnd();
+        if (!st[p]) { st[p] = 1; splat(en, p & 63, p >> 6, 1.0f); ++placed; }
+    }
+    for (int it = 0; it < 220; ++it) {
+        int hi = -1, lo = -1; float he = -1e9f, le = 1e9f;
+        for (int i = 0; i < N2; ++i) {
+            if (st[i] && en[i] > he) { he = en[i]; hi = i; }
+        }
+        if (hi < 0) break;
+        st[hi] = 0; splat(en, hi & 63, hi >> 6, -1.0f);
+        for (int i = 0; i < N2; ++i) {
+            if (!st[i] && en[i] < le) { le = en[i]; lo = i; }
+        }
+        if (lo == hi) { st[hi] = 1; splat(en, hi & 63, hi >> 6, 1.0f); break; }
+        st[lo] = 1; splat(en, lo & 63, lo >> 6, 1.0f);
+    }
+    st_dn = st; en_dn = en;
+    for (int r = INIT_PTS - 1; r >= 0; --r) {
+        int hi = 0; float he = -1e9f;
+        for (int i = 0; i < N2; ++i) if (st_dn[i] && en_dn[i] > he) { he = en_dn[i]; hi = i; }
+        st_dn[hi] = 0; splat(en_dn, hi & 63, hi >> 6, -1.0f);
+        ranks[hi] = r;
+    }
+    for (int r = INIT_PTS; r < N2 / 2; ++r) {
+        int lo = 0; float le = 1e9f;
+        for (int i = 0; i < N2; ++i) if (!st[i] && en[i] < le) { le = en[i]; lo = i; }
+        st[lo] = 1; splat(en, lo & 63, lo >> 6, 1.0f);
+        ranks[lo] = r;
+    }
+    std::fill(en.begin(), en.end(), 0.0f);
+    for (int i = 0; i < N2; ++i) if (!st[i]) splat(en, i & 63, i >> 6, 1.0f);
+    for (int r = N2 / 2; r < N2; ++r) {
+        int hi = 0; float he = -1e9f;
+        for (int i = 0; i < N2; ++i) if (!st[i] && en[i] > he) { he = en[i]; hi = i; }
+        st[hi] = 1; splat(en, hi & 63, hi >> 6, -1.0f);
+        ranks[hi] = r;
+    }
+    std::vector<uint8_t> out(N2);
+    for (int i = 0; i < N2; ++i) out[i] = static_cast<uint8_t>((ranks[i] * 255 + 2047) / 4095);
+    return out;
+}
 }
 
 SkyAndClouds::~SkyAndClouds() {
@@ -19,7 +92,7 @@ SkyAndClouds::~SkyAndClouds() {
 }
 
 bool SkyAndClouds::init(const std::string &shader_root, int win_w, int win_h, int quality,
-                        int pixel_percent, int aa_mode, int weather_detail) {
+                        int pixel_percent, int aa_mode, int weather_detail, int cloud_res_percent) {
     sky_prog_   = compile_program_files(shader_root + "/fullscreen.vert", shader_root + "/sky.frag");
     cloud_prog_ = compile_program_files(shader_root + "/fullscreen.vert", shader_root + "/clouds_qres.frag");
     post_prog_  = compile_program_files(shader_root + "/fullscreen.vert", shader_root + "/post_tonemap.frag");
@@ -51,6 +124,8 @@ bool SkyAndClouds::init(const std::string &shader_root, int win_w, int win_h, in
     u_cld_local_dom_ = glGetUniformLocation(cloud_prog_, "u_atmo_local_domain");
     u_cld_wx_fx_   = glGetUniformLocation(cloud_prog_, "u_wx_fx");
     u_cld_advect_  = glGetUniformLocation(cloud_prog_, "u_cloud_advect");
+    u_cld_field_advect_ = glGetUniformLocation(cloud_prog_, "u_field_advect");
+    u_cld_fphase_  = glGetUniformLocation(cloud_prog_, "u_frame_phase");
     u_post_exp_    = glGetUniformLocation(post_prog_, "u_exposure");
     u_post_sun_uv_ = glGetUniformLocation(post_prog_, "u_sun_uv_vis");
     u_post_warm_   = glGetUniformLocation(post_prog_, "u_haze_warm");
@@ -80,19 +155,30 @@ bool SkyAndClouds::init(const std::string &shader_root, int win_w, int win_h, in
     GLenum db = GL_COLOR_ATTACHMENT0;
     glNamedFramebufferDrawBuffers(refl_fbo_, 1, &db);
 
-    alloc_fbos(win_w, win_h, quality, pixel_percent, aa_mode, weather_detail);
+    const std::vector<uint8_t> bn = build_void_and_cluster_64();
+    glCreateTextures(GL_TEXTURE_2D, 1, &blue_noise_tex_);
+    glTextureStorage2D(blue_noise_tex_, 1, GL_R8, 64, 64);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTextureSubImage2D(blue_noise_tex_, 0, 0, 0, 64, 64, GL_RED, GL_UNSIGNED_BYTE, bn.data());
+    glTextureParameteri(blue_noise_tex_, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTextureParameteri(blue_noise_tex_, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTextureParameteri(blue_noise_tex_, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTextureParameteri(blue_noise_tex_, GL_TEXTURE_WRAP_T, GL_REPEAT);
+
+    alloc_fbos(win_w, win_h, quality, pixel_percent, aa_mode, weather_detail, cloud_res_percent);
     return true;
 }
 
 void SkyAndClouds::shutdown() {
     free_fbos();
-    if (refl_fbo_)     { glDeleteFramebuffers(1, &refl_fbo_); refl_fbo_ = 0; }
-    if (refl_env_tex_) { glDeleteTextures(1, &refl_env_tex_); refl_env_tex_ = 0; }
-    if (sky_prog_)   { glDeleteProgram(sky_prog_);   sky_prog_ = 0; }
-    if (cloud_prog_) { glDeleteProgram(cloud_prog_); cloud_prog_ = 0; }
-    if (post_prog_)  { glDeleteProgram(post_prog_);  post_prog_ = 0; }
-    if (refl_prog_)  { glDeleteProgram(refl_prog_);  refl_prog_ = 0; }
-    if (dummy_vao_)  { glDeleteVertexArrays(1, &dummy_vao_); dummy_vao_ = 0; }
+    if (refl_fbo_)       { glDeleteFramebuffers(1, &refl_fbo_); refl_fbo_ = 0; }
+    if (refl_env_tex_)   { glDeleteTextures(1, &refl_env_tex_); refl_env_tex_ = 0; }
+    if (blue_noise_tex_) { glDeleteTextures(1, &blue_noise_tex_); blue_noise_tex_ = 0; }
+    if (sky_prog_)       { glDeleteProgram(sky_prog_);   sky_prog_ = 0; }
+    if (cloud_prog_)     { glDeleteProgram(cloud_prog_); cloud_prog_ = 0; }
+    if (post_prog_)      { glDeleteProgram(post_prog_);  post_prog_ = 0; }
+    if (refl_prog_)      { glDeleteProgram(refl_prog_);  refl_prog_ = 0; }
+    if (dummy_vao_)      { glDeleteVertexArrays(1, &dummy_vao_); dummy_vao_ = 0; }
 }
 
 void SkyAndClouds::free_fbos() {
@@ -113,14 +199,16 @@ void SkyAndClouds::free_fbos() {
     if (display_depth_) { glDeleteTextures(1, &display_depth_); display_depth_ = 0; }
 }
 
-void SkyAndClouds::alloc_fbos(int win_w, int win_h, int quality, int pixel_percent, int aa_mode, int weather_detail) {
+void SkyAndClouds::alloc_fbos(int win_w, int win_h, int quality, int pixel_percent, int aa_mode, int weather_detail, int cloud_res_percent) {
     free_fbos();
     cur_win_w_ = std::max(320, win_w);
     cur_win_h_ = std::max(240, win_h);
+    static constexpr int kPresetToCloudQ[4] = {0, 2, 4, 6};
     cur_quality_ = std::clamp(quality, 0, 3);
-    cloud_quality_ = weather_detail == 0 ? cur_quality_ : std::clamp(weather_detail - 1, 0, 3);
+    cloud_quality_ = weather_detail == 0 ? kPresetToCloudQ[cur_quality_] : std::clamp(weather_detail - 1, 0, 6);
     cur_pixel_percent_ = std::clamp(pixel_percent, 35, 150);
     cur_aa_mode_ = std::clamp(aa_mode, 0, 2);
+    cur_cloud_res_percent_ = (cloud_res_percent <= 0) ? 0 : std::clamp(cloud_res_percent, 35, 100);
 
     // Keep the output native while letting users select the shaded pixel budget (down to 35% laptop / up to 150% SSAA).
     // sqrt maps the requested pixel-area percentage onto both buffer dimensions.
@@ -128,22 +216,13 @@ void SkyAndClouds::alloc_fbos(int win_w, int win_h, int quality, int pixel_perce
     scene_w_ = std::max(320, static_cast<int>(cur_win_w_ * scale));
     scene_h_ = std::max(180, static_cast<int>(cur_win_h_ * scale));
 
-    // Preserve fine cloud silhouettes on discrete-GPU tiers. Balanced keeps
-    // enough cloud pixels for stable temporal reconstruction while leaving
-    // margin for its higher in-cloud raymarch cost on laptop GPUs.
-    if (cloud_quality_ >= 3) {
-        cloud_w_ = std::max(160, (scene_w_ * 3) / 4);
-        cloud_h_ = std::max(90,  (scene_h_ * 3) / 4);
-    } else if (cloud_quality_ == 2) {
-        cloud_w_ = std::max(160, (scene_w_ * 2) / 3);
-        cloud_h_ = std::max(90,  (scene_h_ * 2) / 3);
-    } else if (cloud_quality_ == 1) {
-        cloud_w_ = std::max(160, (scene_w_ * 46) / 100);
-        cloud_h_ = std::max(90,  (scene_h_ * 46) / 100);
-    } else {
-        cloud_w_ = std::max(160, (scene_w_ * 40) / 100);
-        cloud_h_ = std::max(90,  (scene_h_ * 40) / 100);
-    }
+    // Scale volumetric cloud resolution proportionally from scene dimensions (never hardcoded px limits),
+    // honoring explicit Settings overrides across 1080p, 1440p, and 4K displays across 7 smooth tiers.
+    static constexpr int kAutoCloudPct[7] = {32, 36, 42, 52, 68, 84, 100};
+    const int auto_cloud_pct = kAutoCloudPct[std::clamp(cloud_quality_, 0, 6)];
+    const int cloud_pct = cur_cloud_res_percent_ > 0 ? cur_cloud_res_percent_ : auto_cloud_pct;
+    cloud_w_ = std::max(160, (scene_w_ * cloud_pct) / 100);
+    cloud_h_ = std::max(90,  (scene_h_ * cloud_pct) / 100);
 
     glCreateTextures(GL_TEXTURE_2D, 1, &scene_col_);
     glTextureStorage2D(scene_col_, 1, GL_RGBA16F, scene_w_, scene_h_);
@@ -237,12 +316,16 @@ void SkyAndClouds::alloc_fbos(int win_w, int win_h, int quality, int pixel_perce
     post_ping_ = 0;
 }
 
-void SkyAndClouds::resize_if_needed(int win_w, int win_h, int quality, int pixel_percent, int aa_mode, int weather_detail) {
+void SkyAndClouds::resize_if_needed(int win_w, int win_h, int quality, int pixel_percent, int aa_mode, int weather_detail, int cloud_res_percent) {
     pixel_percent = std::clamp(pixel_percent, 35, 150);
     aa_mode = std::clamp(aa_mode, 0, 2);
+    const int norm_cloud_res = (cloud_res_percent <= 0) ? 0 : std::clamp(cloud_res_percent, 35, 100);
+    static constexpr int kPresetToCloudQ[4] = {0, 2, 4, 6};
+    const int target_cloud_q = weather_detail == 0 ? kPresetToCloudQ[std::clamp(quality, 0, 3)] : std::clamp(weather_detail - 1, 0, 6);
     if (win_w != cur_win_w_ || win_h != cur_win_h_ || quality != cur_quality_ || pixel_percent != cur_pixel_percent_ ||
-        cloud_quality_ != (weather_detail == 0 ? quality : std::clamp(weather_detail - 1, 0, 3))) {
-        alloc_fbos(win_w, win_h, quality, pixel_percent, aa_mode, weather_detail);
+        cloud_quality_ != target_cloud_q ||
+        norm_cloud_res != cur_cloud_res_percent_) {
+        alloc_fbos(win_w, win_h, quality, pixel_percent, aa_mode, weather_detail, norm_cloud_res);
     } else if (aa_mode != cur_aa_mode_) {
         cur_aa_mode_ = aa_mode;
         post_history_valid_ = false;
@@ -253,7 +336,8 @@ void SkyAndClouds::resize_if_needed(int win_w, int win_h, int quality, int pixel
 void SkyAndClouds::update_solar_and_weather(
     double lat_deg, double lon_deg, double ground_m,
     int tod_slot, double sim_time_sec, float fog_regime_mult, float wx_advance01,
-    const WeatherSnapshot *baked, int season_override, double day_cycle_elapsed_sec
+    const WeatherSnapshot *baked, int season_override, double day_cycle_elapsed_sec,
+    const Vec2 *cloud_steer_wind_en_mps
 ) {
     atmo_.fair_vfr = (tod_slot < 0 || (tod_slot >= 0 && tod_slot <= 9));
 
@@ -351,31 +435,42 @@ void SkyAndClouds::update_solar_and_weather(
     float wx = std::clamp(wx_advance01, 0.0f, 1.0f);
     if (cloud_advect_time_ < 0.0 || sim_time_sec + 1e-4 < cloud_advect_time_) {
         cloud_advect_en_ = {0.0f, 0.0f};
+        cloud_steer_wind_init_ = false;
         cloud_advect_time_ = sim_time_sec;
     } else {
         const float adv_dt = static_cast<float>(std::clamp(sim_time_sec - cloud_advect_time_, 0.0, 2.0));
         cloud_advect_time_ = sim_time_sec;
         float wx_u = 9.5f, wx_v = 4.2f;
-        if (baked) {
+        if (cloud_steer_wind_en_mps) {
+            // Follow the exact mid-cloud steering wind (0.56*L1 + 0.44*L2) from the solved mesoscale weather field.
+            wx_u = std::clamp(cloud_steer_wind_en_mps->x, -45.0f, 45.0f);
+            wx_v = std::clamp(cloud_steer_wind_en_mps->y, -45.0f, 45.0f);
+        } else if (baked) {
             const double dir = baked->wind_dir_from_deg * DEG2RAD_D;
             const float spd = std::clamp(baked->wind_speed_10m_mps * 1.08f, 1.5f, 35.0f);
             wx_u = static_cast<float>(-std::sin(dir) * spd);
             wx_v = static_cast<float>(-std::cos(dir) * spd);
         }
-        cloud_advect_en_.x += wx_u * adv_dt;
-        cloud_advect_en_.y += wx_v * adv_dt;
+        if (!cloud_steer_wind_init_) {
+            cloud_steer_wind_en_ = {wx_u, wx_v};
+            cloud_steer_wind_init_ = true;
+        } else if (adv_dt > 0.0f) {
+            const float w_alpha = static_cast<float>(1.0 - std::exp(-adv_dt / 2.0f));
+            cloud_steer_wind_en_.x = std::lerp(cloud_steer_wind_en_.x, wx_u, w_alpha);
+            cloud_steer_wind_en_.y = std::lerp(cloud_steer_wind_en_.y, wx_v, w_alpha);
+        }
+        cloud_advect_en_.x += cloud_steer_wind_en_.x * adv_dt;
+        cloud_advect_en_.y += cloud_steer_wind_en_.y * adv_dt;
     }
     const bool live_open_meteo = baked && baked->label.rfind("LIVE OPEN-METEO", 0) == 0;
     if (baked) {
-        float dyn_osc = 0.015f * std::sin(static_cast<float>(sim_time_sec) * 0.015f);
-        wx = std::clamp(wx + dyn_osc, 0.0f, 1.0f);
-        atmo_.cloud_cov = std::clamp(baked->cloud_cov + 0.015f * std::sin(static_cast<float>(sim_time_sec) * 0.02f), 0.05f, 0.98f);
+        atmo_.cloud_cov = std::clamp(baked->cloud_cov, 0.02f, 0.99f);
         atmo_.precip = baked->precip;
         double base = live_open_meteo
             ? ground_m + std::max(320.0, static_cast<double>(baked->cloud_base_m))
-            : std::max(static_cast<double>(ground_m + 340.0), static_cast<double>(baked->cloud_base_m) - ground_m * 0.08);
-        atmo_.cloud_base_m = static_cast<float>(std::clamp(base, 820.0, 3200.0));
-        atmo_.cloud_thick_m = std::clamp(baked->cloud_thick_m, 900.0f, 3200.0f);
+            : std::max(static_cast<double>(ground_m + 320.0), static_cast<double>(baked->cloud_base_m) - ground_m * 0.06);
+        atmo_.cloud_base_m = static_cast<float>(std::clamp(base, 720.0, 3400.0));
+        atmo_.cloud_thick_m = std::clamp(baked->cloud_thick_m, 900.0f, 3800.0f);
     } else {
         float dyn_osc = 0.055f * std::sin(static_cast<float>(sim_time_sec) * 0.028f) +
                         0.035f * std::cos(static_cast<float>(sim_time_sec) * 0.067f);
@@ -412,12 +507,12 @@ void SkyAndClouds::update_solar_and_weather(
     float storm_dim = std::lerp(1.0f, 0.66f, atmo_.precip);
     atmo_.haze_cool = mix(Vec3(0.004f, 0.008f, 0.022f), mix(Vec3(0.28f, 0.48f, 0.80f), Vec3(0.32f, 0.56f, 0.90f), high_t), day_t) * storm_dim;
     atmo_.haze_warm = mix(Vec3(0.014f, 0.016f, 0.028f), mix(Vec3(1.0f, 0.60f, 0.28f), Vec3(1.0f, 0.90f, 0.72f), high_t), day_t) * storm_dim;
-    atmo_.cloud_lit = mix(Vec3(0.012f, 0.018f, 0.038f), mix(Vec3(1.0f, 0.76f, 0.48f), Vec3(1.0f, 0.98f, 0.94f), high_t), day_t);
-    atmo_.cloud_shadow = mix(Vec3(0.003f, 0.005f, 0.012f), mix(Vec3(0.32f, 0.40f, 0.58f), Vec3(0.42f, 0.52f, 0.68f), high_t), day_t);
-    float cloud_weather = std::clamp(smooth01(0.12f, 0.78f, atmo_.precip) * 0.76f +
-                                     smooth01(0.54f, 0.92f, atmo_.cloud_cov) * 0.22f, 0.0f, 0.90f);
-    atmo_.cloud_lit = mix(atmo_.cloud_lit, Vec3(0.54f, 0.61f, 0.69f) * std::lerp(0.72f, 1.0f, day_t), cloud_weather);
-    atmo_.cloud_shadow = mix(atmo_.cloud_shadow, Vec3(0.075f, 0.092f, 0.125f) * std::lerp(0.72f, 1.0f, day_t), cloud_weather);
+    atmo_.cloud_lit = mix(Vec3(0.014f, 0.020f, 0.042f), mix(Vec3(1.32f, 0.86f, 0.50f), Vec3(1.26f, 1.22f, 1.15f), high_t), day_t);
+    atmo_.cloud_shadow = mix(Vec3(0.004f, 0.007f, 0.016f), mix(Vec3(0.18f, 0.25f, 0.42f), Vec3(0.24f, 0.34f, 0.54f), high_t), day_t);
+    float cloud_weather = std::clamp(smooth01(0.18f, 0.85f, atmo_.precip) * 0.56f +
+                                     smooth01(0.76f, 0.98f, atmo_.cloud_cov) * 0.12f, 0.0f, 0.64f);
+    atmo_.cloud_lit = mix(atmo_.cloud_lit, Vec3(0.84f, 0.90f, 0.98f) * std::lerp(0.78f, 1.0f, day_t), cloud_weather);
+    atmo_.cloud_shadow = mix(atmo_.cloud_shadow, Vec3(0.09f, 0.115f, 0.165f) * std::lerp(0.72f, 1.0f, day_t), cloud_weather);
     float haze_mult = baked ? std::clamp(baked->haze_mult, 0.55f, 2.2f) : std::lerp(0.82f, 2.35f, wx);
     atmo_.haze_density = std::clamp(0.000014f * fog_regime_mult * haze_mult * std::lerp(1.22f, 0.88f, high_t), 0.000009f, 0.000095f);
     atmo_.exposure = std::lerp(1.12f, std::lerp(1.18f, 1.14f, high_t), day_t);
@@ -527,7 +622,7 @@ void SkyAndClouds::render_clouds_and_post(
     GLuint cloud_noise_tex, GLuint cloud_vol_tex, GLuint cloud_detail_tex, GLuint lut_tex,
     GLuint atmo_field_tex, GLuint atmo_terrain_tex, const Vec4 &atmo_domain,
     GLuint local_atmo_field_tex, GLuint local_atmo_terrain_tex, const Vec4 &local_atmo_domain,
-    float time_sec, const Vec4 &wx_fx
+    float time_sec, const Vec4 &wx_fx, float step_scale, uint64_t atmo_field_gen
 ) {
     Vec3 camera_delta{0.0f, 0.0f, 0.0f};
     if (prev_camera_valid_) {
@@ -549,7 +644,8 @@ void SkyAndClouds::render_clouds_and_post(
     const float camera_turn_rad = prev_camera_valid_ ? std::acos(forward_dot) : 0.0f;
     const float temporal_blend = (!history_valid_ || camera_step_m > 40.0)
         ? 0.0f
-        : std::clamp(0.68f - static_cast<float>(camera_step_m) * 0.008f - camera_turn_rad * 2.5f, 0.35f, 0.68f);
+        : std::clamp(0.86f - static_cast<float>(camera_step_m) * 0.004f - camera_turn_rad * 1.2f, 0.58f, 0.86f);
+    const float frame_phase = static_cast<float>(std::fmod(static_cast<double>(cloud_frame_idx_++) * 0.618033988749895, 1.0));
     // Blend the cloud renderer's inputs between weather solves. The model
     // snapshot used for flight dynamics and weather readouts stays intact.
     const double cloud_dt = time_sec - cloud_filter_time_;
@@ -588,8 +684,10 @@ void SkyAndClouds::render_clouds_and_post(
     glUniform1f(u_cld_precip_, cloud_precip_);
     glUniform1f(u_cld_time_, time_sec);
     glUniform1f(u_cld_tblend_, temporal_blend);
-    static constexpr GLint kCloudSteps[4] = {8, 14, 24, 36};
-    glUniform1i(u_cld_steps_, kCloudSteps[std::clamp(cloud_quality_, 0, 3)]);
+    static constexpr GLint kCloudSteps[7] = {18, 22, 26, 32, 38, 44, 52};
+    const int base_steps = kCloudSteps[std::clamp(cloud_quality_, 0, 6)];
+    const int scaled_steps = std::clamp(static_cast<int>(std::lround(base_steps * std::clamp(step_scale, 0.78f, 1.05f))), 16, 52);
+    glUniform1i(u_cld_steps_, scaled_steps);
     glUniform3f(u_cld_lit_, atmo_.cloud_lit.x, atmo_.cloud_lit.y, atmo_.cloud_lit.z);
     glUniform3f(u_cld_sh_, atmo_.cloud_shadow.x, atmo_.cloud_shadow.y, atmo_.cloud_shadow.z);
     glUniform3f(u_cld_cool_, atmo_.haze_cool.x, atmo_.haze_cool.y, atmo_.haze_cool.z);
@@ -598,7 +696,20 @@ void SkyAndClouds::render_clouds_and_post(
     glUniform4f(u_cld_local_dom_, local_atmo_domain.x, local_atmo_domain.y,
                 local_atmo_domain.z, local_atmo_domain.w);
     glUniform4f(u_cld_wx_fx_, wx_fx.x, wx_fx.y, wx_fx.z, wx_fx.w);
+    if (atmo_field_gen != last_atmo_field_gen_) {
+        last_atmo_field_gen_ = atmo_field_gen;
+        field_pub_advect_en_ = cloud_advect_en_;
+    }
+    Vec2 field_sub = cloud_advect_en_ - field_pub_advect_en_;
+    const float field_sub_len = std::hypot(field_sub.x, field_sub.y);
+    if (field_sub_len > 250.0f) {
+        const float s = 250.0f / field_sub_len;
+        field_sub.x *= s;
+        field_sub.y *= s;
+    }
     glUniform2f(u_cld_advect_, -cloud_advect_en_.x, -cloud_advect_en_.y);
+    if (u_cld_field_advect_ >= 0) glUniform2f(u_cld_field_advect_, -field_sub.x, -field_sub.y);
+    glUniform1f(u_cld_fphase_, frame_phase);
 
     glBindTextureUnit(0, cloud_noise_tex);
     glBindTextureUnit(1, cloud_vol_tex);
@@ -609,6 +720,7 @@ void SkyAndClouds::render_clouds_and_post(
     glBindTextureUnit(6, cloud_detail_tex);
     glBindTextureUnit(7, local_atmo_field_tex);
     glBindTextureUnit(8, local_atmo_terrain_tex);
+    glBindTextureUnit(9, blue_noise_tex_);
     glBindVertexArray(dummy_vao_);
     glDrawArrays(GL_TRIANGLES, 0, 3);
 
@@ -658,6 +770,7 @@ void SkyAndClouds::render_clouds_and_post(
     // Draw HUD and read captures from the resolved image. The display FBO
     // shares the color target and has no temporal history attachment.
     glBindFramebuffer(GL_FRAMEBUFFER, display_fbo_);
+    glViewport(0, 0, cur_win_w_, cur_win_h_);
     glBindVertexArray(0);
     post_history_valid_ = true;
     post_ping_ = post_src;

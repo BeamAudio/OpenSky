@@ -40,15 +40,17 @@ public:
     ~SkyAndClouds();
 
     bool init(const std::string &shader_root, int win_w, int win_h, int quality,
-              int pixel_percent = 60, int aa_mode = 2, int weather_detail = 0);
+              int pixel_percent = 60, int aa_mode = 2, int weather_detail = 0, int cloud_res_percent = 0);
     void shutdown();
-    void resize_if_needed(int win_w, int win_h, int quality, int pixel_percent = 60, int aa_mode = 2, int weather_detail = 0);
+    void resize_if_needed(int win_w, int win_h, int quality, int pixel_percent = 60, int aa_mode = 2,
+                          int weather_detail = 0, int cloud_res_percent = 0);
 
     void update_solar_and_weather(
         double lat_deg, double lon_deg, double ground_m,
         int tod_slot, double sim_time_sec, float fog_regime_mult = 1.0f, float wx_advance01 = 0.28f,
         const WeatherSnapshot *baked = nullptr, int season_override = -1,
-        double day_cycle_elapsed_sec = -1.0
+        double day_cycle_elapsed_sec = -1.0,
+        const Vec2 *cloud_steer_wind_en_mps = nullptr
     );
     void reset_temporal_history() {
         history_valid_ = post_history_valid_ = prev_camera_valid_ = false;
@@ -71,7 +73,9 @@ public:
         GLuint atmo_field_tex, GLuint atmo_terrain_tex, const Vec4 &atmo_domain,
         GLuint local_atmo_field_tex, GLuint local_atmo_terrain_tex, const Vec4 &local_atmo_domain,
         float time_sec,
-        const Vec4 &wx_fx = {0.0f, 0.0f, 0.0f, 0.0f}
+        const Vec4 &wx_fx = {0.0f, 0.0f, 0.0f, 0.0f},
+        float step_scale = 1.0f,
+        uint64_t atmo_field_gen = 0
     );
     // Draw a native-resolution cockpit over the reconstructed world image.
     void begin_native_cockpit_pass();
@@ -86,7 +90,7 @@ public:
     int cloud_h() const { return cloud_h_; }
 
 private:
-    void alloc_fbos(int win_w, int win_h, int quality, int pixel_percent, int aa_mode, int weather_detail);
+    void alloc_fbos(int win_w, int win_h, int quality, int pixel_percent, int aa_mode, int weather_detail, int cloud_res_percent = 0);
     void free_fbos();
 
     GLuint sky_prog_ = 0;
@@ -94,6 +98,7 @@ private:
     GLuint post_prog_ = 0;
     GLuint refl_prog_ = 0;
     GLuint dummy_vao_ = 0;
+    GLuint blue_noise_tex_ = 0;
 
     // Cached GL uniform locations (ZERO per-frame glGetUniformLocation string lookups!)
     GLint u_sky_inv_vp_ = -1, u_sky_sun_ = -1, u_sky_cool_ = -1, u_sky_warm_ = -1, u_sky_cov_ = -1;
@@ -103,6 +108,9 @@ private:
     GLint u_cld_tblend_ = -1, u_cld_steps_ = -1;
     GLint u_cld_lit_ = -1, u_cld_sh_ = -1, u_cld_cool_ = -1, u_cld_warm_ = -1, u_cld_dom_ = -1, u_cld_local_dom_ = -1, u_cld_wx_fx_ = -1;
     GLint u_cld_advect_ = -1;
+    GLint u_cld_field_advect_ = -1;
+    GLint u_cld_fphase_ = -1;
+    uint32_t cloud_frame_idx_ = 0;
     GLint u_post_exp_ = -1, u_post_sun_uv_ = -1, u_post_warm_ = -1;
     GLint u_post_inv_vp_ = -1, u_post_prev_vp_ = -1, u_post_camera_delta_ = -1;
     GLint u_post_history_valid_ = -1, u_post_aa_mode_ = -1;
@@ -132,6 +140,10 @@ private:
     double prev_cam_east_m_ = 0.0, prev_cam_north_m_ = 0.0, prev_cam_alt_m_ = 0.0;
     Vec2 cloud_advect_en_{0.0f, 0.0f};
     Vec2 prev_cloud_advect_en_{0.0f, 0.0f};
+    Vec2 field_pub_advect_en_{0.0f, 0.0f};
+    uint64_t last_atmo_field_gen_ = 0;
+    Vec2 cloud_steer_wind_en_{0.0f, 0.0f};
+    bool cloud_steer_wind_init_ = false;
     double cloud_advect_time_ = -1.0;
     double cloud_filter_time_ = -1.0;
     float cloud_base_ = 0.0f, cloud_thickness_ = 0.0f, cloud_coverage_ = 0.0f, cloud_precip_ = 0.0f;
@@ -158,6 +170,7 @@ private:
     int cur_win_w_ = 0, cur_win_h_ = 0;
     int cloud_quality_ = 2;
     int cur_pixel_percent_ = 60, cur_aa_mode_ = 2;
+    int cur_cloud_res_percent_ = 0;
 
     AtmosphereState atmo_{};
 };

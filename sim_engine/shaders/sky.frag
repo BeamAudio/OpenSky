@@ -28,11 +28,11 @@ void main() {
     // Physically-inspired Mediterranean Rayleigh zenith-to-horizon sky gradient + Henyey-Greenstein Mie solar corona!
     vec3 zenith_day = mix(vec3(0.048, 0.18, 0.58), vec3(0.052, 0.23, 0.76), high_t);
     vec3 zenith_night = vec3(0.0018, 0.0035, 0.011);
-    float overcast = smoothstep(0.42, 0.92, u_cloud_cov);
+    float overcast = smoothstep(0.64, 0.96, u_cloud_cov);
     vec3 zenith = mix(zenith_night, zenith_day, day_t);
-    zenith = mix(zenith, vec3(0.22, 0.27, 0.34) * mix(0.68, 1.0, day_t), overcast * 0.78);
+    zenith = mix(zenith, vec3(0.24, 0.30, 0.38) * mix(0.72, 1.0, day_t), overcast * 0.56);
     vec3 horiz_col = mix(u_haze_cool * 0.72, mix(u_haze_cool, u_haze_warm, 0.28 * day_t), day_t);
-    horiz_col = mix(horiz_col, vec3(0.42, 0.46, 0.52) * mix(0.72, 1.0, day_t), overcast * 0.64);
+    horiz_col = mix(horiz_col, vec3(0.46, 0.50, 0.56) * mix(0.76, 1.0, day_t), overcast * 0.48);
 
     float ray_t = pow(1.0 - elev, 2.8);
     vec3 sky = mix(zenith, horiz_col * mix(0.85, 1.18, day_t), ray_t);

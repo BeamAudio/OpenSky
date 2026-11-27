@@ -46,6 +46,8 @@ struct GlbMeshData {
     std::vector<GlbNode> nodes;
     std::unordered_map<std::string, int> node_index;
     std::vector<GlbSubmesh> submeshes;
+    std::vector<float> cpu_verts;
+    std::vector<uint32_t> cpu_indices;
 };
 
 // GPU-Driven World Objects:
@@ -67,10 +69,25 @@ public:
         std::vector<float> rv;
         std::vector<float> lv;
     };
+    struct StagedReanchorUpload {
+        PreparedReanchor data;
+        GLuint buildings = 0;
+        GLuint runways = 0;
+        GLuint landmarks = 0;
+        size_t buildings_uploaded = 0;
+        size_t runways_uploaded = 0;
+        size_t landmarks_uploaded = 0;
+        int phase = 0;
+    };
 
     bool init(const PackReader *pack, const std::string &asset_root, const std::string &shader_root, const std::string &pack_dir = "packs");
     PreparedReanchor prepare_reanchor_cpu(const PackReader::WorldFrame &frame) const;
     void commit_reanchor(PreparedReanchor &&prep);
+    void begin_staged_reanchor_upload(PreparedReanchor &&prep);
+    void pump_staged_reanchor_upload(size_t byte_budget = 512 * 1024);
+    bool staged_reanchor_upload_ready() const { return staged_reanchor_.phase >= 3; }
+    void commit_staged_reanchor_upload();
+    void cancel_staged_reanchor_upload();
     void on_reanchor();
     void shutdown();
 
@@ -78,15 +95,27 @@ public:
         const Mat4 &vp, const Frustum &frustum,
         double cam_east_m, double cam_north_m, double cam_alt_m,
         const AtmosphereState &atmo, float time_sec, const Vec2 &wind_en_mps, GLuint refl_env_tex, int quality,
-        int max_new_tree_cells = 1, int world_detail = -1
+        int max_new_tree_cells = 1, int world_detail = -1,
+        float dist_scale = 1.0f, int road_quality = -1
     );
+    void cancel_road_stream();
     void set_anisotropy(int max_aniso);
 
     // Load a colored .glb (used by AircraftHud for C172S exterior & cockpit!)
-    static bool load_colored_glb(const std::string &path, GlbMeshData &out);
+    static bool load_colored_glb(const std::string &path, GlbMeshData &out, bool keep_cpu_geom = false);
 
     int total_buildings() const { return total_bldgs_ + baked_city_bldgs_; }
     int active_cars() const { return active_cars_; }
+    int active_city_regions() const {
+        int n = 0;
+        for (const auto &cr : city_regions_) if (cr.gpu_streamed) ++n;
+        return n;
+    }
+    int streamed_city_chunks() const {
+        int n = 0;
+        for (const auto &cr : city_regions_) if (cr.gpu_streamed) n += static_cast<int>(cr.chunks.size());
+        return n;
+    }
 
 private:
     struct DrawCmd {
@@ -170,6 +199,20 @@ private:
         GLuint vbo = 0, ebo = 0;
         size_t uploaded = 0;
     };
+    struct PreparedRoads {
+        std::vector<RoadVert> rv;
+        std::vector<RoadSeg> segs;
+        std::vector<std::vector<uint32_t>> adj;
+        std::vector<TrafficAgent> agents;
+        double ce = 0.0, cn = 0.0;
+        int q = -1;
+    };
+    struct RoadStream {
+        bool pending = false;
+        double ce = 0.0, cn = 0.0;
+        int q = -1;
+        std::future<PreparedRoads> job;
+    };
 
     static constexpr int MAX_PER_ARCH = 16000;
     static constexpr int MAX_LOD1 = 65536;
@@ -197,11 +240,18 @@ private:
     void upload_buildings_gpu(const std::vector<BldgGpu> &gpu_b);
     void upload_runways_gpu(const std::vector<float> &rv);
     void upload_landmarks_gpu(const std::vector<float> &lv);
+    GLuint create_runway_vao(GLuint vbo);
+    GLuint create_landmark_vao(GLuint vbo);
     void build_car_mesh();
+    static PreparedRoads build_roads_cpu(const PackReader *pack, std::shared_ptr<const PackReader::WorldFrame> frame,
+                                         double cam_e, double cam_n, int quality);
+    static void plan_vehicle_route_on(const std::vector<RoadSeg> &segs, const std::vector<std::vector<uint32_t>> &adj,
+                                      TrafficAgent &ag, bool random_progress);
     void rebuild_local_roads_and_traffic(double cam_e, double cam_n, int quality);
     void plan_vehicle_route(TrafficAgent &ag, bool random_progress);
 
     const PackReader *pack_ = nullptr;
+    StagedReanchorUpload staged_reanchor_{};
 
     // GPU-driven OSM buildings + 1-call GPU-instanced directional ground shadows & contact AO
     GLuint cull_comp_ = 0;
@@ -240,6 +290,7 @@ private:
     int road_last_q_ = -1;
     std::vector<RoadSeg> active_segs_;
     std::vector<std::vector<uint32_t>> road_adj_;
+    RoadStream road_stream_;
     float prev_traffic_t_ = -1.0f;
 
     GLuint traffic_prog_ = 0;

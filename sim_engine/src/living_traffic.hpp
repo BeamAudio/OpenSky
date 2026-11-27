@@ -35,6 +35,20 @@ public:
     int active_aircraft() const { return active_aircraft_; }
     int active_ships() const { return active_ships_; }
 
+    struct NearestAircraftSample {
+        bool valid = false;
+        float dist_m = 1e6f;
+        float rel_east_m = 0.0f;
+        float rel_up_m = 0.0f;
+        float rel_north_m = 0.0f;
+        float vel_east_mps = 0.0f;
+        float vel_up_mps = 0.0f;
+        float vel_north_mps = 0.0f;
+        float rpm_hint = 0.0f;
+        bool is_airliner = false;
+    };
+    NearestAircraftSample nearest_aircraft(double listener_lat_deg, double listener_lon_deg, double listener_alt_m) const;
+
     // Headless deterministic self-check for `--selftest` (no GL context required).
     static bool run_selftest(const PackReader &pack);
 

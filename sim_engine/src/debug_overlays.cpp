@@ -2,6 +2,7 @@
 #include "flight_profiler.hpp"
 
 #include <cstdio>
+#include <cstring>
 
 namespace nsim {
 
@@ -30,11 +31,17 @@ void AircraftAndHud::hud_arrow(Vec2 a, Vec2 b, float width, Vec3 color) {
 
 void AircraftAndHud::render_debug_overlays(float w, float h, float top, const RegionalAtmosphere &atmo,
                                             const DebugOverlayView &view) {
-    const float scale = std::min(w / 1920.0f, h / 1080.0f);
+    const bool portrait = (w < h);
+    const bool promo = (view.promo_mode != PromoInspectMode::None);
+    const float scale = portrait
+        ? std::clamp(w / 1080.0f, 0.78f, 1.35f)
+        : std::min(w / 1920.0f, h / 1080.0f);
     const float pad = 16.0f * scale, font = 18.0f * scale, row = 21.0f * scale;
-    const Vec3 white{0.89f, 0.94f, 0.98f}, green{0.48f, 0.98f, 0.68f}, blue{0.47f, 0.80f, 1.0f};
-    const Vec3 yellow{1.0f, 0.79f, 0.36f}, red{1.0f, 0.45f, 0.38f};
-    char line[176];
+    const Vec3 white{0.92f, 0.96f, 0.99f}, muted{0.62f, 0.72f, 0.82f};
+    const Vec3 green{0.34f, 0.96f, 0.58f}, blue{0.32f, 0.84f, 1.0f};
+    const Vec3 yellow{1.0f, 0.79f, 0.34f}, orange{1.0f, 0.50f, 0.24f}, red{1.0f, 0.36f, 0.34f};
+    const Vec3 violet{0.72f, 0.52f, 1.0f};
+    char line[200];
     auto project = [&](Vec3 point, Vec2 &screen) {
         const Vec4 clip = view.projection_view.mul({point.x, point.y, point.z, 1.0f});
         if (clip.w <= 0.13f || !std::isfinite(clip.w) ||
@@ -42,12 +49,19 @@ void AircraftAndHud::render_debug_overlays(float w, float h, float top, const Re
         screen = {(clip.x / clip.w + 1.0f) * w * 0.5f, (1.0f - clip.y / clip.w) * h * 0.5f};
         return true;
     };
-    auto text_at = [&](float x, float y, const char *msg, Vec3 color) {
-        hud_text(x, y, font, msg, color.x, color.y, color.z, 1.0f);
+    auto text_at = [&](float x, float y, const char *msg, Vec3 color, float fh = -1.0f) {
+        hud_text(x, y, fh > 0.0f ? fh : font, msg, color.x, color.y, color.z, 1.0f);
     };
-    auto panel = [&](float x, float y, float width, float height, Vec3 color) {
-        hud_rect(x, y, width, height, 0.022f, 0.045f, 0.068f, 0.92f);
-        hud_border(x, y, width, height, scale, color.x, color.y, color.z, 0.65f);
+    auto panel = [&](float x, float y, float width, float height, Vec3 color, float bg_a = 0.92f) {
+        hud_rect(x, y, width, height, 0.018f, 0.036f, 0.058f, bg_a);
+        hud_border(x, y, width, height, std::max(1.2f, 1.5f * scale), color.x, color.y, color.z, 0.72f);
+        hud_rect(x, y, width, std::max(2.5f, 3.5f * scale), color.x, color.y, color.z, 0.95f);
+    };
+    auto draw_bar = [&](float x, float y, float bw, float bh, float frac, Vec3 col) {
+        hud_rect(x, y, bw, bh, 0.06f, 0.10f, 0.16f, 0.95f);
+        const float fill = std::clamp(frac, 0.0f, 1.0f) * bw;
+        if (fill > 0.5f) hud_rect(x, y, fill, bh, col.x, col.y, col.z, 0.94f);
+        hud_border(x, y, bw, bh, 1.0f * scale, 0.25f, 0.40f, 0.55f, 0.65f);
     };
 
     if (view.weather_volume_3d) {
@@ -130,7 +144,7 @@ void AircraftAndHud::render_debug_overlays(float w, float h, float top, const Re
         }
 
         // Dense, pre-seeded RK2 flow lines advected through the published 4-layer field across the camera frustum.
-        static constexpr size_t kTracesPerLevel[4] = {40, 28, 18, 12};
+        static constexpr size_t kTracesPerLevel[4] = {64, 48, 36, 24};
         static constexpr size_t kTraceCount = kTracesPerLevel[0] + kTracesPerLevel[1] + kTracesPerLevel[2] + kTracesPerLevel[3];
         const float cam_agl = std::max(1200.0f, static_cast<float>(st_.alt_msl_m - st_.ground_m));
         const float half_v = slices[0].locally_refined
@@ -261,7 +275,8 @@ void AircraftAndHud::render_debug_overlays(float w, float h, float top, const Re
             }
         }
 
-        const float x = wx_pad, y = wx_pad, pw = 760.0f * wx_scale, ph = 5.95f * wx_row;
+        if (!promo) {
+        const float x = wx_pad, y = wx_pad, pw = std::min(w - 2.0f * wx_pad, 760.0f * wx_scale), ph = 5.95f * wx_row;
         hud_rect(x, y, pw, ph, 0.012f, 0.027f, 0.046f, 0.97f);
         hud_border(x, y, pw, ph, 2.0f * wx_scale, 0.35f, 0.78f, 1.0f, 0.92f);
         if (slices[0].locally_refined) {
@@ -303,6 +318,7 @@ void AircraftAndHud::render_debug_overlays(float w, float h, float top, const Re
         const int model_seconds = static_cast<int>(std::max(0.0, view.simulation_time_s)) % 60;
         std::snprintf(line, sizeof(line), "MODEL TIME  +%02d:%02d", model_minutes, model_seconds);
         wx_text(x + wx_pad, y + wx_row * 5.12f, line, yellow);
+        }
     } else if (view.weather_level >= 0) {
         const auto slice = atmo.debug_slice(view.east_m, view.north_m, view.weather_level);
         const WeatherDebugCell &center = slice.cells[slice.cells.size() / 2];
@@ -378,15 +394,15 @@ void AircraftAndHud::render_debug_overlays(float w, float h, float top, const Re
         auto vector = [&](Vec3 start, Vec3 end, Vec3 color, const char *name) {
             Vec2 a, b;
             if (!project(start, a) || !project(end, b)) return;
-            hud_arrow(a, b, 2.0f * scale, color);
-            text_at(b.x + 4.0f * scale, b.y, name, color);
+            hud_arrow(a, b, (promo ? 4.2f : 2.0f) * scale, color);
+            text_at(b.x + 6.0f * scale, b.y - 6.0f * scale, name, color, (promo ? 24.0f : 18.0f) * scale);
         };
         if (!st_.slew_fast && st_.view_mode == 1) {
-            vector({}, body({2.8f, 0, 0}), red, "RIGHT");
-            vector({}, body({0, 2.5f, 0}), green, "UP");
-            vector({}, body({0, 0, -4.5f}), white, "FWD");
-            if (length(air) > 0.5f) vector({}, normalize(air) * 6.5f, blue, "AIR PATH");
-            if (f.thrust_n > 1.0) vector(body({0, 0, -1.4f}), body({0, 0, -1.4f - static_cast<float>(f.thrust_n * 0.002)}), yellow, "THRUST");
+            vector({}, body({3.0f, 0, 0}), red, "RIGHT");
+            vector({}, body({0, 2.8f, 0}), green, "UP / LIFT");
+            vector({}, body({0, 0, -4.8f}), white, "FWD");
+            if (length(air) > 0.5f) vector({}, normalize(air) * 7.2f, blue, "AIR PATH");
+            if (f.thrust_n > 1.0) vector(body({0, 0, -1.4f}), body({0, 0, -1.4f - static_cast<float>(f.thrust_n * 0.0022)}), yellow, "THRUST");
             for (size_t i = 0; i < f.wheel_wow.size(); ++i) {
                 const auto &wheel = f.wheel_offset_m[i];
                 const Vec3 hub = body({static_cast<float>(wheel[1]),
@@ -395,7 +411,12 @@ void AircraftAndHud::render_debug_overlays(float w, float h, float top, const Re
                 Vec2 marker;
                 if (project(hub, marker)) {
                     const auto c = f.wheel_wow[i] ? green : red;
-                    hud_rect(marker.x - 3 * scale, marker.y - 3 * scale, 6 * scale, 6 * scale, c.x, c.y, c.z, 0.95f);
+                    const float hs = (promo ? 6.0f : 3.0f) * scale;
+                    hud_rect(marker.x - hs, marker.y - hs, 2.0f * hs, 2.0f * hs, c.x, c.y, c.z, 0.95f);
+                    if (promo) {
+                        static constexpr const char *kWn[3] = {"NOSE", "L", "R"};
+                        text_at(marker.x + 8.0f * scale, marker.y - 6.0f * scale, kWn[i], c, 15.0f * scale);
+                    }
                 }
             }
         } else if (!st_.slew_fast && st_.view_mode == 0 && length(air) > 0.5f) {
@@ -408,7 +429,9 @@ void AircraftAndHud::render_debug_overlays(float w, float h, float top, const Re
             }
         }
 
-        const float pw = 540.0f * scale, x = pad, y = h - 247.0f * scale;
+        if (!promo) {
+        const float pw = std::min(w - 2.0f * pad, 540.0f * scale), x = pad;
+        const float y = portrait ? (h - 247.0f * scale - (view.profiler ? 268.0f * scale : 0.0f)) : (h - 247.0f * scale);
         panel(x, y, pw, row * 8.8f, green);
         auto row_text = [&](int i, const char *msg, Vec3 c) { text_at(x + pad, y + row * (0.45f + i), msg, c); };
         row_text(0, st_.slew_fast ? "F7  SLEW ACTIVE / LAST FDM STATE" : "F7  FLIGHT PHYSICS / UPSTREAM JSBSIM", green);
@@ -434,13 +457,15 @@ void AircraftAndHud::render_debug_overlays(float w, float h, float top, const Re
                       systems_.get_left_tank_gal(), systems_.get_right_tank_gal(),
                       systems_.get_oil_press_psi(), systems_.get_fuel_flow_gph());
         row_text(7, line, white);
+        }
     }
 
+    if (!promo) {
     if (const FlightProfiler *prof = view.profiler) {
         const auto &host = prof->host();
         const auto &gpu = prof->latest_gpu_ms();
         const auto &phase = prof->latest_phases_ms();
-        const float pw = 550.0f * scale, x = w - pw - pad, y = h - 268.0f * scale;
+        const float pw = std::min(w - 2.0f * pad, 550.0f * scale), x = portrait ? pad : (w - pw - pad), y = h - 268.0f * scale;
         panel(x, y, pw, row * 9.8f, yellow);
         auto row_text = [&](int i, const char *msg, Vec3 c) { text_at(x + pad, y + row * (0.45f + i), msg, c); };
         row_text(0, "F5  PERFORMANCE", yellow);
@@ -455,9 +480,18 @@ void AircraftAndHud::render_debug_overlays(float w, float h, float top, const Re
         } else row_text(2, "CPU/RSS sampling...", white);
 
         if (host.gpu_busy_pct >= 0 && host.vram_used_bytes >= 0 && host.gtt_used_bytes >= 0) {
-            std::snprintf(line, sizeof(line), "GPU device %lld%%  |  VRAM %.0f  GTT %.0f MiB",
-                          static_cast<long long>(host.gpu_busy_pct), host.vram_used_bytes / 1048576.0,
-                          host.gtt_used_bytes / 1048576.0);
+            if (host.package_temp_c > 0.0) {
+                std::snprintf(line, sizeof(line), "GPU %lld%%  VRAM %.0f GTT %.0f MiB  Temp %.0fC",
+                              static_cast<long long>(host.gpu_busy_pct), host.vram_used_bytes / 1048576.0,
+                              host.gtt_used_bytes / 1048576.0, host.package_temp_c);
+            } else {
+                std::snprintf(line, sizeof(line), "GPU device %lld%%  |  VRAM %.0f  GTT %.0f MiB",
+                              static_cast<long long>(host.gpu_busy_pct), host.vram_used_bytes / 1048576.0,
+                              host.gtt_used_bytes / 1048576.0);
+            }
+            row_text(3, line, white);
+        } else if (host.package_temp_c > 0.0) {
+            std::snprintf(line, sizeof(line), "Package temp %.0f C  |  GPU mem via GL", host.package_temp_c);
             row_text(3, line, white);
         } else row_text(3, "GPU device busy / memory unavailable", white);
 
@@ -476,6 +510,336 @@ void AircraftAndHud::render_debug_overlays(float w, float h, float top, const Re
         std::snprintf(line, sizeof(line), "Terrain worker per page  build %.0f ms  BC7 %.0f ms",
                       prof->build_ms_per_page(), prof->encode_ms_per_page());
         row_text(7, line, white);
+    }
+    return;
+    }
+
+    // === CLEAN HIGH-IMPACT PORTRAIT ENGINE OVERLAYS (PROMO SERIES 01..05) ===
+    const float pw = w - 40.0f * scale;
+    const float px = 20.0f * scale;
+    const float top_y = 20.0f * scale;
+    auto big_hdr = [&](float x, float y, float wbox, const char *title, const char *stage, Vec3 accent) {
+        text_at(x + 20.0f * scale, y + 14.0f * scale, title, accent, 25.0f * scale);
+        if (stage && *stage) {
+            const float sw = std::min(wbox * 0.56f, static_cast<float>(std::strlen(stage)) * 11.4f * scale + 28.0f * scale);
+            const float sx = x + wbox - sw - 18.0f * scale;
+            const float sy = y + 10.0f * scale;
+            hud_rect(sx, sy, sw, 32.0f * scale, accent.x * 0.24f, accent.y * 0.24f, accent.z * 0.24f, 0.96f);
+            hud_border(sx, sy, sw, 32.0f * scale, 1.5f * scale, accent.x, accent.y, accent.z, 0.90f);
+            text_at(sx + 12.0f * scale, sy + 6.0f * scale, stage, white, 19.0f * scale);
+        }
+    };
+
+    if (view.promo_mode == PromoInspectMode::LoadBalancing) {
+        panel(px, top_y, pw, 168.0f * scale, yellow, 0.92f);
+        big_hdr(px, top_y, pw, "LOAD BALANCER", view.promo_stage, yellow);
+        static constexpr const char *kTier[4] = {"F1 LOW", "F2 BALANCED", "F3 HIGH", "F4 ULTRA"};
+        const int qi = std::clamp(view.quality, 0, 3);
+        const double fps = view.cur_fps;
+        const Vec3 fps_col = (fps >= 56.0) ? green : (fps >= 42.0 ? yellow : red);
+        std::snprintf(line, sizeof(line), "%.1f FPS", fps);
+        text_at(px + 20.0f * scale, top_y + 54.0f * scale, line, fps_col, 42.0f * scale);
+        std::snprintf(line, sizeof(line), "%s   |   %.1f ms", kTier[qi], view.cur_avg_ms);
+        text_at(px + 265.0f * scale, top_y + 62.0f * scale, line, white, 26.0f * scale);
+
+        // Clean single-row stacked GPU timeline bar against 16.6ms deadline (0..26ms)
+        const float bx = px + 20.0f * scale, by = top_y + 112.0f * scale, bw = pw - 40.0f * scale, bh = 32.0f * scale;
+        hud_rect(bx, by, bw, bh, 0.06f, 0.09f, 0.14f, 0.96f);
+        static constexpr float kMaxMs = 26.0f;
+        const auto &gpu = view.profiler ? view.profiler->latest_gpu_ms() : std::array<double, FlightProfiler::PassCount>{};
+        const struct { FlightProfiler::Pass p; Vec3 c; } segs[6] = {
+            {FlightProfiler::Terrain, green}, {FlightProfiler::World, orange}, {FlightProfiler::CloudsPost, blue},
+            {FlightProfiler::NativeCockpit, violet}, {FlightProfiler::Sky, yellow}, {FlightProfiler::Upload, {0.96f, 0.42f, 0.72f}},
+        };
+        float cur_x = bx;
+        for (const auto &s : segs) {
+            const float gms = std::max(0.0f, static_cast<float>(gpu[s.p]));
+            const float sw = std::min((bx + bw) - cur_x, (gms / kMaxMs) * bw);
+            if (sw > 0.5f) {
+                hud_rect(cur_x, by, sw, bh, s.c.x, s.c.y, s.c.z, 0.94f);
+                cur_x += sw;
+            }
+        }
+        const float dl_x = bx + (16.67f / kMaxMs) * bw;
+        hud_rect(dl_x - 2.0f * scale, by - 5.0f * scale, 4.0f * scale, bh + 10.0f * scale, 1.0f, 0.28f, 0.28f, 1.0f);
+        hud_border(bx, by, bw, bh, 1.5f * scale, 0.45f, 0.65f, 0.85f, 0.80f);
+        text_at(dl_x + 8.0f * scale, by + 6.0f * scale, "16.6ms LIMIT", white, 17.5f * scale);
+
+        const float bot_y = h - 300.0f * scale;
+        panel(px, bot_y, pw, 280.0f * scale, blue, 0.92f);
+        const FlightBudgetDecision fb = view.budget ? *view.budget : FlightBudgetDecision{};
+        const float lx = px + 24.0f * scale, bw2 = pw - 48.0f * scale;
+
+        std::snprintf(line, sizeof(line), "INTERNAL SCENE:  %dx%d  (%d%%)", view.scene_w, view.scene_h, fb.pixel_percent);
+        text_at(lx, bot_y + 22.0f * scale, line, yellow, 24.0f * scale);
+        draw_bar(lx, bot_y + 54.0f * scale, bw2, 24.0f * scale, fb.pixel_percent / 100.0f, (fb.pixel_percent < 80 ? yellow : green));
+
+        std::snprintf(line, sizeof(line), "NATIVE COCKPIT:  %dx%d  (100%% SHARP)", view.out_w, view.out_h);
+        text_at(lx, bot_y + 104.0f * scale, line, blue, 24.0f * scale);
+        draw_bar(lx, bot_y + 136.0f * scale, bw2, 24.0f * scale, 1.0f, blue);
+
+        const float tier1_avg = 0.25f * (fb.cloud_step_scale + fb.terrain_lod_scale + fb.city_dist_scale + fb.veg_density_scale);
+        std::snprintf(line, sizeof(line), "GPU BUDGET:  %.1f / 16.6 ms   |   LOD+CLD SCALE %.0f%%",
+                      view.cur_avg_ms, tier1_avg * 100.0f);
+        text_at(lx, bot_y + 186.0f * scale, line, white, 24.0f * scale);
+        draw_bar(lx, bot_y + 218.0f * scale, bw2, 24.0f * scale, static_cast<float>(view.cur_avg_ms / 24.0),
+                 view.cur_avg_ms <= 16.6 ? green : red);
+        return;
+    }
+
+    if (view.promo_mode == PromoInspectMode::TileStreaming) {
+        panel(px, top_y, pw, 166.0f * scale, green, 0.92f);
+        big_hdr(px, top_y, pw, "CDLOD QUADTREE STREAMER", view.promo_stage, green);
+        const double kt = st_.speed_mps * 1.94384;
+        std::snprintf(line, sizeof(line), "%.0f KT   |   %d LEAVES (1 DRAW)   |   MAX L%d",
+                      kt, view.cdlod.visible_nodes, view.cdlod.max_active_lod);
+        text_at(px + 20.0f * scale, top_y + 62.0f * scale, line, white, 26.0f * scale);
+
+        const int lcnt[5] = {
+            view.cdlod.visible_by_lod[9], view.cdlod.visible_by_lod[8], view.cdlod.visible_by_lod[7],
+            view.cdlod.visible_by_lod[6], view.cdlod.visible_by_lod[0] + view.cdlod.visible_by_lod[1] +
+            view.cdlod.visible_by_lod[2] + view.cdlod.visible_by_lod[3] + view.cdlod.visible_by_lod[4] + view.cdlod.visible_by_lod[5]
+        };
+        const char *ltxt[5] = {"L9", "L8", "L7", "L6", "HORIZ"};
+        const Vec3 lcolors[5] = {{0.08f, 0.96f, 1.0f}, {0.20f, 0.94f, 0.46f}, {0.98f, 0.80f, 0.16f}, {1.0f, 0.42f, 0.14f}, {0.64f, 0.36f, 1.0f}};
+        for (int i = 0; i < 5; ++i) {
+            const float bx = px + 20.0f * scale + i * 198.0f * scale, by = top_y + 114.0f * scale;
+            hud_rect(bx, by + 2.0f * scale, 22.0f * scale, 22.0f * scale, lcolors[i].x, lcolors[i].y, lcolors[i].z, 1.0f);
+            std::snprintf(line, sizeof(line), "%s:%d", ltxt[i], lcnt[i]);
+            text_at(bx + 30.0f * scale, by, line, white, 22.0f * scale);
+        }
+
+        const float bot_y = h - 320.0f * scale;
+        panel(px, bot_y, pw, 300.0f * scale, blue, 0.92f);
+        const float rsz = 256.0f * scale, rx0 = px + 22.0f * scale, ry0 = bot_y + 22.0f * scale;
+        hud_rect(rx0, ry0, rsz, rsz, 0.015f, 0.028f, 0.048f, 0.98f);
+        hud_border(rx0, ry0, rsz, rsz, 2.0f * scale, 0.35f, 0.72f, 0.95f, 0.85f);
+        static constexpr double kRadarSpanM = 28000.0;
+        const float rc_x = rx0 + rsz * 0.5f, rc_y = ry0 + rsz * 0.5f;
+        if (view.resident_keys) {
+            for (const QuadKey &qk : *view.resident_keys) {
+                if (qk.lod < 5) continue;
+                double ce = 0.0, cn = 0.0, hs = 0.0;
+                AsyncTerrainStreamer::quad_bounds_en(qk, ce, cn, hs);
+                const float x0 = rc_x + static_cast<float>((ce - hs - view.east_m) / kRadarSpanM) * rsz;
+                const float x1 = rc_x + static_cast<float>((ce + hs - view.east_m) / kRadarSpanM) * rsz;
+                const float y0 = rc_y - static_cast<float>((cn + hs - view.north_m) / kRadarSpanM) * rsz;
+                const float y1 = rc_y - static_cast<float>((cn - hs - view.north_m) / kRadarSpanM) * rsz;
+                if (x1 <= rx0 || x0 >= rx0 + rsz || y1 <= ry0 || y0 >= ry0 + rsz) continue;
+                const float cx0 = std::max(x0, rx0), cy0 = std::max(y0, ry0);
+                const float cx1 = std::min(x1, rx0 + rsz), cy1 = std::min(y1, ry0 + rsz);
+                const Vec3 &tc = lcolors[std::clamp(9 - static_cast<int>(qk.lod), 0, 4)];
+                hud_rect(cx0, cy0, cx1 - cx0, cy1 - cy0, tc.x, tc.y, tc.z, qk.lod >= 8 ? 0.42f : 0.25f);
+                hud_border(cx0, cy0, cx1 - cx0, cy1 - cy0, 1.2f, tc.x, tc.y, tc.z, 0.75f);
+            }
+        }
+        const double hdg_r = st_.heading_deg * DEG2RAD_D;
+        const Vec2 vdir{static_cast<float>(std::sin(hdg_r)), static_cast<float>(-std::cos(hdg_r))};
+        const float arrow_len = std::clamp(static_cast<float>(kt * 0.34), 24.0f, 110.0f) * scale;
+        hud_arrow({rc_x, rc_y}, {rc_x + vdir.x * arrow_len, rc_y + vdir.y * arrow_len}, 3.5f * scale, white);
+        hud_rect(rc_x - 5.0f * scale, rc_y - 5.0f * scale, 10.0f * scale, 10.0f * scale, 1.0f, 0.28f, 0.28f, 1.0f);
+        text_at(rx0 + 10.0f * scale, ry0 + 8.0f * scale, "CACHE MAP", white, 17.0f * scale);
+
+        const float mx = px + 306.0f * scale, mw = pw - 328.0f * scale;
+        const float cache_pct = view.stream.max_pages > 0 ? float(view.stream.resident_pages) / view.stream.max_pages : 0.0f;
+        std::snprintf(line, sizeof(line), "CACHE:  %d / %d PAGES (%.0f MiB)",
+                      view.stream.resident_pages, view.stream.max_pages,
+                      (view.stream.resident_pages * double(view.stream.gpu_page_bytes)) / 1048576.0);
+        text_at(mx, bot_y + 28.0f * scale, line, white, 24.0f * scale);
+        draw_bar(mx, bot_y + 62.0f * scale, mw, 24.0f * scale, cache_pct, green);
+
+        const double avg_b = view.profiler ? view.profiler->build_ms_per_page() : view.stream.avg_worker_ms;
+        const double avg_e = view.profiler ? view.profiler->encode_ms_per_page() : 0.0;
+        std::snprintf(line, sizeof(line), "BC7 WORKERS: %.0f ms  |  QUEUE %d", avg_b + avg_e, view.stream.queued_jobs);
+        text_at(mx, bot_y + 114.0f * scale, line, yellow, 24.0f * scale);
+
+        std::snprintf(line, sizeof(line), "CITY STREAM: %d CHUNKS  |  %d CARS", view.city_chunks, view.active_cars);
+        text_at(mx, bot_y + 174.0f * scale, line, orange, 24.0f * scale);
+
+        std::snprintf(line, sizeof(line), "REGION: %s", view.region_id ? view.region_id : "es_aragon");
+        text_at(mx, bot_y + 232.0f * scale, line, blue, 22.0f * scale);
+        return;
+    }
+
+    if (view.promo_mode == PromoInspectMode::WeatherCloudsWindshield) {
+        panel(px, top_y, pw, 158.0f * scale, blue, 0.92f);
+        big_hdr(px, top_y, pw, st_.view_mode == 0 ? "WINDSHIELD FLUID PDE" : "3D OROGRAPHIC WEATHER", view.promo_stage, blue);
+        std::snprintf(line, sizeof(line), "WIND %03.0f/%.0f KT   |   RAIN %.1f mm/h   |   CLD %.0f%%",
+                      last_air_.from_dir_deg(), last_air_.speed_kt(), last_air_.precipitation_mm_hr, last_air_.local_cloud_frac * 100.0f);
+        text_at(px + 20.0f * scale, top_y + 60.0f * scale, line, white, 25.0f * scale);
+        std::snprintf(line, sizeof(line), st_.view_mode == 0
+            ? "AIRFLOW %.0f KT  |  XWIND %+.1f m/s  |  WIPERS %s"
+            : "GRID 384x288x4 + 8KM LOCAL  |  UPDRAFT %+.1f m/s",
+            st_.view_mode == 0 ? rain_airspeed_mps_ * 1.94384f : static_cast<float>(last_air_.wind_up_mps),
+            rain_cross_mps_,
+            st_.wiper_mode >= 2 ? "ACTIVE" : "AUTO");
+        text_at(px + 20.0f * scale, top_y + 104.0f * scale, line, green, 23.0f * scale);
+
+        const float bot_y = h - 320.0f * scale;
+        panel(px, bot_y, pw, 300.0f * scale, blue, 0.92f);
+        if (st_.view_mode != 0) {
+            static const Vec3 kLC[4] = {{0.36f, 0.92f, 0.65f}, {0.28f, 0.84f, 1.0f}, {1.0f, 0.74f, 0.34f}, {0.82f, 0.62f, 1.0f}};
+            for (int lvl = 0; lvl < 4; ++lvl) {
+                const auto s = atmo.debug_slice(view.east_m, view.north_m, lvl, 1);
+                const WeatherDebugCell c = s.cells.empty() ? WeatherDebugCell{} : s.cells[s.cells.size() / 2];
+                const float spd_kt = std::hypot(c.wind_enu_mps.x, c.wind_enu_mps.y) * 1.94384f;
+                const float ry = bot_y + 22.0f * scale + lvl * 66.0f * scale;
+                std::snprintf(line, sizeof(line), "L%d %.0fm   WIND %2.0fKT   CLD %3.0f%%   RAIN %.1f",
+                              lvl, s.agl_m, spd_kt, c.cloud_fraction * 100.0f, c.rain_mm_hr);
+                text_at(px + 24.0f * scale, ry, line, white, 22.0f * scale);
+                draw_bar(px + 24.0f * scale, ry + 30.0f * scale, pw - 48.0f * scale, 20.0f * scale, c.cloud_fraction, kLC[lvl]);
+            }
+        } else {
+            const float pip_x = 42.0f * scale, pip_y = h - 294.0f * scale, pip_w = 400.0f * scale, pip_h = 250.0f * scale;
+            text_at(pip_x, bot_y + 12.0f * scale, "LIVE GPU FLUID BUFFER", blue, 20.0f * scale);
+            hud_rect(pip_x, pip_y, pip_w, pip_h, 0.02f, 0.05f, 0.09f, 0.98f);
+
+            const float rx = px + 448.0f * scale, rw = pw - 472.0f * scale;
+            std::snprintf(line, sizeof(line), "AIRFLOW: %.0f KT", rain_airspeed_mps_ * 1.94384f);
+            text_at(rx, bot_y + 28.0f * scale, line, blue, 24.0f * scale);
+            draw_bar(rx, bot_y + 60.0f * scale, rw, 22.0f * scale, rain_airspeed_mps_ / 62.0f, blue);
+
+            std::snprintf(line, sizeof(line), "PROPWASH: %.0f%%", rain_propwash01_ * 100.0f);
+            text_at(rx, bot_y + 110.0f * scale, line, green, 24.0f * scale);
+            draw_bar(rx, bot_y + 142.0f * scale, rw, 22.0f * scale, rain_propwash01_, green);
+
+            static constexpr const char *kWm[4] = {"OFF", "AUTO", "LOW", "HIGH"};
+            std::snprintf(line, sizeof(line), "WIPERS: %s (%.0f%%)", kWm[std::clamp(st_.wiper_mode, 0, 3)], wiper_pos_ * 100.0f);
+            text_at(rx, bot_y + 192.0f * scale, line, white, 24.0f * scale);
+            draw_bar(rx, bot_y + 224.0f * scale, rw, 22.0f * scale, wiper_pos_, violet);
+        }
+        return;
+    }
+
+    if (view.promo_mode == PromoInspectMode::AircraftSystems) {
+        panel(px, top_y, pw, 228.0f * scale, orange, 0.92f);
+        big_hdr(px, top_y, pw, "28V ELECTRICAL BUS", view.promo_stage, orange);
+        const bool m_bat = systems_.get_master_battery();
+        const bool m_alt = systems_.get_master_alternator();
+        const bool crank = systems_.is_starter_cranking();
+        const double bus_v = systems_.get_bus_volts();
+        const double amm_a = systems_.get_ammeter_amps();
+
+        auto node_box = [&](float bx, float by, float bw, float bh, const char *l1, const char *l2, Vec3 c) {
+            hud_rect(bx, by, bw, bh, c.x * 0.16f, c.y * 0.16f, c.z * 0.16f, 0.96f);
+            hud_border(bx, by, bw, bh, 2.0f * scale, c.x, c.y, c.z, 0.92f);
+            text_at(bx + 14.0f * scale, by + 8.0f * scale, l1, c, 19.0f * scale);
+            text_at(bx + 14.0f * scale, by + 34.0f * scale, l2, white, 22.0f * scale);
+        };
+        const float ny = top_y + 58.0f * scale;
+        char b_txt[40], m_txt[40], a_txt[40];
+        std::snprintf(b_txt, sizeof(b_txt), "%s (%.0f%%)", m_bat ? "ON" : "OFF", systems_.get_battery_soc() * 100.0);
+        std::snprintf(m_txt, sizeof(m_txt), "%.1fV | %+.0fA", bus_v, amm_a);
+        std::snprintf(a_txt, sizeof(a_txt), "%s", crank ? "CRANK!" : (m_alt && bus_v > 25.0 ? "CHARGING" : "OFF"));
+        node_box(px + 20.0f * scale, ny, 240.0f * scale, 68.0f * scale, "24V BAT", b_txt, m_bat ? green : red);
+        hud_line({px + 260.0f * scale, ny + 34.0f * scale}, {px + 340.0f * scale, ny + 34.0f * scale}, 4.5f * scale, m_bat ? green : muted, 0.95f);
+        node_box(px + 340.0f * scale, ny, 330.0f * scale, 68.0f * scale, crank ? "BUS (SAG)" : "MAIN BUS", m_txt, crank ? yellow : (bus_v > 20.0 ? blue : red));
+        hud_line({px + 670.0f * scale, ny + 34.0f * scale}, {px + 750.0f * scale, ny + 34.0f * scale}, 4.5f * scale, (m_alt && bus_v > 25.0) ? green : muted, 0.95f);
+        node_box(px + 750.0f * scale, ny, 260.0f * scale, 68.0f * scale, "60A ALT", a_txt, crank ? orange : (m_alt && bus_v > 25.0 ? green : muted));
+
+        // 6 Critical Breakers in one bold readable row
+        const int cb_ids[6] = {
+            nspain::CB_ALT_FIELD, nspain::CB_AVIONICS_BUS_1, nspain::CB_AVIONICS_BUS_2,
+            nspain::CB_FLAPS, nspain::CB_LAND_LIGHT, nspain::CB_PITOT_HEAT
+        };
+        const char *cb_lbl[6] = {"ALT", "AVN1", "AVN2", "FLAP", "LDG", "PITOT"};
+        for (int i = 0; i < 6; ++i) {
+            const float cw = 158.0f * scale, ch = 62.0f * scale;
+            const float cx = px + 20.0f * scale + i * 166.0f * scale, cy = top_y + 144.0f * scale;
+            const bool pulled = systems_.is_breaker_pulled(cb_ids[i]);
+            const bool pwr = systems_.is_circuit_powered(cb_ids[i]);
+            const Vec3 cc = pulled ? red : (pwr ? green : yellow);
+            hud_rect(cx, cy, cw, ch, cc.x * 0.18f, cc.y * 0.18f, cc.z * 0.18f, 0.96f);
+            hud_border(cx, cy, cw, ch, pulled ? 3.0f * scale : 1.5f * scale, cc.x, cc.y, cc.z, 0.92f);
+            text_at(cx + 14.0f * scale, cy + 7.0f * scale, cb_lbl[i], white, 20.0f * scale);
+            text_at(cx + 14.0f * scale, cy + 32.0f * scale, pulled ? "TRIP!" : (pwr ? "PWR" : "OFF"), cc, 19.0f * scale);
+        }
+
+        const float bot_y = h - 270.0f * scale;
+        panel(px, bot_y, pw, 250.0f * scale, green, 0.92f);
+        static constexpr const char *kFuelSel[4] = {"OFF", "LEFT", "BOTH", "RIGHT"};
+        static constexpr const char *kMagPos[5] = {"OFF", "R", "L", "BOTH", "START"};
+        std::snprintf(line, sizeof(line), "ENGINE: %4.0f RPM   |   MAG: %s   |   OIL %.0f PSI",
+                      fdm_.state().rpm, kMagPos[std::clamp(systems_.get_magnetos(), 0, 4)], systems_.get_oil_press_psi());
+        text_at(px + 24.0f * scale, bot_y + 24.0f * scale, line, white, 25.0f * scale);
+
+        std::snprintf(line, sizeof(line), "FUEL: %.1f GAL (%s)   |   FLOW %.1f GPH   |   EGT %.0f F",
+                      systems_.get_left_tank_gal() + systems_.get_right_tank_gal(),
+                      kFuelSel[std::clamp(systems_.get_fuel_selector(), 0, 3)],
+                      systems_.get_fuel_flow_gph(), systems_.get_egt_f());
+        text_at(px + 24.0f * scale, bot_y + 80.0f * scale, line, yellow, 24.0f * scale);
+
+        std::snprintf(line, sizeof(line), "AVN1 (GNS430): %s   |   FLAPS: %.0f -> %.0f DEG",
+                      systems_.is_avionics_bus_powered(1) ? "ONLINE" : "OFFLINE",
+                      systems_.get_flaps_actual_deg(), systems_.get_flaps_target_deg());
+        text_at(px + 24.0f * scale, bot_y + 138.0f * scale, line,
+                systems_.is_avionics_bus_powered(1) ? green : red, 25.0f * scale);
+        draw_bar(px + 24.0f * scale, bot_y + 188.0f * scale, pw - 48.0f * scale, 26.0f * scale,
+                 static_cast<float>(systems_.get_flaps01()), blue);
+        return;
+    }
+
+    if (view.promo_mode == PromoInspectMode::AircraftPhysics) {
+        const auto &f = fdm_.state();
+        const auto &controls = fdm_.controls();
+        const Vec3 top_col = f.stalled ? red : (f.stall_warn ? orange : green);
+        panel(px, top_y, pw, 158.0f * scale, top_col, 0.92f);
+        big_hdr(px, top_y, pw, "120 HZ JSBSIM PHYSICS", view.promo_stage, top_col);
+        std::snprintf(line, sizeof(line), "%.0f KT   |   %+.2f G   |   %s",
+                      f.ias_kt, f.g_load,
+                      f.stalled ? "STALL CL_MAX!" : (f.on_ground ? "WEIGHT ON WHEELS" : "AIRBORNE 6-DOF"));
+        text_at(px + 20.0f * scale, top_y + 62.0f * scale, line, f.stalled ? red : white, 30.0f * scale);
+        std::snprintf(line, sizeof(line), "SURFACE FRICTION MU = %.2f   |   WOW N:%d  L:%d  R:%d",
+                      last_surf_friction_, f.wheel_wow[0], f.wheel_wow[1], f.wheel_wow[2]);
+        text_at(px + 20.0f * scale, top_y + 108.0f * scale, line, blue, 22.0f * scale);
+
+        const float bot_y = h - 306.0f * scale;
+        panel(px, bot_y, pw, 286.0f * scale, green, 0.92f);
+
+        // Col 1: Bold 2D Yoke Crosshair
+        const float c1x = px + 24.0f * scale, ssz = 200.0f * scale, sy0 = bot_y + 24.0f * scale;
+        hud_rect(c1x, sy0, ssz, ssz, 0.02f, 0.04f, 0.07f, 0.96f);
+        hud_border(c1x, sy0, ssz, ssz, 2.0f * scale, 0.40f, 0.72f, 0.95f, 0.82f);
+        hud_line({c1x + ssz * 0.5f, sy0}, {c1x + ssz * 0.5f, sy0 + ssz}, 1.5f * scale, muted, 0.45f);
+        hud_line({c1x, sy0 + ssz * 0.5f}, {c1x + ssz, sy0 + ssz * 0.5f}, 1.5f * scale, muted, 0.45f);
+        const float stk_x = c1x + ssz * (0.5f + 0.45f * static_cast<float>(std::clamp(controls.aileron, -1.0, 1.0)));
+        const float stk_y = sy0 + ssz * (0.5f - 0.45f * static_cast<float>(std::clamp(controls.elevator, -1.0, 1.0)));
+        hud_line({c1x + ssz * 0.5f, sy0 + ssz * 0.5f}, {stk_x, stk_y}, 3.5f * scale, blue, 0.95f);
+        hud_rect(stk_x - 9.0f * scale, stk_y - 9.0f * scale, 18.0f * scale, 18.0f * scale, 0.34f, 0.96f, 0.58f, 1.0f);
+        text_at(c1x + 28.0f * scale, sy0 + ssz + 14.0f * scale, "YOKE INPUT", white, 21.0f * scale);
+
+        // Col 2: 3 Clean Aerodynamic Bars
+        const float c2x = px + 258.0f * scale, c2w = 420.0f * scale;
+        std::snprintf(line, sizeof(line), "AoA %+.1f DEG %s", f.alpha_deg, f.stalled ? "STALL!" : "");
+        text_at(c2x, bot_y + 24.0f * scale, line, f.stalled ? red : white, 23.0f * scale);
+        draw_bar(c2x, bot_y + 56.0f * scale, c2w, 22.0f * scale, static_cast<float>((f.alpha_deg + 4.0) / 24.0), f.stalled ? red : green);
+        const float crit_x = c2x + c2w * ((15.5f + 4.0f) / 24.0f);
+        hud_rect(crit_x - 2.0f * scale, bot_y + 52.0f * scale, 4.0f * scale, 30.0f * scale, 1.0f, 0.3f, 0.3f, 1.0f);
+
+        std::snprintf(line, sizeof(line), "CL %.2f   |   BETA %+.1f DEG", f.cl, f.beta_deg);
+        text_at(c2x, bot_y + 108.0f * scale, line, blue, 23.0f * scale);
+        draw_bar(c2x, bot_y + 140.0f * scale, c2w, 22.0f * scale, static_cast<float>(f.cl / 1.8), blue);
+
+        std::snprintf(line, sizeof(line), "BRAKES: %.0f%%", std::max(controls.brake_left, controls.brake_right) * 100.0);
+        text_at(c2x, bot_y + 192.0f * scale, line, orange, 23.0f * scale);
+        draw_bar(c2x, bot_y + 224.0f * scale, c2w, 22.0f * scale, static_cast<float>(std::max(controls.brake_left, controls.brake_right)), orange);
+
+        // Col 3: 3 Bold Gear Oleo Struts
+        const float c3x = px + 708.0f * scale, c3w = pw - 728.0f * scale;
+        static constexpr const char *kGearLbl[3] = {"N", "L", "R"};
+        const float col_w = (c3w - 24.0f * scale) / 3.0f;
+        for (int i = 0; i < 3; ++i) {
+            const float gx = c3x + i * (col_w + 12.0f * scale);
+            const float gy = bot_y + 24.0f * scale, gh = 176.0f * scale;
+            const double mm = std::max(0.0, f.wheel_comp_m[i] * 1000.0);
+            const Vec3 gc = f.wheel_wow[i] ? green : blue;
+            hud_rect(gx, gy, col_w, gh, 0.03f, 0.06f, 0.10f, 0.96f);
+            const float ch = std::clamp(static_cast<float>(mm / 140.0), 0.0f, 1.0f) * gh;
+            if (ch > 1.0f) hud_rect(gx, gy + gh - ch, col_w, ch, gc.x, gc.y, gc.z, 0.94f);
+            hud_border(gx, gy, col_w, gh, 2.0f * scale, gc.x, gc.y, gc.z, 0.90f);
+            std::snprintf(line, sizeof(line), "%s %.0f", kGearLbl[i], mm);
+            text_at(gx + 6.0f * scale, gy + gh + 16.0f * scale, line, gc, 21.0f * scale);
+        }
     }
 }
 

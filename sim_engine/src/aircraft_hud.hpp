@@ -9,6 +9,7 @@
 #include "../../engine/src/flight_model_jsb.hpp"
 #include "async_streamer.hpp"
 #include "cdlod_terrain.hpp"
+#include "flight_frame_budget.hpp"
 #include "gl_loader.hpp"
 #include "graphics_settings.hpp"
 #include "math3d.hpp"
@@ -26,15 +27,35 @@ namespace nsim {
 class FlightProfiler;
 class GameFrontend;
 
+enum class PromoInspectMode : int {
+    None = 0,
+    LoadBalancing = 1,
+    TileStreaming = 2,
+    WeatherCloudsWindshield = 3,
+    AircraftSystems = 4,
+    AircraftPhysics = 5
+};
+
 struct DebugOverlayView {
     const FlightProfiler *profiler = nullptr;
     int weather_level = -1;
     bool physics = false;
-    Mat4 projection_view;
-    Mat4 aircraft_rotation;
+    Mat4 projection_view{};
+    Mat4 aircraft_rotation{};
     double east_m = 0.0, north_m = 0.0;
     double simulation_time_s = 0.0;
     bool weather_volume_3d = false;
+    PromoInspectMode promo_mode = PromoInspectMode::None;
+    const char *promo_stage = nullptr;
+    const FlightBudgetDecision *budget = nullptr;
+    int quality = 1, scene_w = 0, scene_h = 0, out_w = 0, out_h = 0;
+    int total_bldgs = 0, active_cars = 0, city_regions = 0, city_chunks = 0, pnoa_hits = 0, pnoa_new = 0;
+    double cur_fps = 0.0, cur_avg_ms = 0.0, cur_p95_ms = 0.0;
+    const char *region_id = nullptr;
+    StreamStats stream{};
+    CdlodDrawStats cdlod{};
+    float cdlod_debug_alpha = 0.0f;
+    const std::vector<QuadKey> *resident_keys = nullptr;
 };
 
 // C172S EYEPOINT is 25 inches above its CG in the flight model.
@@ -77,6 +98,7 @@ struct FlightSimState {
     float ap_disconnect_warn_s = 0.0f;
     int ap_trim_annunc = 0;      // -1=TRIM DN, 0=none, +1=TRIM UP
     int view_mode = 0;      // 0=Cockpit, 1=Chase, 2=Free Cam
+    int wiper_mode = 1;     // 0=OFF, 1=AUTO (rain-sensing), 2=LOW, 3=HIGH
     float look_yaw_deg = 0.0f;
     float look_pitch_deg = 0.0f;
     float seat_height_m = 0.0f;
@@ -191,12 +213,20 @@ public:
     float windscreen_frost() const { return windscreen_frost_; }
     float airframe_ice01() const { return airframe_ice01_; }
     float ground_wetness() const { return static_cast<float>(ground_wetness_); }
+    double last_surf_friction() const { return last_surf_friction_; }
+    float rain_airspeed_mps() const { return rain_airspeed_mps_; }
+    float rain_cross_mps() const { return rain_cross_mps_; }
+    float rain_propwash01() const { return rain_propwash01_; }
 
 private:
     friend class GameFrontend;
     void apply_autopilot(const nspain::FlightState &fs, double dt, double &roll_cmd, double &pitch_cmd,
                          double &ap_ail_out, double &ap_elv_out, double &ap_rud_out);
     void init_avionics_display_texture();
+    void init_wiper_mesh();
+    void update_wipers(float rdt, float rain_mm);
+    void step_windshield_sim(float rdt, float rain_mm, float relative_airspeed, float sim_time_sec, float defrost_clear);
+    void draw_wipers(const Mat4 &vp, const Mat4 &root_world, const Mat4 &root_cam_rel) const;
     void update_avionics_display_texture(float sim_time_sec, const AtmosphereState &atmo);
     void update_davtron_and_steam_textures(float sim_time_sec, const AtmosphereState &atmo);
     void advance_aircraft(double dt, const AtmosphereState &atmo, const RegionalAtmosphere &reg_atmo,
@@ -207,7 +237,8 @@ private:
     void apply_damage_rig(std::vector<Mat4> &anim, float flaps_rad, float ail, float elv, float trm, float rud) const;
     std::string visual_node_name(const GlbMeshData &mesh, const char *fallback) const;
     friend class AircraftSession;
-    void flush_hud(float width, float height, GLuint font = 0);
+    void flush_hud(float width, float height, GLuint font = 0, int tex_mode = 0);
+    void draw_hud_texture_pip(GLuint tex, int mode, float x, float y, float w, float h, float wf, float hf, float alpha = 1.0f);
     struct HudVert {
         float x, y;
         float u, v;
@@ -256,6 +287,9 @@ private:
     Vec2 rain_flow_front_{0.0f, 0.0f}, rain_flow_side_{0.0f, 0.0f};
     Vec2 rain_vel_front_{0.0f, 0.15f}, rain_vel_side_{0.05f, 0.15f};
     float rain_speed01_ = 0.0f;
+    float rain_airspeed_mps_ = 0.0f, rain_cross_mps_ = 0.0f, rain_propwash01_ = 0.0f;
+    float wiper_phase_ = 0.0f, wiper_pos_ = 0.0f, wiper_prev_pos_ = 0.0f, wiper_park_age_s_ = 12.0f, wiper_freq_ = 0.0f;
+    float win_sim_dry_s_ = 10.0f;
     double mouse_yoke_roll_ = 0.0, mouse_yoke_pitch_ = 0.0;
     double anchor_mx_ = 0.0, anchor_my_ = 0.0;
     double raw_yoke_x_ = 0.0, raw_yoke_y_ = 0.0;
@@ -265,6 +299,7 @@ private:
     double taxi_hold_hdg_deg_ = 0.0;
     bool taxi_hold_valid_ = false;
     double ground_wetness_ = 0.0;
+    double last_surf_friction_ = 0.82;
     double damage_ = 0.0;
     double tire_wear_ = 0.0, brake_wear_ = 0.0, gear_alignment_ = 0.0, prop_nicks_ = 0.0;
     double windshield_dirt_ = 0.0, windshield_crack_ = 0.0;
@@ -311,16 +346,30 @@ private:
     GLint u_ac_unlit_ = -1, u_ac_cabin_glass_ = -1, u_ac_glass_weather_ = -1;
     GLint u_ac_glass_flow_f_ = -1, u_ac_glass_flow_s_ = -1;
     GLint u_ac_rain_luts_ = -1;
-    GLint u_ac_glass_fx_ = -1, u_ac_plane_wx_ = -1, u_ac_dmg_zones_ = -1, u_ac_dmg_extra_ = -1;
+    GLint u_ac_glass_fx_ = -1, u_ac_plane_wx_ = -1, u_ac_glass_wiper_ = -1, u_ac_win_sim_ = -1, u_ac_dmg_zones_ = -1, u_ac_dmg_extra_ = -1;
     GLint u_ac_baked_reflection_ = -1, u_ac_detail_ = -1;
     GLint u_ac_native_output_ = -1, u_ac_output_exposure_ = -1, u_ac_output_lut_ = -1;
+    GLuint win_sim_prog_ = 0, win_sim_vao_ = 0;
+    GLuint windshield_sim_fbo_[2]{}, windshield_sim_tex_[2]{};
+    int win_sim_ping_ = 0;
+    bool win_sim_valid_ = false;
+    GLint u_ws_flow_ = -1, u_ws_wiper_ = -1, u_ws_env_ = -1;
     GlbMeshData ext_mesh_{};
     GlbMeshData ckpt_mesh_{};
+    struct WiperSurfaceTri {
+        Vec3 p0, p1, p2;
+        Vec3 n0, n1, n2;
+        Vec2 uv0, uv1, uv2;
+    };
+    std::vector<WiperSurfaceTri> wiper_ws_tris_;
+    bool wiper_mesh_dirty_ = true;
+    GLuint wiper_vao_ = 0, wiper_vbo_ = 0, wiper_ebo_ = 0;
+    GLsizei wiper_idx_count_ = 0;
     GLuint windshield_rain_front_tex_ = 0, windshield_rain_side_tex_ = 0;
 
     GLuint hud_prog_ = 0;
     GLuint hud_font_tex_ = 0;
-    GLint u_hud_scr_ = -1;
+    GLint u_hud_scr_ = -1, u_hud_tex_mode_ = -1;
     GLuint hud_vao_ = 0;
     GLuint hud_vbo_ = 0;
     size_t hud_vbo_cap_ = 0;

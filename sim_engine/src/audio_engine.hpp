@@ -24,6 +24,20 @@ struct AudioState {
     float walk_speed_mps = 0.0f;
     float aircraft_dist_m = 0.0f;
     float aircraft_pan = 0.0f; // -1 left .. +1 right
+    float aircraft_front = 1.0f; // -1 behind listener .. +1 directly ahead
+    float aircraft_elev = 0.0f; // -1 below .. +1 above listener
+    float aircraft_rel_speed_mps = 0.0f; // + approaching listener, - receding (Doppler)
+    float wind_pan = 0.0f; // -1 crosswind from left .. +1 from right
+    float wheel_bias = 0.0f; // -1 left main gear load .. +1 right main gear load
+    float cockpit_stall_pan = -0.08f; // Head-tracked cockpit reed L/R pan
+    float cockpit_avionics_pan = 0.36f; // Head-tracked center/right stack L/R pan
+    float cockpit_flaps_pan = 0.14f; // Head-tracked overhead flap motor L/R pan
+    float traffic_dist_m = 5000.0f; // Nearest AI traffic distance (m)
+    float traffic_pan = 0.0f; // -1 left .. +1 right
+    float traffic_front = 1.0f; // -1 behind .. +1 ahead
+    float traffic_rel_speed_mps = 0.0f; // + approaching, - receding
+    float traffic_rpm = 0.0f; // >0 when nearby AI aircraft is running
+    bool traffic_is_airliner = false;
     float master_volume = 0.72f;
     bool engine_running = false;
     bool starter_cranking = false;
@@ -41,7 +55,7 @@ struct AudioState {
 };
 
 // Zero-dependency procedural aviation audio engine (Linux ALSA via dlopen libasound.so.2, or Windows WinMM waveOut).
-// Runs synthesis in a dedicated low-CPU thread (<0.3% of 1 core) so rendering/thermals stay cool.
+// Runs synthesis in a dedicated low-CPU thread (<0.4% of 1 core) with binaural ITD/ILD/pinna spatialization.
 class AudioEngine {
 public:
     static constexpr unsigned int kSampleRate = 48000;
@@ -66,6 +80,9 @@ public:
 
 private:
     struct SynthState {
+        static constexpr unsigned int kItdBufSize = 64;   // 1.33 ms @ 48 kHz (> 0.66 ms max head ITD)
+        static constexpr unsigned int kCabinBufSize = 256; // 5.3 ms early cockpit reflection ring
+
         double phase_fire = 0.0;
         double phase_sub = 0.0;
         double phase_starter = 0.0;
@@ -75,6 +92,8 @@ private:
         double phase_gyro = 0.0;
         double phase_step = 0.0;
         double phase_td = 0.0;
+        double phase_tr_fire = 0.0;
+        double phase_tr_sub = 0.0;
 
         float sm_rpm = 0.0f;
         float sm_thr = 0.0f;
@@ -84,20 +103,53 @@ private:
         float sm_gnd = 0.0f;
         float sm_gain = 0.0f;
         float sm_cabin = 1.0f;
+        float sm_pan = 0.0f;
+        float sm_front = 1.0f;
+        float sm_elev = 0.0f;
+        float sm_wind_pan = 0.0f;
+        float sm_doppler = 1.0f;
+        float sm_tr_pan = 0.0f;
+        float sm_tr_front = 1.0f;
+        float sm_tr_gain = 0.0f;
+        float sm_tr_doppler = 1.0f;
 
         float lp_engine = 0.0f;
-        float lp_wind1 = 0.0f;
-        float lp_wind2 = 0.0f;
-        float lp_rain = 0.0f;
+        float lp_eng_air = 0.0f;
+        float lp_eng_front = 0.0f;
+        float lp_eng_shadow_l = 0.0f;
+        float lp_eng_shadow_r = 0.0f;
+        float lp_cabin_refl = 0.0f;
+        float lp_tr_eng = 0.0f;
+        float lp_tr_front = 0.0f;
+        float lp_tr_shadow_l = 0.0f;
+        float lp_tr_shadow_r = 0.0f;
+        float lp_wind_l1 = 0.0f;
+        float lp_wind_r1 = 0.0f;
+        float lp_wind_l2 = 0.0f;
+        float lp_wind_r2 = 0.0f;
+        float lp_rain_l = 0.0f;
+        float lp_rain_r = 0.0f;
         float lp_thunder = 0.0f;
+        float lp_thunder_r = 0.0f;
         float lp_gnd = 0.0f;
-        float hp_rain_prev = 0.0f;
-        float hp_rain_out = 0.0f;
+        float hp_rain_prev_l = 0.0f;
+        float hp_rain_out_l = 0.0f;
+        float hp_rain_prev_r = 0.0f;
+        float hp_rain_out_r = 0.0f;
+
+        std::array<float, kItdBufSize> eng_delay_{};
+        std::array<float, kItdBufSize> tr_delay_{};
+        std::array<float, kCabinBufSize> cabin_refl_{};
+        unsigned int eng_delay_idx_ = 0;
+        unsigned int tr_delay_idx_ = 0;
+        unsigned int cabin_refl_idx_ = 0;
 
         float thunder_env = 0.0f;
+        float thunder_pan = 0.0f;
         float prev_lightning = 0.0f;
         float td_env = 0.0f;
         float td_strength = 0.0f;
+        float td_bias = 0.0f;
         uint32_t last_td_seq = 0;
         float step_env = 0.0f;
         float sputter_gain = 1.0f;

@@ -57,6 +57,27 @@ bool AircraftAndHud::init(const PackReader *pack, const std::string &asset_root,
     u_ac_rain_luts_ = glGetUniformLocation(ac_prog_, "u_rain_luts");
     u_ac_glass_fx_ = glGetUniformLocation(ac_prog_, "u_glass_fx");
     u_ac_plane_wx_ = glGetUniformLocation(ac_prog_, "u_plane_wx");
+    u_ac_glass_wiper_ = glGetUniformLocation(ac_prog_, "u_glass_wiper");
+    u_ac_win_sim_ = glGetUniformLocation(ac_prog_, "u_windshield_sim");
+    win_sim_prog_ = compile_program_files(shader_root + "/fullscreen.vert", shader_root + "/windshield_rain_sim.frag");
+    if (win_sim_prog_) {
+        u_ws_flow_ = glGetUniformLocation(win_sim_prog_, "u_flow_params");
+        u_ws_wiper_ = glGetUniformLocation(win_sim_prog_, "u_wiper_params");
+        u_ws_env_ = glGetUniformLocation(win_sim_prog_, "u_env_params");
+        glCreateVertexArrays(1, &win_sim_vao_);
+        glCreateTextures(GL_TEXTURE_2D, 2, windshield_sim_tex_);
+        glCreateFramebuffers(2, windshield_sim_fbo_);
+        static const float kZero4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (int i = 0; i < 2; ++i) {
+            glTextureStorage2D(windshield_sim_tex_[i], 1, GL_RGBA16F, 256, 160);
+            glTextureParameteri(windshield_sim_tex_[i], GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTextureParameteri(windshield_sim_tex_[i], GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTextureParameteri(windshield_sim_tex_[i], GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTextureParameteri(windshield_sim_tex_[i], GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glClearTexImage(windshield_sim_tex_[i], 0, GL_RGBA, GL_FLOAT, kZero4);
+            glNamedFramebufferTexture(windshield_sim_fbo_[i], GL_COLOR_ATTACHMENT0, windshield_sim_tex_[i], 0);
+        }
+    }
     u_ac_dmg_zones_ = glGetUniformLocation(ac_prog_, "u_dmg_zones");
     u_ac_dmg_extra_ = glGetUniformLocation(ac_prog_, "u_dmg_extra");
     u_ac_baked_reflection_ = glGetUniformLocation(ac_prog_, "u_baked_reflection");
@@ -65,6 +86,7 @@ bool AircraftAndHud::init(const PackReader *pack, const std::string &asset_root,
     u_ac_output_exposure_ = glGetUniformLocation(ac_prog_, "u_output_exposure");
     u_ac_output_lut_ = glGetUniformLocation(ac_prog_, "u_output_lut");
     u_hud_scr_  = glGetUniformLocation(hud_prog_, "u_screen_size");
+    u_hud_tex_mode_ = glGetUniformLocation(hud_prog_, "u_tex_mode");
     if (precip_prog_) {
         u_pr_vp_    = glGetUniformLocation(precip_prog_, "u_vp");
         u_pr_cam_   = glGetUniformLocation(precip_prog_, "u_cam_world");
@@ -136,7 +158,7 @@ bool AircraftAndHud::init(const PackReader *pack, const std::string &asset_root,
     }
     if (!aircraft_.cockpit_model.empty() &&
         (!resolve_aircraft_asset(aircraft_, aircraft_.cockpit_model, asset_root, cockpit_path, asset_error) ||
-         !WorldObjects::load_colored_glb(cockpit_path.string(), ckpt_mesh_))) {
+         !WorldObjects::load_colored_glb(cockpit_path.string(), ckpt_mesh_, true))) {
         std::fprintf(stderr, "[AIRCRAFT] Unable to load aircraft cockpit (%s): %s\n",
                      aircraft_.id.c_str(), asset_error.c_str());
         return false;
@@ -192,6 +214,7 @@ bool AircraftAndHud::init(const PackReader *pack, const std::string &asset_root,
     glEnableVertexArrayAttrib(hud_vao_, 1); glVertexArrayAttribFormat(hud_vao_, 1, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float)); glVertexArrayAttribBinding(hud_vao_, 1, 0);
     glEnableVertexArrayAttrib(hud_vao_, 2); glVertexArrayAttribFormat(hud_vao_, 2, 4, GL_FLOAT, GL_FALSE, 4 * sizeof(float)); glVertexArrayAttribBinding(hud_vao_, 2, 0);
     hud_verts_.reserve(8192);
+    init_wiper_mesh();
     return true;
 }
 
@@ -219,6 +242,7 @@ bool AircraftAndHud::init_physics(const PackReader *pack, const std::string &air
             const double grip_mult = icy ? std::lerp(1.0, 0.38, ground_wetness_) : std::lerp(1.0, 0.62, ground_wetness_);
             ground.friction = std::max(0.20, ground.friction * grip_mult);
         }
+        last_surf_friction_ = ground.friction;
         return ground;
     });
     if (!fdm_.load(aircraft_dir)) {
@@ -271,6 +295,15 @@ void AircraftAndHud::shutdown() {
     if (hud_prog_) { glDeleteProgram(hud_prog_); hud_prog_ = 0; }
     if (hud_vao_)  { glDeleteVertexArrays(1, &hud_vao_); hud_vao_ = 0; }
     if (hud_vbo_)  { glDeleteBuffers(1, &hud_vbo_); hud_vbo_ = 0; hud_vbo_cap_ = 0; }
+    if (wiper_vao_) { glDeleteVertexArrays(1, &wiper_vao_); wiper_vao_ = 0; }
+    if (wiper_vbo_) { glDeleteBuffers(1, &wiper_vbo_); wiper_vbo_ = 0; }
+    if (wiper_ebo_) { glDeleteBuffers(1, &wiper_ebo_); wiper_ebo_ = 0; }
+    wiper_idx_count_ = 0;
+    if (windshield_sim_fbo_[0]) { glDeleteFramebuffers(2, windshield_sim_fbo_); windshield_sim_fbo_[0] = windshield_sim_fbo_[1] = 0; }
+    if (windshield_sim_tex_[0]) { glDeleteTextures(2, windshield_sim_tex_); windshield_sim_tex_[0] = windshield_sim_tex_[1] = 0; }
+    if (win_sim_vao_) { glDeleteVertexArrays(1, &win_sim_vao_); win_sim_vao_ = 0; }
+    if (win_sim_prog_) { glDeleteProgram(win_sim_prog_); win_sim_prog_ = 0; }
+    win_sim_valid_ = false;
 }
 
 void AircraftAndHud::reset_flight(double lat, double lon, double alt_m, double hdg_deg, double ias_kt, bool on_ground) {
@@ -279,6 +312,7 @@ void AircraftAndHud::reset_flight(double lat, double lon, double alt_m, double h
     raw_yoke_x_ = raw_yoke_y_ = 0.0;
     yoke_anchor_valid_ = false;
     kb_bank_cmd_ = kb_pitch_cmd_ = 0.0;
+    st_.aileron = st_.elevator = st_.rudder = st_.trim = 0.0;
     throttle_hw_active_ = mixture_hw_active_ = false;
     throttle_hw_last_ = mixture_hw_last_ = -1.0;
     st_.ap_master = false;
@@ -290,6 +324,18 @@ void AircraftAndHud::reset_flight(double lat, double lon, double alt_m, double h
     st_.ap_alt_ft = std::round(alt_m * 3.28084 / 100.0) * 100.0;
     st_.ind_alt_ft = alt_m * 3.28084 + (systems_.get_baro_hpa() - 1013.25) * 27.3;
     ai_gyro_spool_ = systems_.is_engine_running() ? 1.0f : 0.0f;
+    wiper_phase_ = 0.0f;
+    wiper_pos_ = 0.0f;
+    wiper_prev_pos_ = 0.0f;
+    wiper_park_age_s_ = 12.0f;
+    wiper_freq_ = 0.0f;
+    win_sim_dry_s_ = 10.0f;
+    if (win_sim_valid_ && windshield_sim_tex_[0]) {
+        static const float kZero4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        glClearTexImage(windshield_sim_tex_[0], 0, GL_RGBA, GL_FLOAT, kZero4);
+        glClearTexImage(windshield_sim_tex_[1], 0, GL_RGBA, GL_FLOAT, kZero4);
+        win_sim_valid_ = false;
+    }
     prev_ground_coll_ = on_ground;
     prev_vsi_coll_ = 0.0;
     impact_cooldown_s_ = 0.0;
@@ -717,6 +763,7 @@ void AircraftAndHud::step_inputs_and_physics(const PlatformWindow &win, double d
     }
     if (win.key_pressed(KEY_F) || yk.flaps_down_pressed) systems_.set_flaps_target_deg(std::min(aircraft_.max_flaps_deg, systems_.get_flaps_target_deg() + 10.0));
     if (win.key_pressed(KEY_V) || yk.flaps_up_pressed) systems_.set_flaps_target_deg(std::max(0.0, systems_.get_flaps_target_deg() - 10.0));
+    if (win.key_pressed(KEY_J)) st_.wiper_mode = (st_.wiper_mode + 1) % 4;
     if (yk.parking_brake_pressed && !chocks_on_ && !tie_downs_on_) st_.parking_brake = !st_.parking_brake;
     if (yk.ap_disc_pressed) st_.ap_master = false;
     if (std::abs(yk.trim_rate) > 0.1) st_.trim = std::clamp(st_.trim + yk.trim_rate * dt * 0.28, -0.55, 0.55);
@@ -2273,6 +2320,11 @@ void AircraftAndHud::update_avionics_display_texture(float sim_time_sec, const A
 void AircraftAndHud::update_davtron_and_steam_textures(float sim_time_sec, const AtmosphereState &atmo) {
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 
+    // Stagger mipmapped cockpit canvas regeneration so avionics & steam textures never stack mip rebuilds on one frame.
+    if (sim_time_sec >= 0.0f && avionics_last_upd_s_ >= 0.0f && std::abs(sim_time_sec - avionics_last_upd_s_) < 1e-5f) {
+        return;
+    }
+
     // 1. Live Davtron M803 Amber OAT / Bus Volts / UTC / QNH Digital Glass Display on PanelFace2K
     if (panel_face_tex_ && davtron_base_rgba_.size() == static_cast<size_t>(kDavW * kDavH) * 4u) {
         if (davtron_last_upd_s_ < 0.0f || sim_time_sec < davtron_last_upd_s_ ||
@@ -2479,6 +2531,296 @@ void AircraftAndHud::update_davtron_and_steam_textures(float sim_time_sec, const
     }
 }
 
+void AircraftAndHud::init_wiper_mesh() {
+    wiper_ws_tris_.clear();
+    if (ckpt_mesh_.cpu_verts.empty() || ckpt_mesh_.cpu_indices.empty()) return;
+    const std::string ws_name = visual_node_name(ckpt_mesh_, "Windshield");
+    auto wi = ckpt_mesh_.node_index.find(ws_name);
+    if (wi == ckpt_mesh_.node_index.end()) return;
+
+    const auto &vf = ckpt_mesh_.cpu_verts;
+    const auto &idxs = ckpt_mesh_.cpu_indices;
+    const size_t nverts = vf.size() / 12;
+
+    for (const auto &sm : ckpt_mesh_.submeshes) {
+        if (sm.node_idx != wi->second) continue;
+        const size_t end_idx = std::min(idxs.size(), static_cast<size_t>(sm.first_index) + sm.index_count);
+        for (size_t k = sm.first_index; k + 2 < end_idx; k += 3) {
+            auto push_v = [&](size_t ii, Vec3 &p, Vec3 &n, Vec2 &uv) -> bool {
+                const int64_t vi = static_cast<int64_t>(idxs[ii]) + sm.base_vertex;
+                if (vi < 0 || static_cast<size_t>(vi) >= nverts) return false;
+                const float *d = &vf[static_cast<size_t>(vi) * 12];
+                p = {d[0], d[1], d[2]};
+                n = {d[3], d[4], d[5]};
+                uv = {d[10], d[11]};
+                return true;
+            };
+            Vec3 p0, p1, p2, n0, n1, n2;
+            Vec2 uv0, uv1, uv2;
+            if (push_v(k, p0, n0, uv0) && push_v(k + 1, p1, n1, uv1) && push_v(k + 2, p2, n2, uv2)) {
+                wiper_ws_tris_.push_back({p0, p1, p2, n0, n1, n2, uv0, uv1, uv2});
+            }
+        }
+    }
+    ckpt_mesh_.cpu_verts.clear();
+    ckpt_mesh_.cpu_verts.shrink_to_fit();
+    ckpt_mesh_.cpu_indices.clear();
+    ckpt_mesh_.cpu_indices.shrink_to_fit();
+    if (wiper_ws_tris_.empty()) return;
+
+    glCreateVertexArrays(1, &wiper_vao_);
+    glCreateBuffers(1, &wiper_vbo_);
+    glCreateBuffers(1, &wiper_ebo_);
+    glNamedBufferData(wiper_vbo_, 1024 * 12 * sizeof(float), nullptr, GL_STREAM_DRAW);
+    glNamedBufferData(wiper_ebo_, 4096 * sizeof(uint32_t), nullptr, GL_STREAM_DRAW);
+    glVertexArrayVertexBuffer(wiper_vao_, 0, wiper_vbo_, 0, 12 * sizeof(float));
+    glVertexArrayElementBuffer(wiper_vao_, wiper_ebo_);
+    glEnableVertexArrayAttrib(wiper_vao_, 0); glVertexArrayAttribFormat(wiper_vao_, 0, 3, GL_FLOAT, GL_FALSE, 0); glVertexArrayAttribBinding(wiper_vao_, 0, 0);
+    glEnableVertexArrayAttrib(wiper_vao_, 1); glVertexArrayAttribFormat(wiper_vao_, 1, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float)); glVertexArrayAttribBinding(wiper_vao_, 1, 0);
+    glEnableVertexArrayAttrib(wiper_vao_, 2); glVertexArrayAttribFormat(wiper_vao_, 2, 4, GL_FLOAT, GL_FALSE, 6 * sizeof(float)); glVertexArrayAttribBinding(wiper_vao_, 2, 0);
+    glEnableVertexArrayAttrib(wiper_vao_, 3); glVertexArrayAttribFormat(wiper_vao_, 3, 2, GL_FLOAT, GL_FALSE, 10 * sizeof(float)); glVertexArrayAttribBinding(wiper_vao_, 3, 0);
+    wiper_mesh_dirty_ = true;
+}
+
+void AircraftAndHud::update_wipers(float rdt, float rain_mm) {
+    const bool bus_ok = (systems_.get_bus_volts() >= 16.0) || st_.slew_fast || (st_.visual_rpm_override >= 0.0);
+    float tgt_freq = 0.0f;
+    if (bus_ok) {
+        if (st_.wiper_mode == 1) {
+            if (rain_mm >= 11.0f) tgt_freq = 1.28f;
+            else if (rain_mm >= 4.0f) tgt_freq = 0.88f;
+            else if (rain_mm >= 1.5f) tgt_freq = 0.58f;
+        } else if (st_.wiper_mode == 2) {
+            tgt_freq = 0.82f;
+        } else if (st_.wiper_mode == 3) {
+            tgt_freq = 1.32f;
+        }
+    }
+
+    const float prev_pos = wiper_pos_;
+    if (tgt_freq > 0.0f) {
+        wiper_freq_ = std::lerp(wiper_freq_, tgt_freq, std::min(1.0f, rdt * 6.0f));
+        wiper_phase_ += 2.0f * PI_F * wiper_freq_ * rdt;
+        if (wiper_phase_ > 628.3185f) wiper_phase_ = 12.56637f + std::fmod(wiper_phase_, 2.0f * PI_F);
+        wiper_park_age_s_ = 0.0f;
+    } else if (bus_ok && wiper_pos_ > 0.015f) {
+        const float mod_before = std::fmod(wiper_phase_, 2.0f * PI_F);
+        const float step = 2.0f * PI_F * 0.72f * rdt;
+        if (mod_before + step >= 2.0f * PI_F) {
+            wiper_phase_ = std::ceil(wiper_phase_ / (2.0f * PI_F)) * (2.0f * PI_F);
+            wiper_freq_ = 0.0f;
+        } else {
+            wiper_phase_ += step;
+        }
+        wiper_park_age_s_ = 0.0f;
+    } else {
+        wiper_freq_ = 0.0f;
+        wiper_park_age_s_ = std::min(20.0f, wiper_park_age_s_ + rdt);
+        if (wiper_park_age_s_ > 4.5f) wiper_phase_ = 0.0f;
+    }
+    wiper_pos_ = 0.5f - 0.5f * std::cos(wiper_phase_);
+    if (!wiper_mesh_dirty_ && std::abs(wiper_pos_ - prev_pos) < 0.0005f) return;
+    if (wiper_ws_tris_.empty() || !wiper_vbo_ || !wiper_ebo_) return;
+    wiper_mesh_dirty_ = false;
+
+    auto eval_surface = [&](float u, float v, Vec3 &out_p, Vec3 &out_n) {
+        const float uc = std::clamp(u, 0.02f, 0.98f);
+        const float vc = std::clamp(v, 0.08f, 0.995f);
+        float best_d2 = 1e9f;
+        const WiperSurfaceTri *best_t = &wiper_ws_tris_[0];
+        for (const auto &tr : wiper_ws_tris_) {
+            const float dv1x = tr.uv1.x - tr.uv0.x, dv1y = tr.uv1.y - tr.uv0.y;
+            const float dv2x = tr.uv2.x - tr.uv0.x, dv2y = tr.uv2.y - tr.uv0.y;
+            const float den = dv1x * dv2y - dv2x * dv1y;
+            if (std::abs(den) > 1e-8f) {
+                const float qx = uc - tr.uv0.x, qy = vc - tr.uv0.y;
+                const float w1 = (qx * dv2y - dv2x * qy) / den;
+                const float w2 = (dv1x * qy - qx * dv1y) / den;
+                const float w0 = 1.0f - w1 - w2;
+                if (w0 >= -0.02f && w1 >= -0.02f && w2 >= -0.02f) {
+                    out_p = tr.p0 * w0 + tr.p1 * w1 + tr.p2 * w2;
+                    out_n = normalize(tr.n0 * w0 + tr.n1 * w1 + tr.n2 * w2);
+                    if (out_n.z > 0.0f) out_n = {-out_n.x, -out_n.y, -out_n.z};
+                    return;
+                }
+            }
+            const float cu = (tr.uv0.x + tr.uv1.x + tr.uv2.x) * (1.0f / 3.0f) - uc;
+            const float cv = (tr.uv0.y + tr.uv1.y + tr.uv2.y) * (1.0f / 3.0f) - vc;
+            const float d2 = cu * cu + cv * cv;
+            if (d2 < best_d2) { best_d2 = d2; best_t = &tr; }
+        }
+        out_p = (best_t->p0 + best_t->p1 + best_t->p2) * (1.0f / 3.0f);
+        out_n = normalize(best_t->n0 + best_t->n1 + best_t->n2);
+        if (out_n.z > 0.0f) out_n = {-out_n.x, -out_n.y, -out_n.z};
+    };
+
+    struct WVert { float px, py, pz, nx, ny, nz, r, g, b, a, u, v; };
+    thread_local std::vector<WVert> vbuf;
+    thread_local std::vector<uint32_t> ibuf;
+    vbuf.clear();
+    ibuf.clear();
+
+    auto add_beam = [&](const std::vector<Vec3> &pts, const std::vector<Vec3> &nrms,
+                        float half_w, float base_off, float top_off, Vec4 col) {
+        const size_t n = pts.size();
+        if (n < 2) return;
+        const uint32_t base_vi = static_cast<uint32_t>(vbuf.size());
+        for (size_t i = 0; i < n; ++i) {
+            const Vec3 &p = pts[i];
+            const Vec3 &nm = nrms[i];
+            const Vec3 fwd = normalize(i + 1 < n ? (pts[i + 1] - p) : (p - pts[i - 1]));
+            Vec3 side = cross(fwd, nm);
+            if (length(side) < 0.1f) side = {1.0f, 0.0f, 0.0f};
+            else side = normalize(side);
+            const Vec3 pb = p + nm * base_off;
+            const Vec3 pt = p + nm * top_off;
+            const Vec3 c0 = pb - side * half_w;
+            const Vec3 c1 = pb + side * half_w;
+            const Vec3 c2 = pt + side * half_w;
+            const Vec3 c3 = pt - side * half_w;
+            vbuf.push_back({c0.x, c0.y, c0.z, nm.x, nm.y, nm.z, col.x, col.y, col.z, col.w, 0.5f, 0.5f});
+            vbuf.push_back({c1.x, c1.y, c1.z, nm.x, nm.y, nm.z, col.x, col.y, col.z, col.w, 0.5f, 0.5f});
+            vbuf.push_back({c2.x, c2.y, c2.z, nm.x, nm.y, nm.z, col.x, col.y, col.z, col.w, 0.5f, 0.5f});
+            vbuf.push_back({c3.x, c3.y, c3.z, nm.x, nm.y, nm.z, col.x, col.y, col.z, col.w, 0.5f, 0.5f});
+        }
+        for (size_t i = 0; i + 1 < n; ++i) {
+            const uint32_t a = base_vi + static_cast<uint32_t>(i * 4);
+            const uint32_t b = a + 4;
+            for (uint32_t f = 0; f < 4; ++f) {
+                const uint32_t nf = (f + 1) & 3;
+                ibuf.push_back(a + f); ibuf.push_back(b + f); ibuf.push_back(b + nf);
+                ibuf.push_back(a + f); ibuf.push_back(b + nf); ibuf.push_back(a + nf);
+            }
+        }
+    };
+
+    const float ang = -0.02f + wiper_pos_ * 1.40f;
+    const float ca = std::cos(ang), sa = std::sin(ang);
+    static constexpr float kAx = 2.25f;
+    static constexpr float kPivots[2][2] = {{0.18f, 1.02f}, {0.54f, 1.02f}};
+
+    for (int side = 0; side < 2; ++side) {
+        const float pu = kPivots[side][0], pv = kPivots[side][1];
+        auto uv_at = [&](float r, float perp_off = 0.0f) -> Vec2 {
+            return {pu + (r * ca - perp_off * sa) / kAx, pv - (r * sa + perp_off * ca)};
+        };
+
+        // 1. Slim tapered black anodized spring arm (parks flush below cowl sill when idle)
+        std::vector<Vec3> a_pts(6), a_nrms(6);
+        for (int i = 0; i < 6; ++i) {
+            const Vec2 uv = uv_at(0.36f * (static_cast<float>(i) / 5.0f), 0.0f);
+            eval_surface(uv.x, uv.y, a_pts[i], a_nrms[i]);
+        }
+        add_beam(a_pts, a_nrms, 0.0036f, 0.011f, 0.0155f, {0.013f, 0.014f, 0.017f, 1.0f});
+
+        // 2. Pantograph parallel tie rod
+        std::vector<Vec3> p_pts(4), p_nrms(4);
+        for (int i = 0; i < 4; ++i) {
+            const Vec2 uv = uv_at(0.02f + 0.32f * (static_cast<float>(i) / 3.0f), 0.016f);
+            eval_surface(uv.x, uv.y, p_pts[i], p_nrms[i]);
+        }
+        add_beam(p_pts, p_nrms, 0.0018f, 0.011f, 0.0140f, {0.015f, 0.016f, 0.019f, 1.0f});
+
+        // 3. Conforming articulated squeegee spine + velvety charcoal rubber lip flush with glass!
+        std::vector<Vec3> b_pts(10), b_nrms(10);
+        for (int i = 0; i < 10; ++i) {
+            const float r = 0.135f + (0.625f - 0.135f) * (static_cast<float>(i) / 9.0f);
+            const Vec2 uv = uv_at(r, 0.0f);
+            eval_surface(uv.x, uv.y, b_pts[i], b_nrms[i]);
+        }
+        add_beam(b_pts, b_nrms, 0.0028f, 0.0052f, 0.0090f, {0.012f, 0.013f, 0.016f, 1.0f});
+        add_beam(b_pts, b_nrms, 0.0014f, 0.0016f, 0.0052f, {0.008f, 0.0085f, 0.010f, 1.0f});
+    }
+
+    glNamedBufferSubData(wiper_vbo_, 0, static_cast<GLsizeiptr>(vbuf.size() * sizeof(WVert)), vbuf.data());
+    glNamedBufferSubData(wiper_ebo_, 0, static_cast<GLsizeiptr>(ibuf.size() * sizeof(uint32_t)), ibuf.data());
+    wiper_idx_count_ = static_cast<GLsizei>(ibuf.size());
+}
+
+void AircraftAndHud::step_windshield_sim(float rdt, float rain_mm, float relative_airspeed,
+                                         float sim_time_sec, float defrost_clear) {
+    if (!win_sim_prog_ || !windshield_sim_fbo_[0] || !win_sim_vao_) return;
+    const bool was_valid = win_sim_valid_;
+    if (rain_mm >= 0.70f) {
+        win_sim_dry_s_ = 0.0f;
+        win_sim_valid_ = true;
+    } else if (win_sim_valid_) {
+        win_sim_dry_s_ += rdt;
+        if (win_sim_dry_s_ >= 8.0f) {
+            static const float kZero4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            glClearTexImage(windshield_sim_tex_[0], 0, GL_RGBA, GL_FLOAT, kZero4);
+            glClearTexImage(windshield_sim_tex_[1], 0, GL_RGBA, GL_FLOAT, kZero4);
+            win_sim_valid_ = false;
+            wiper_prev_pos_ = wiper_pos_;
+            return;
+        }
+    } else {
+        wiper_prev_pos_ = wiper_pos_;
+        return;
+    }
+
+    GLint prev_fbo = 0;
+    GLint prev_vp[4]{0, 0, 1280, 720};
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev_fbo);
+    glGetIntegerv(GL_VIEWPORT, prev_vp);
+
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_BLEND);
+    glUseProgram(win_sim_prog_);
+    glBindVertexArray(win_sim_vao_);
+    if (u_ws_env_ >= 0) glUniform4f(u_ws_env_, relative_airspeed, defrost_clear, rain_cross_mps_, rain_propwash01_);
+
+    const int n_steps = (!was_valid && rain_mm >= 0.70f) ? 32 : 1;
+    for (int s = 0; s < n_steps; ++s) {
+        const float step_dt = (n_steps > 1) ? 0.028f : std::clamp(rdt, 0.002f, 0.040f);
+        const float step_t = (n_steps > 1) ? (sim_time_sec - static_cast<float>(n_steps - 1 - s) * 0.028f) : sim_time_sec;
+        const float wp0 = (n_steps > 1) ? (wiper_pos_ * static_cast<float>(s) / static_cast<float>(n_steps)) : wiper_prev_pos_;
+        const float wp1 = (n_steps > 1) ? (wiper_pos_ * static_cast<float>(s + 1) / static_cast<float>(n_steps)) : wiper_pos_;
+        const int dst = 1 - win_sim_ping_;
+        glBindFramebuffer(GL_FRAMEBUFFER, windshield_sim_fbo_[dst]);
+        glViewport(0, 0, 256, 160);
+        if (u_ws_flow_ >= 0) glUniform4f(u_ws_flow_, rain_vel_front_.x, rain_vel_front_.y, step_dt, rain_mm);
+        if (u_ws_wiper_ >= 0) glUniform4f(u_ws_wiper_, wp0, wp1, wiper_park_age_s_, step_t);
+        glBindTextureUnit(0, windshield_sim_tex_[win_sim_ping_]);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        win_sim_ping_ = dst;
+    }
+    wiper_prev_pos_ = wiper_pos_;
+
+    glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(prev_fbo));
+    glViewport(prev_vp[0], prev_vp[1], prev_vp[2], prev_vp[3]);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_GREATER);
+}
+
+void AircraftAndHud::draw_wipers(const Mat4 &vp, const Mat4 &root_world, const Mat4 &root_cam_rel) const {
+    if (!wiper_vao_ || wiper_idx_count_ <= 0) return;
+    const Mat4 mvp = vp * root_world;
+    glUniformMatrix4fv(u_ac_mvp_, 1, GL_FALSE, mvp.m);
+    glUniformMatrix4fv(u_ac_model_, 1, GL_FALSE, root_cam_rel.m);
+    if (u_ac_node_ >= 0) {
+        const Mat4 id = Mat4::identity();
+        glUniformMatrix4fv(u_ac_node_, 1, GL_FALSE, id.m);
+    }
+    if (u_ac_dmg_zones_ >= 0) glUniform4f(u_ac_dmg_zones_, 0.0f, 0.0f, 0.0f, 0.0f);
+    glBindTextureUnit(0, white_tex_);
+    glBindTextureUnit(1, white_tex_);
+    glBindTextureUnit(2, white_tex_);
+    glUniform4f(u_ac_tint_, 1.0f, 1.0f, 1.0f, 1.0f);
+    glUniform4f(u_ac_pbr_, 0.08f, 0.65f, 0.0f, 0.0f);
+    glUniform3f(u_ac_em_, 0.0f, 0.0f, 0.0f);
+    glUniform1f(u_ac_alpha_, 1.0f);
+    glUniform1f(u_ac_livery_, 0.0f);
+    glUniform1i(u_ac_unlit_, 0);
+    glUniform1f(u_ac_baked_reflection_, 0.0f);
+    glUniform1i(u_ac_cabin_glass_, 0);
+    glDisable(GL_CULL_FACE);
+    glBindVertexArray(wiper_vao_);
+    glDrawElements(GL_TRIANGLES, wiper_idx_count_, GL_UNSIGNED_INT, nullptr);
+    glBindVertexArray(ckpt_mesh_.vao);
+}
+
 void AircraftAndHud::draw_glb(
     const GlbMeshData &mesh,
     const Mat4 &vp, const Mat4 &root_world, const Mat4 &root_cam_rel,
@@ -2526,13 +2868,8 @@ void AircraftAndHud::draw_glb(
     glUniform1i(u_ac_output_lut_, 6);
     glUniform1i(u_ac_rain_luts_, (windshield_rain_front_tex_ ? 1 : 0) | (windshield_rain_side_tex_ ? 2 : 0));
     glBindVertexArray(mesh.vao);
-    const nspain::FlightState &flight_air = fdm_.state();
-    // Use JSBSim true airspeed for the rain-flow driver. Ground speed varies
-    // with wind and can make the drops slide at the wrong rate in a headwind.
-    // Slew mode bypasses JSBSim, so derive its flow from the explicit slew speed.
-    const float relative_airspeed = st_.slew_fast
-        ? static_cast<float>(std::max(0.0, st_.speed_mps))
-        : static_cast<float>(std::max(0.0, flight_air.tas_kt) * 0.514444);
+    // Pass full coupled body-axis airflow (JSBSim TAS + ambient wind + propwash) computed in render_aircraft_3d.
+    const float relative_airspeed = rain_airspeed_mps_;
 
     // Pass 0: opaque submeshes; Pass 1: translucent glass, sun visors & spinning prop blur disc
     for (int pass = 0; pass < 2; pass++) {
@@ -2609,7 +2946,7 @@ void AircraftAndHud::draw_glb(
                    mesh.nodes[ni].name == visual_node_name(mesh, "Cabin glazing") ? 1 : 0)
                 : 0;
             glUniform1i(u_ac_cabin_glass_, glass_mode);
-            const float glass_rain_mm = (last_air_.precipitation_mm_hr >= 0.45) ? static_cast<float>(last_air_.precipitation_mm_hr) : 0.0f;
+            const float glass_rain_mm = (last_air_.precipitation_mm_hr >= 0.70) ? static_cast<float>(last_air_.precipitation_mm_hr) : 0.0f;
             glUniform3f(u_ac_glass_weather_, glass_rain_mm, sim_time_sec, relative_airspeed);
             if (u_ac_glass_flow_f_ >= 0) {
                 glUniform4f(u_ac_glass_flow_f_, rain_flow_front_.x, rain_flow_front_.y,
@@ -2624,6 +2961,12 @@ void AircraftAndHud::draw_glb(
             glUniform4f(u_ac_glass_fx_, windscreen_frost_, cabin_mist_,
                         static_cast<float>(windshield_dirt_), last_air_.snow_factor);
             glUniform4f(u_ac_plane_wx_, airframe_ice01_, last_air_.lightning_flash, defrost_clear, wet_sheen);
+            if (u_ac_glass_wiper_ >= 0) {
+                glUniform4f(u_ac_glass_wiper_, wiper_pos_, std::fmod(wiper_phase_, 2.0f * PI_F),
+                            wiper_park_age_s_, std::min(wiper_phase_, 14.0f));
+            }
+            if (u_ac_win_sim_ >= 0) glUniform1i(u_ac_win_sim_, 8);
+            glBindTextureUnit(8, windshield_sim_tex_[win_sim_ping_] ? windshield_sim_tex_[win_sim_ping_] : white_tex_);
 
             if (sm.double_sided || glass_mode != 0) glDisable(GL_CULL_FACE);
             else glEnable(GL_CULL_FACE);
@@ -2632,6 +2975,9 @@ void AircraftAndHud::draw_glb(
                 reinterpret_cast<const void *>(static_cast<uintptr_t>(sm.first_index) * sizeof(uint32_t)),
                 sm.base_vertex
             );
+        }
+        if (pass == 0 && is_interior && wiper_vao_ && wiper_idx_count_ > 0) {
+            draw_wipers(vp, root_world, root_cam_rel);
         }
         if (pass == 1) {
             glDepthMask(GL_TRUE);
@@ -2746,35 +3092,63 @@ void AircraftAndHud::render_aircraft_3d(const Mat4 &vp, const Vec3 &cam_off, con
         prop_angle_rad_ = std::fmod(prop_angle_rad_ + rdt * eff_prop_rpm * 0.032f, 2.0f * PI_F);
     }
     {
-        // Physically coupled windshield & side-window rain flow from attitude (pitch/roll),
-        // aerodynamic slipstream (TAS + sideslip), and propeller slipstream wash.
-        const float pitch_r = static_cast<float>(st_.pitch_deg * DEG2RAD_D);
-        const float roll_r  = static_cast<float>(st_.roll_deg * DEG2RAD_D);
-        const float beta_r  = st_.slew_fast ? 0.0f : static_cast<float>(std::clamp(fs.beta_deg, -35.0, 35.0) * DEG2RAD_D);
-        const float gx = std::cos(pitch_r) * std::sin(roll_r);
-        const float gy = -std::cos(pitch_r) * std::cos(roll_r);
-        const float gz = std::sin(pitch_r);
-        const float tas_mps = st_.slew_fast
+        // Physically coupled windshield & side-window rain flow from 3D attitude (gravity projection),
+        // true body-frame airspeed + ambient atmospheric wind (headwind, crosswind, updrafts), and propwash.
+        const Vec3 body_right{ac_rot.m[0], ac_rot.m[1], ac_rot.m[2]};
+        const Vec3 body_up{ac_rot.m[4], ac_rot.m[5], ac_rot.m[6]};
+        const Vec3 body_fwd{-ac_rot.m[8], -ac_rot.m[9], -ac_rot.m[10]};
+        const Vec3 v_wind_gl{
+            static_cast<float>(last_air_.wind_east_mps),
+            static_cast<float>(last_air_.wind_up_mps),
+            static_cast<float>(-last_air_.wind_north_mps)
+        };
+        const Vec3 v_ac_gl{
+            static_cast<float>(st_.vel_east_mps),
+            static_cast<float>(st_.vsi_mps),
+            static_cast<float>(-st_.vel_north_mps)
+        };
+        const Vec3 rel_air_gl = v_wind_gl - v_ac_gl; // Air velocity relative to aircraft in GL ENU
+        const float kin_cross = dot(rel_air_gl, body_right);
+        const float kin_head  = -dot(rel_air_gl, body_fwd);
+        const float kin_up    = dot(rel_air_gl, body_up);
+
+        const float jsb_tas = st_.slew_fast
             ? static_cast<float>(std::max(0.0, st_.speed_mps))
             : static_cast<float>(std::max(0.0, fs.tas_kt) * 0.514444);
-        const float propwash_mps = st_.slew_fast ? 0.0f
-            : std::clamp((eff_prop_rpm - 450.0f) / 1850.0f, 0.0f, 1.0f) * 14.5f;
-        const float v_front_eff = tas_mps + propwash_mps;
-        const float v_side_eff  = tas_mps + propwash_mps * 0.25f;
-        const float q_front = std::pow(std::clamp(v_front_eff / 34.0f, 0.0f, 2.2f), 1.45f);
-        const float q_side  = std::pow(std::clamp(v_side_eff  / 34.0f, 0.0f, 2.2f), 1.45f);
-        rain_speed01_ = std::clamp((v_front_eff - 3.5f) / 48.0f, 0.0f, 1.0f);
+        const float beta_r = st_.slew_fast ? 0.0f : static_cast<float>(std::clamp(fs.beta_deg, -45.0, 45.0) * DEG2RAD_D);
+        const float jsb_cross = st_.slew_fast ? kin_cross : -std::sin(beta_r) * jsb_tas;
 
-        const float grav_front_v = gy * (-0.74f) + gz * 0.67f;
-        const float aero_front_u = -std::sin(beta_r) * q_front * 0.95f;
-        const float aero_front_v = -q_front * 1.15f;
+        // Unify parked/static/slew relative wind with JSBSim flight airspeed & real-time atmospheric gusts
+        const float air_active = std::clamp((jsb_tas - 3.0f) / 10.0f, 0.0f, 1.0f);
+        const float fwd_air_mps = (std::max)(std::lerp(kin_head, jsb_tas, air_active), -14.0f);
+        const float gust_u = static_cast<float>(last_air_.p_turb_rps * 3.2 + last_air_.r_turb_rps * 2.4);
+        const float gust_v = static_cast<float>(last_air_.q_turb_rps * 2.6);
+        const float cross_air_mps = std::lerp(kin_cross, jsb_cross, air_active * 0.65f) + gust_u;
+
+        const float prop01 = st_.slew_fast ? 0.0f : std::clamp((eff_prop_rpm - 420.0f) / 1880.0f, 0.0f, 1.0f);
+        const float propwash_mps = prop01 * 16.5f;
+        const float v_axial_front = std::max(0.0f, fwd_air_mps + propwash_mps - 0.35f * std::max(0.0f, -kin_up));
+        const float v_total_front = std::hypot(v_axial_front, cross_air_mps * 0.65f);
+        const float v_side_eff    = std::max(0.0f, fwd_air_mps) + propwash_mps * 0.30f + std::abs(cross_air_mps) * 0.28f;
+
+        rain_airspeed_mps_ = v_total_front;
+        rain_cross_mps_    = cross_air_mps;
+        rain_propwash01_   = prop01;
+        rain_speed01_      = std::clamp((v_total_front - 3.5f) / 50.0f, 0.0f, 1.0f);
+
+        const float grav_front_u = -body_right.y;
+        const float grav_front_v = 0.75f * (-body_up.y) + 0.66f * body_fwd.y; // +v downward along sloped windshield
+        const float q_front = std::pow(std::clamp(v_axial_front / 26.0f, 0.0f, 3.8f), 1.45f);
+        const float q_cross = cross_air_mps * (0.015f + 0.012f * std::sqrt(v_axial_front + std::abs(cross_air_mps) + 1.0f));
+        const float q_side  = std::pow(std::clamp(v_side_eff / 26.0f, 0.0f, 3.8f), 1.45f);
+
         rain_vel_front_ = {
-            (gx * 0.65f + aero_front_u * 0.95f) * 0.36f,
-            (grav_front_v * 0.52f + aero_front_v) * 0.42f
+            grav_front_u * 0.16f + q_cross * 0.85f,
+            grav_front_v * 0.18f - q_front * 0.34f + gust_v * 0.08f
         };
         rain_vel_side_ = {
-            (gz * 0.42f + q_side * 1.25f) * 0.40f,
-            (-gy * 0.56f - q_side * 0.10f) * 0.40f
+            0.09f * body_fwd.y + q_side * 0.38f + gust_u * 0.06f,
+            0.16f * (-body_up.y) - q_side * 0.045f + gust_v * 0.06f
         };
         if (last_air_.precipitation_mm_hr >= 0.35) {
             auto wrap = [](float v) {
@@ -2786,6 +3160,10 @@ void AircraftAndHud::render_aircraft_3d(const Mat4 &vp, const Vec3 &cam_off, con
             rain_flow_side_.x  = wrap(rain_flow_side_.x  + rain_vel_side_.x  * rdt);
             rain_flow_side_.y  = wrap(rain_flow_side_.y  + rain_vel_side_.y  * rdt);
         }
+        const float glass_rain = (last_air_.precipitation_mm_hr >= 0.70) ? static_cast<float>(last_air_.precipitation_mm_hr) : 0.0f;
+        update_wipers(rdt, glass_rain);
+        const float defrost_c = std::clamp(static_cast<float>((systems_.get_oil_temp_f() - 120.0) / 55.0), 0.0f, 1.0f);
+        step_windshield_sim(rdt, glass_rain, v_total_front, sim_time_sec, defrost_c);
     }
     // Engine-driven vacuum pump spools the attitude & directional gyros upright above 2.2 inHg, tumbles when off!
     const float gyro_target = (rpm > 450.0f && systems_.get_vacuum_inhg() >= 2.2) ? 1.0f : 0.0f;
@@ -3240,8 +3618,11 @@ void AircraftAndHud::render_hud(
     static const char *kQNames[4] = {"LOW iGPU", "MEDIUM", "HIGH", "ULTRA"};
     static const char *kVNames[3] = {"COCKPIT", "CHASE", "FREE CAM"};
 
-    // HiDPI-aware responsive sizing: razor-sharp ~22px text @ 1080p, ~35px @ 1728p, auto-clamped so ZERO clip/overlap!
-    const float ui = std::clamp(std::min(hf / 1080.0f, wf / 1920.0f), 0.78f, 2.30f);
+    // HiDPI-aware & portrait-aware sizing: crisp text on both 16:9 desktop and 9:16 portrait captures!
+    const bool portrait = (wf < hf);
+    const float ui = portrait
+        ? std::clamp(wf / 1080.0f, 0.78f, 1.50f)
+        : std::clamp(std::min(hf / 1080.0f, wf / 1920.0f), 0.78f, 2.30f);
     const float margin = 16.0f * ui;
     const float pad_x  = 16.0f * ui;
     const float pad_y  = 12.0f * ui;
@@ -3287,15 +3668,16 @@ void AircraftAndHud::render_hud(
     size_t max_l = 0, max_r = 0;
     for (int i = 0; i < 6; i++) max_l = std::max(max_l, std::strlen(L[i]));
     for (int i = 0; i < 6; i++) max_r = std::max(max_r, std::strlen(R[i]));
-    float max_panel_w = wf * 0.475f;
-    float fh = 22.5f * ui;
+    const bool promo_custom = debug && debug->promo_mode != PromoInspectMode::None;
+    float max_panel_w = portrait ? (wf - 2.0f * margin) : (wf * 0.475f);
+    float fh = (portrait ? 18.0f : 22.5f) * ui;
     float need_w = static_cast<float>(std::max(max_l, max_r)) * (fh * 0.56f) + pad_x * 2.2f;
     if (need_w > max_panel_w) fh *= (max_panel_w / need_w);
     const float adv = fh * 0.56f;
     const float row_h = fh * 1.24f;
 
     const float lh = pad_y * 2.0f + 6.0f * row_h;
-    if (show_diagnostics && !st_.menu_open) {
+    if (show_diagnostics && !st_.menu_open && !promo_custom) {
     // Top-left Flight Telemetry Glass Panel
     const float lw = std::min(max_panel_w, static_cast<float>(max_l) * adv + pad_x * 2.1f);
     hud_rect(margin, margin, lw, lh, 0.035f, 0.060f, 0.095f, 0.82f);
@@ -3310,22 +3692,23 @@ void AircraftAndHud::render_hud(
     hud_text(margin + pad_x, margin + pad_y + 4.0f * row_h, fh, L[4], 0.80f, 0.95f, 0.86f, 1.0f);
     hud_text(margin + pad_x, margin + pad_y + 5.0f * row_h, fh * 0.92f, L[5], 0.74f, 0.84f, 0.94f, 0.96f);
 
-    // Top-right Engine, Weather & 10-TOD Telemetry Glass Panel
+    // Top-right Engine, Weather & 10-TOD Telemetry Glass Panel (stacks cleanly beneath L in portrait)
     const float rw = std::min(max_panel_w, static_cast<float>(max_r) * adv + pad_x * 2.1f);
     const float rh = pad_y * 2.0f + 6.0f * row_h;
-    const float rx = wf - rw - margin;
-    hud_rect(rx, margin, rw, rh, 0.035f, 0.060f, 0.095f, 0.82f);
-    hud_border(rx, margin, rw, rh, std::max(1.0f, 1.5f * ui), 0.36f, 0.62f, 0.85f, 0.55f);
-    hud_rect(rx, margin, rw, std::max(2.0f, 3.0f * ui), 0.96f, 0.78f, 0.36f, 0.92f);
+    const float rx = portrait ? margin : (wf - rw - margin);
+    const float ry = portrait ? (margin + lh + 10.0f * ui) : margin;
+    hud_rect(rx, ry, rw, rh, 0.035f, 0.060f, 0.095f, 0.82f);
+    hud_border(rx, ry, rw, rh, std::max(1.0f, 1.5f * ui), 0.36f, 0.62f, 0.85f, 0.55f);
+    hud_rect(rx, ry, rw, std::max(2.0f, 3.0f * ui), 0.96f, 0.78f, 0.36f, 0.92f);
 
-    hud_text(rx + pad_x, margin + pad_y + 0.0f * row_h, fh, R[0], 1.00f, 0.95f, 0.78f, 1.0f);
-    hud_text(rx + pad_x, margin + pad_y + 1.0f * row_h, fh, R[1], 0.86f, 0.94f, 1.00f, 1.0f);
-    hud_text(rx + pad_x, margin + pad_y + 2.0f * row_h, fh, R[2], 0.86f, 0.94f, 1.00f, 1.0f);
-    hud_text(rx + pad_x, margin + pad_y + 3.0f * row_h, fh, R[3], 0.80f, 0.90f, 0.96f, 1.0f);
-    hud_text(rx + pad_x, margin + pad_y + 4.0f * row_h, fh, R[4], 0.42f, 0.98f, 0.64f, 1.0f);
-    hud_text(rx + pad_x, margin + pad_y + 5.0f * row_h, fh * 0.94f, R[5], 0.82f, 0.88f, 0.94f, 0.96f);
+    hud_text(rx + pad_x, ry + pad_y + 0.0f * row_h, fh, R[0], 1.00f, 0.95f, 0.78f, 1.0f);
+    hud_text(rx + pad_x, ry + pad_y + 1.0f * row_h, fh, R[1], 0.86f, 0.94f, 1.00f, 1.0f);
+    hud_text(rx + pad_x, ry + pad_y + 2.0f * row_h, fh, R[2], 0.86f, 0.94f, 1.00f, 1.0f);
+    hud_text(rx + pad_x, ry + pad_y + 3.0f * row_h, fh, R[3], 0.80f, 0.90f, 0.96f, 1.0f);
+    hud_text(rx + pad_x, ry + pad_y + 4.0f * row_h, fh, R[4], 0.42f, 0.98f, 0.64f, 1.0f);
+    hud_text(rx + pad_x, ry + pad_y + 5.0f * row_h, fh * 0.94f, R[5], 0.82f, 0.88f, 0.94f, 0.96f);
 
-    } else if (!st_.menu_open) {
+    } else if (!st_.menu_open && !promo_custom) {
         char flight[128];
         const char *season_tag = wx_snap ? WeatherLibrary::season_name(wx_snap->season) : "AUTO";
         std::snprintf(flight, sizeof(flight), "%.0f KT  %.0f FT MSL  HDG %03d  %s",
@@ -3334,8 +3717,10 @@ void AircraftAndHud::render_hud(
         const float footer = hf - 48.0f * ui;
         hud_rect(margin, footer, band, 36.0f * ui, 0.026f, 0.048f, 0.070f, 0.84f);
         hud_text(margin + 12.0f * ui, footer + 6.0f * ui, 19.0f * ui, flight, 0.93f, 0.97f, 1.0f, 1.0f);
-        hud_text(wf - 480.0f * ui, footer + 6.0f * ui, 16.0f * ui,
-                 "ESC Menu   N Season   F5 Profile   F6 Weather   F7 Physics", 0.94f, 0.97f, 1.0f, 1.0f);
+        if (!portrait) {
+            hud_text(wf - 480.0f * ui, footer + 6.0f * ui, 16.0f * ui,
+                     "ESC Menu   N Season   F5 Profile   F6 Weather   F7 Physics", 0.94f, 0.97f, 1.0f, 1.0f);
+        }
     }
 
     if (collision_msg_s_ > 0.0 && !collision_msg_.empty() && !st_.menu_open) {
@@ -3347,10 +3732,28 @@ void AircraftAndHud::render_hud(
         hud_text(bx + 16.0f * ui, by + 8.0f * ui, 19.0f * ui, collision_msg_.c_str(), 1.0f, 0.88f, 0.72f, 1.0f);
     }
 
+    const float debug_top = margin + (show_diagnostics && !promo_custom ? (portrait ? (lh * 2.0f + 20.0f * ui) : (lh + 10.0f * ui)) : 0.0f);
     if (debug && !st_.menu_open)
-        render_debug_overlays(wf, hf, margin + (show_diagnostics ? lh + 10.0f * ui : 0.0f), reg_atmo, *debug);
+        render_debug_overlays(wf, hf, debug_top, reg_atmo, *debug);
 
     flush_hud(wf, hf);
+
+    // Render live GPU windshield PDE buffer PiP cleanly on top of its bottom card frame in Weather Video 3
+    if (debug && debug->promo_mode == PromoInspectMode::WeatherCloudsWindshield &&
+        st_.view_mode == 0 && win_sim_valid_ && windshield_sim_tex_[win_sim_ping_] != 0) {
+        const float ps = portrait ? std::clamp(wf / 1080.0f, 0.78f, 1.35f) : std::min(wf / 1920.0f, hf / 1080.0f);
+        const float pip_x = 42.0f * ps;
+        const float pip_y = hf - 294.0f * ps;
+        const float pip_w = 400.0f * ps;
+        const float pip_h = 250.0f * ps;
+        draw_hud_texture_pip(windshield_sim_tex_[win_sim_ping_], 1, pip_x, pip_y, pip_w, pip_h, wf, hf, 1.0f);
+        hud_verts_.clear();
+        hud_border(pip_x, pip_y, pip_w, pip_h, 2.5f * ps, 0.28f, 0.90f, 1.0f, 0.95f);
+        hud_rect(pip_x + 0.14f * pip_w - 5.0f * ps, pip_y + 0.85f * pip_h - 5.0f * ps, 10.0f * ps, 10.0f * ps, 1.0f, 0.78f, 0.25f, 1.0f);
+        hud_rect(pip_x + 0.56f * pip_w - 5.0f * ps, pip_y + 0.84f * pip_h - 5.0f * ps, 10.0f * ps, 10.0f * ps, 1.0f, 0.78f, 0.25f, 1.0f);
+        hud_text(pip_x + 10.0f * ps, pip_y + 10.0f * ps, 18.0f * ps, "GPU FLUID PDE", 0.96f, 0.98f, 1.0f, 0.95f);
+        flush_hud(wf, hf);
+    }
 }
 
 void AircraftAndHud::render_cockpit_interaction(
@@ -3442,6 +3845,9 @@ void AircraftAndHud::render_cockpit_interaction(
     } else {
         add_p("pitot_prime", {-0.088f, -0.136f, 0.018f}, 18.0f, systems_.get_pitot_heat_switch() ? "PITOT HEAT: ON" : "PITOT HEAT: OFF");
     }
+    static constexpr const char *kWiperStr[4] = {"OFF (PARKED)", "AUTO (RAIN-SENSING)", "LOW", "HIGH"};
+    std::snprintf(buf, sizeof(buf), "WINDSHIELD WIPERS: %s  (Key J)", kWiperStr[std::clamp(st_.wiper_mode, 0, 3)]);
+    add_p("wipers", {-0.056f, -0.136f, 0.018f}, 18.0f, buf);
 
     // 2. 10 Physical 28V Circuit Breakers on Panel (click pulls/resets real CB!)
     static constexpr int kPanelCbs[10] = {
@@ -3592,6 +3998,8 @@ void AircraftAndHud::render_cockpit_interaction(
         else if (id == "pitot_prime") {
             if (!running) systems_.actuate_primer();
             else systems_.set_pitot_heat_switch(!systems_.get_pitot_heat_switch());
+        } else if (id == "wipers") {
+            st_.wiper_mode = (st_.wiper_mode + 1) % 4;
         } else if (id.size() == 3 && id[0] == 'c' && id[1] == 'b') {
             systems_.toggle_breaker(kPanelCbs[id[2] - '0']);
         } else if (id == "carb_heat") systems_.set_carb_heat(systems_.get_carb_heat() > 0.5 ? 0.0 : 1.0);
@@ -3727,7 +4135,7 @@ void AircraftAndHud::render_cockpit_interaction(
     flush_hud(wf, hf);
 }
 
-void AircraftAndHud::flush_hud(float wf, float hf, GLuint font) {
+void AircraftAndHud::flush_hud(float wf, float hf, GLuint font, int tex_mode) {
     if (hud_verts_.empty()) return;
     if (hud_verts_.size() > hud_vbo_cap_) {
         while (hud_vbo_cap_ < hud_verts_.size()) hud_vbo_cap_ = std::max<size_t>(32768, hud_vbo_cap_ * 2);
@@ -3736,17 +4144,34 @@ void AircraftAndHud::flush_hud(float wf, float hf, GLuint font) {
     const size_t max_v = hud_verts_.size();
     glNamedBufferSubData(hud_vbo_, 0, static_cast<GLsizeiptr>(max_v * sizeof(HudVert)), hud_verts_.data());
 
+    // Keep glViewport synchronized to logical HUD framebuffer dimensions without changing active FBO.
+    glViewport(0, 0, static_cast<GLsizei>(wf), static_cast<GLsizei>(hf));
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glUseProgram(hud_prog_);
     glUniform2f(u_hud_scr_, wf, hf);
+    if (u_hud_tex_mode_ >= 0) glUniform1i(u_hud_tex_mode_, tex_mode);
     glBindTextureUnit(0, font ? font : (hud_font_tex_ ? hud_font_tex_ : white_tex_));
     glBindVertexArray(hud_vao_);
     glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(max_v));
     glBindVertexArray(0);
+    if (u_hud_tex_mode_ >= 0 && tex_mode != 0) glUniform1i(u_hud_tex_mode_, 0);
     glDisable(GL_BLEND);
+}
+
+void AircraftAndHud::draw_hud_texture_pip(GLuint tex, int mode, float x, float y, float w, float h, float wf, float hf, float alpha) {
+    if (!tex) return;
+    hud_verts_.clear();
+    hud_verts_.push_back({x,     y,     0.0f, 0.0f, 1.0f, 1.0f, 1.0f, alpha});
+    hud_verts_.push_back({x + w, y,     1.0f, 0.0f, 1.0f, 1.0f, 1.0f, alpha});
+    hud_verts_.push_back({x + w, y + h, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, alpha});
+    hud_verts_.push_back({x,     y,     0.0f, 0.0f, 1.0f, 1.0f, 1.0f, alpha});
+    hud_verts_.push_back({x + w, y + h, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, alpha});
+    hud_verts_.push_back({x,     y + h, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f, alpha});
+    flush_hud(wf, hf, tex, mode);
+    hud_verts_.clear();
 }
 
 } // namespace nsim

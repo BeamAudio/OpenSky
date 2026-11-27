@@ -1,9 +1,12 @@
 # Changelog
 
-This file records user-visible changes. No GitHub release version has been assigned yet.
+## 0.3.2 (2026-11-27)
 
-## Unreleased
-
+- Expanded `weather_detail` to 7 gradual volumetric cloud quality tiers (`Very Low` through `Ultra (Max Clouds)`, plus `Follow preset`) with `cloud_res_percent` scaling across 1080p–4K displays.
+- Rebuilt volumetric cloud shading in `clouds_qres.frag` around a unified 3D Perlin-Worley/Worley density field coupled directly to the solved mesoscale weather field (`0.56*L1 + 0.44*L2` mid-cloud steering wind with 60 Hz continuous field-advection interpolation, downwind vertical shear, dynamic `2/3/4`-tap directional sun light marching driven by Settings & `FlightFrameBudget`, opaque zero-visibility IMC interiors, and smooth mountain-crest depth fusion in `post_tonemap.frag`).
+- Added a real-time 2D `256x160` `GL_RGBA16F` shallow-water windshield fluid simulation (`windshield_rain_sim.frag`) driven by 3D body-frame airspeed, ambient crosswind/headwind, gravity projection, and clockwise propeller slipstream wash, plus articulated 3D conformal pantograph windshield wipers (`KEY_J` / panel switch) and metric object-space rain/fluid parity across lateral and rear cockpit windows.
+- Updated `FlightFrameBudget` adaptive pixel scaling floor (`44%` / `36%` thermal) for Ryzen/Renoir 60 FPS consistency while preserving native output resolution for cockpit instruments.
+- Added 5 `1080×1920` vertical @ 60 FPS engine showcase promo clips (`engine_load_balancing`, `engine_tile_loading`, `engine_weather_cloud_terrain`, `engine_aircraft_systems`, `engine_aircraft_physics`).
 - Fixed acoustic CFL instability, Davies nested boundary coupling, and debug pathline visualization in local weather refinement (`192×192` / `384×384`), added dividing-streamline orographic terrain flow deflection, and updated the 9:16 vertical weather promo videos.
 - Replaced World map wind arrows with an animated, zoom-adaptive GPU streamline flowmap across all installed `.nswx` regions.
 - Replaced scrolling raindrop LUTs on cockpit glass with procedural optical convex-lens water beads and meandering stick-slip rivulets.
@@ -19,6 +22,4 @@ This file records user-visible changes. No GitHub release version has been assig
 ### Current limitations
 
 - Aircraft format 1 supports one piston engine, two fuel tanks, and the shared light-piston systems profile. Multi-engine, turbine, aircraft-specific systems, and Lua behavior are not implemented.
-- The current Renoir benchmark does not meet the 60 FPS average and p95 frame-time targets.
-- C172 model attribution is documented; the region builder uses OurAirports and OpenStreetMap airport data and does not import ENAIRE AIP records. Open-Meteo remains an optional service with separate terms and can be disabled at launch. No Debian package has been generated, and baseline region packs are not in the source checkout. See the [GitHub publication status](docs/OPEN_SOURCE_RELEASE.md).
-- Windows 11 is not supported until the platform APIs are ported. See the [open-source release checklist](docs/OPEN_SOURCE_RELEASE.md).
+- C172 model attribution is documented; the region builder uses OurAirports and OpenStreetMap airport data and does not import ENAIRE AIP records. Open-Meteo remains an optional service with separate terms and can be disabled at launch. Baseline region packs are not in the source checkout. See the [GitHub publication status](docs/OPEN_SOURCE_RELEASE.md).

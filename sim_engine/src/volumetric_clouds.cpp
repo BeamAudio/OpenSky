@@ -44,7 +44,6 @@ bool SkyAndClouds::init(const std::string &shader_root, int win_w, int win_h, in
     u_cld_frame_   = glGetUniformLocation(cloud_prog_, "u_frame_idx");
     u_cld_tblend_  = glGetUniformLocation(cloud_prog_, "u_temporal_blend");
     u_cld_steps_   = glGetUniformLocation(cloud_prog_, "u_steps");
-    u_cld_sparse_  = glGetUniformLocation(cloud_prog_, "u_sparse_period");
     u_cld_lit_     = glGetUniformLocation(cloud_prog_, "u_cloud_lit");
     u_cld_sh_      = glGetUniformLocation(cloud_prog_, "u_cloud_shadow");
     u_cld_cool_    = glGetUniformLocation(cloud_prog_, "u_haze_cool");
@@ -101,6 +100,7 @@ void SkyAndClouds::free_fbos() {
     if (scene_fbo_)   { glDeleteFramebuffers(1, &scene_fbo_); scene_fbo_ = 0; }
     if (scene_col_)   { glDeleteTextures(1, &scene_col_);     scene_col_ = 0; }
     if (scene_depth_) { glDeleteTextures(1, &scene_depth_);   scene_depth_ = 0; }
+    if (cloud_occlusion_fbo_) { glDeleteFramebuffers(1, &cloud_occlusion_fbo_); cloud_occlusion_fbo_ = 0; }
     if (cloud_occlusion_depth_) { glDeleteTextures(1, &cloud_occlusion_depth_); cloud_occlusion_depth_ = 0; }
     for (int i = 0; i < 2; i++) {
         if (cloud_fbo_[i]) { glDeleteFramebuffers(1, &cloud_fbo_[i]); cloud_fbo_[i] = 0; }
@@ -156,11 +156,16 @@ void SkyAndClouds::alloc_fbos(int win_w, int win_h, int quality, int pixel_perce
     glTextureParameteri(scene_depth_, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
     glCreateTextures(GL_TEXTURE_2D, 1, &cloud_occlusion_depth_);
-    glTextureStorage2D(cloud_occlusion_depth_, 1, GL_DEPTH_COMPONENT32F, scene_w_, scene_h_);
+    glTextureStorage2D(cloud_occlusion_depth_, 1, GL_DEPTH_COMPONENT32F, cloud_w_, cloud_h_);
     glTextureParameteri(cloud_occlusion_depth_, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTextureParameteri(cloud_occlusion_depth_, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTextureParameteri(cloud_occlusion_depth_, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTextureParameteri(cloud_occlusion_depth_, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glCreateFramebuffers(1, &cloud_occlusion_fbo_);
+    glNamedFramebufferTexture(cloud_occlusion_fbo_, GL_DEPTH_ATTACHMENT, cloud_occlusion_depth_, 0);
+    const GLenum none = GL_NONE;
+    glNamedFramebufferDrawBuffers(cloud_occlusion_fbo_, 1, &none);
+    glNamedFramebufferReadBuffer(cloud_occlusion_fbo_, GL_NONE);
 
     glCreateFramebuffers(1, &scene_fbo_);
     glNamedFramebufferTexture(scene_fbo_, GL_COLOR_ATTACHMENT0, scene_col_, 0);
@@ -469,20 +474,28 @@ void SkyAndClouds::update_reflection_map_if_needed(double sim_time_sec) {
     glGenerateTextureMipmap(refl_env_tex_);
 }
 
-void SkyAndClouds::begin_scene_pass(const Mat4 &inv_vp) {
+void SkyAndClouds::begin_scene_pass() {
     glBindFramebuffer(GL_FRAMEBUFFER, scene_fbo_);
     glViewport(0, 0, scene_w_, scene_h_);
     // Reverse-Z clear depth to 0.0 (far infinity) + test GL_GREATER!
     glClipControl(GL_LOWER_LEFT, GL_ZERO_TO_ONE);
     glDepthMask(GL_TRUE);
-    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClearDepth(0.0);
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glClear(GL_DEPTH_BUFFER_BIT);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_GREATER);
+    glEnable(GL_CULL_FACE);
+    glCullFace(GL_BACK);
+    glDisable(GL_BLEND);
+}
 
-    // Draw Rayleigh + Mie Sky fullscreen triangle with depth write disabled
-    glDisable(GL_DEPTH_TEST);
+void SkyAndClouds::draw_sky_background(const Mat4 &inv_vp) {
+    // The fullscreen triangle has reverse-Z depth zero, matching uncovered pixels.
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_EQUAL);
     glDepthMask(GL_FALSE);
     glDisable(GL_CULL_FACE);
+    glDisable(GL_BLEND);
     glUseProgram(sky_prog_);
     glUniformMatrix4fv(u_sky_inv_vp_, 1, GL_FALSE, inv_vp.m);
     glUniform3f(u_sky_sun_, atmo_.sun_dir.x, atmo_.sun_dir.y, atmo_.sun_dir.z);
@@ -492,8 +505,7 @@ void SkyAndClouds::begin_scene_pass(const Mat4 &inv_vp) {
     glBindVertexArray(dummy_vao_);
     glDrawArrays(GL_TRIANGLES, 0, 3);
 
-    // Restore Reverse-Z opaque depth state for terrain, cities, trees, runways & aircraft
-    glEnable(GL_DEPTH_TEST);
+    // Restore the scene state for moving geometry and precipitation.
     glDepthFunc(GL_GREATER);
     glDepthMask(GL_TRUE);
     glEnable(GL_CULL_FACE);
@@ -501,10 +513,8 @@ void SkyAndClouds::begin_scene_pass(const Mat4 &inv_vp) {
 }
 
 void SkyAndClouds::capture_cloud_occlusion_depth() {
-    if (!scene_depth_ || !cloud_occlusion_depth_ || scene_w_ <= 0 || scene_h_ <= 0) return;
-    glCopyImageSubData(scene_depth_, GL_TEXTURE_2D, 0, 0, 0, 0,
-                       cloud_occlusion_depth_, GL_TEXTURE_2D, 0, 0, 0, 0,
-                       scene_w_, scene_h_, 1);
+    glBlitNamedFramebuffer(scene_fbo_, cloud_occlusion_fbo_, 0, 0, scene_w_, scene_h_,
+                           0, 0, cloud_w_, cloud_h_, GL_DEPTH_BUFFER_BIT, GL_NEAREST);
 }
 
 void SkyAndClouds::render_clouds_and_post(
@@ -534,7 +544,6 @@ void SkyAndClouds::render_clouds_and_post(
         camera_forward.z * prev_camera_forward_.z,
         -1.0f, 1.0f);
     const float camera_turn_rad = prev_camera_valid_ ? std::acos(forward_dot) : 0.0f;
-    const int sparse_period = (cloud_quality_ == 0) ? 2 : 1;
     const float temporal_blend = (!history_valid_ || camera_step_m > 40.0)
         ? 0.0f
         : std::clamp(0.68f - static_cast<float>(camera_step_m) * 0.008f - camera_turn_rad * 2.5f, 0.35f, 0.68f);
@@ -563,9 +572,8 @@ void SkyAndClouds::render_clouds_and_post(
     glUniform1f(u_cld_time_, time_sec);
     glUniform1i(u_cld_frame_, frame_idx);
     glUniform1f(u_cld_tblend_, temporal_blend);
-    static constexpr GLint kCloudSteps[4] = {7, 8, 9, 18};
+    static constexpr GLint kCloudSteps[4] = {8, 14, 24, 36};
     glUniform1i(u_cld_steps_, kCloudSteps[std::clamp(cloud_quality_, 0, 3)]);
-    glUniform1i(u_cld_sparse_, sparse_period);
     glUniform3f(u_cld_lit_, atmo_.cloud_lit.x, atmo_.cloud_lit.y, atmo_.cloud_lit.z);
     glUniform3f(u_cld_sh_, atmo_.cloud_shadow.x, atmo_.cloud_shadow.y, atmo_.cloud_shadow.z);
     glUniform3f(u_cld_cool_, atmo_.haze_cool.x, atmo_.haze_cool.y, atmo_.haze_cool.z);
@@ -620,6 +628,7 @@ void SkyAndClouds::render_clouds_and_post(
     glBindTextureUnit(2, lut_tex);
     glBindTextureUnit(3, scene_depth_);
     glBindTextureUnit(4, post_history_tex_[post_src]);
+    glBindTextureUnit(5, cloud_occlusion_depth_);
     glBindVertexArray(dummy_vao_);
     glDrawArrays(GL_TRIANGLES, 0, 3);
 

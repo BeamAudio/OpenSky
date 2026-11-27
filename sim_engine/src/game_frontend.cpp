@@ -1355,6 +1355,7 @@ void GameFrontend::draw_settings(AircraftAndHud &ui, int &time_of_day, RegionalA
     panel(ui, {64,225,1100,720});
     label(ui, 91, 240, 22, "Graphics, Hardware Tuning & Streaming");
     auto &s = ui.graphics_settings_;
+    const int old_grid = s.weather_grid_detail;
     bool changed = false;
 
     // One-click hardware profile bar (adapts all tuning sliders for laptops/iGPUs vs dedicated GPUs)
@@ -1372,7 +1373,7 @@ void GameFrontend::draw_settings(AircraftAndHud &ui, int &time_of_day, RegionalA
         if (button(ui, {1095,y,42,30}, ">")) { changed = true; return 1; }
         return 0;
     };
-    static const char *presets[] = {"Low (F1 / Laptop)", "Medium (F2 / 60 FPS)", "High (F3 / Balanced)", "Ultra (F4 / dGPU)"};
+    static const char *presets[] = {"Laptop / Battery (F1)", "Balanced 60 FPS (F2)", "High Quality (F3)", "Max Dedicated GPU (F4)"};
     static const char *weather[] = {"Follow preset", "Low (Fastest)", "Medium", "High", "Ultra (Max Clouds)"};
     static const char *surf[] = {"Follow preset", "Fast (Ortho only)", "Balanced", "High (PBR relief)", "Extreme (Full PBR)"};
     static const char *world[] = {"Follow preset", "Sparse (Laptop)", "Medium", "High", "Max (Dense Cities)"};
@@ -1381,7 +1382,8 @@ void GameFrontend::draw_settings(AircraftAndHud &ui, int &time_of_day, RegionalA
     static const char *clarity[] = {"Crisp VFR", "Natural", "Hazy"};
     static constexpr int kAnisoVals[] = {1, 2, 4, 8, 16};
     char value[48];
-    s.quality_preset = (s.quality_preset + setting(0, "Performance preset", presets[s.quality_preset]) + 4) % 4;
+    const int profile_delta = setting(0, "Performance preset", presets[s.quality_preset]);
+    if (profile_delta != 0) apply_graphics_profile(s, (s.quality_preset + profile_delta + 4) % 4);
     std::snprintf(value, sizeof(value), "%d%%", s.pixel_percent);
     s.pixel_percent = std::clamp(s.pixel_percent + 5 * setting(1, "Render resolution", value), 35, 150);
     s.aa_mode = (s.aa_mode + setting(2, "Anti-aliasing", aa[s.aa_mode]) + 3) % 3;
@@ -1499,9 +1501,10 @@ void GameFrontend::draw_settings(AircraftAndHud &ui, int &time_of_day, RegionalA
         if (button(ui, {1782, 824, 48, 44}, ">")) grid_delta = +1;
         if (grid_delta != 0) {
             s.weather_grid_detail = (s.weather_grid_detail + grid_delta + 3) % 3;
-            reg_atmo->set_grid_detail(s.weather_grid_detail, ui.state().lat_deg, ui.state().lon_deg);
             changed = true;
         }
+        if (s.weather_grid_detail != old_grid)
+            reg_atmo->set_grid_detail(s.weather_grid_detail, ui.state().lat_deg, ui.state().lon_deg);
         label(ui, 1284, 837, 18, kGridModes[s.weather_grid_detail]);
         label(ui, 1218, 884, 14, "8 km aircraft-following valley tile; regional coverage stays active.", true);
         label(ui, 1218, 905, 14, "Added solver work: about 33% / 133% of regional mode.", true);

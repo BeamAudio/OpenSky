@@ -1,4 +1,5 @@
 #include "world_objects.hpp"
+#include "platform_window.hpp"
 
 #define CGLTF_IMPLEMENTATION
 #include "../third_party/cgltf.h"
@@ -237,8 +238,12 @@ bool WorldObjects::load_city_region_meta(CityRegionGpu &cr) {
     return true;
 }
 
-bool WorldObjects::stream_city_region_local(CityRegionGpu &cr, double cam_le, double cam_ln) {
-    if (!cr.meta_loaded && !load_city_region_meta(cr)) return false;
+namespace {
+constexpr size_t kCityVertexBytes = 32;
+}
+
+std::optional<WorldObjects::CityRegionData> WorldObjects::read_city_region(
+    const CityRegionGpu &cr, double cam_le, double cam_ln) {
 
     // Stream chunks within 22 km of camera, prioritizing nearest chunks under an iGPU-safe
     // vertex cap (~3.6M verts / ~130 MB GPU) so Barcelona keeps full forward skyline within VRAM.
@@ -274,15 +279,11 @@ bool WorldObjects::stream_city_region_local(CityRegionGpu &cr, double cam_le, do
     // Re-sort in file order so contiguous NVMe read coalescing stays fast.
     std::sort(selected.begin(), selected.end());
 
-    // Free old local GPU buffers FIRST so peak VRAM never doubles during re-centering!
-    unload_city_region_gpu(cr);
-    cr.stream_le = cam_le;
-    cr.stream_ln = cam_ln;
-    cr.gpu_streamed = true;
-    if (selected.empty()) return true;
+    CityRegionData data;
+    if (selected.empty()) return data;
 
     std::ifstream ifs(cr.city_path, std::ios::binary);
-    if (!ifs.is_open()) return false;
+    if (!ifs.is_open()) return std::nullopt;
 
     // Merge adjacent selected chunks into contiguous file reads for fast NVMe I/O
     std::vector<Run> runs;
@@ -292,22 +293,10 @@ bool WorldObjects::stream_city_region_local(CityRegionGpu &cr, double cam_le, do
         else runs.push_back({idx, idx});
     }
 
-#pragma pack(push, 1)
-    struct RawCityVert {
-        float pos[3];
-        int8_t nrm[3];
-        uint8_t flags;
-        float uv[2];
-        uint32_t bake_u32;
-        uint8_t meta[4];
-    };
-#pragma pack(pop)
-    static_assert(sizeof(RawCityVert) == 32, "RawCityVert layout mismatch");
-
-    std::vector<RawCityVert> local_verts(tot_verts);
-    std::vector<uint32_t> local_idx(tot_idx);
-    cr.chunks.reserve(selected.size());
-    cr.macro_grid.reserve(512);
+    data.vertices.resize(tot_verts * kCityVertexBytes);
+    data.indices.resize(tot_idx);
+    data.chunks.reserve(selected.size());
+    data.macro_grid.reserve(512);
 
     size_t v_cur = 0, i_cur = 0;
     for (const Run &run : runs) {
@@ -316,32 +305,43 @@ bool WorldObjects::stream_city_region_local(CityRegionGpu &cr, double cam_le, do
         const size_t run_v_cnt = (last_dc.base_vertex + last_dc.vert_count) - first_dc.base_vertex;
         const size_t run_i_cnt = (last_dc.first_index + last_dc.index_count) - first_dc.first_index;
 
-        ifs.seekg(static_cast<std::streamoff>(cr.vert_file_off + static_cast<uint64_t>(first_dc.base_vertex) * sizeof(RawCityVert)));
-        ifs.read(reinterpret_cast<char *>(local_verts.data() + v_cur), static_cast<std::streamsize>(run_v_cnt * sizeof(RawCityVert)));
+        if (run_v_cnt > tot_verts - v_cur || run_i_cnt > tot_idx - i_cur) return std::nullopt;
+        ifs.seekg(static_cast<std::streamoff>(cr.vert_file_off + static_cast<uint64_t>(first_dc.base_vertex) * kCityVertexBytes));
+        ifs.read(reinterpret_cast<char *>(data.vertices.data() + v_cur * kCityVertexBytes), static_cast<std::streamsize>(run_v_cnt * kCityVertexBytes));
         ifs.seekg(static_cast<std::streamoff>(cr.idx_file_off + static_cast<uint64_t>(first_dc.first_index) * sizeof(uint32_t)));
-        ifs.read(reinterpret_cast<char *>(local_idx.data() + i_cur), static_cast<std::streamsize>(run_i_cnt * sizeof(uint32_t)));
-        if (!ifs) { unload_city_region_gpu(cr); return false; }
+        ifs.read(reinterpret_cast<char *>(data.indices.data() + i_cur), static_cast<std::streamsize>(run_i_cnt * sizeof(uint32_t)));
+        if (!ifs) return std::nullopt;
 
         for (uint32_t k = run.first_ch; k <= run.last_ch; ++k) {
             const auto &dc = cr.disk_chunks[k];
             const uint32_t local_first_idx = static_cast<uint32_t>(i_cur + (dc.first_index - first_dc.first_index));
             const int32_t local_base_v = static_cast<int32_t>(v_cur + (dc.base_vertex - first_dc.base_vertex));
-            const uint32_t out_i = static_cast<uint32_t>(cr.chunks.size());
-            cr.chunks.push_back({dc.is_urban, local_first_idx, dc.index_count, local_base_v, dc.ce, dc.cy, dc.cn, dc.rad});
+            const uint32_t out_i = static_cast<uint32_t>(data.chunks.size());
+            data.chunks.push_back({dc.is_urban, local_first_idx, dc.index_count, local_base_v, dc.ce, dc.cy, dc.cn, dc.rad});
             int32_t mx = static_cast<int32_t>(std::floor(dc.ce / 4000.0f));
             int32_t my = static_cast<int32_t>(std::floor(dc.cn / 4000.0f));
-            cr.macro_grid[pack_tc(mx, my)].push_back(out_i);
+            data.macro_grid[pack_tc(mx, my)].push_back(out_i);
         }
         v_cur += run_v_cnt;
         i_cur += run_i_cnt;
     }
 
+    return data;
+}
+
+void WorldObjects::publish_city_region(CityRegionGpu &cr, CityRegionData &&data,
+                                       double le, double ln, GLuint vbo, GLuint ebo) {
+    unload_city_region_gpu(cr);
+    cr.stream_le = le;
+    cr.stream_ln = ln;
+    cr.gpu_streamed = true;
+    if (data.vertices.empty()) return;
+    cr.chunks = std::move(data.chunks);
+    cr.macro_grid = std::move(data.macro_grid);
+    cr.vbo = vbo;
+    cr.ebo = ebo;
     glCreateVertexArrays(1, &cr.vao);
-    glCreateBuffers(1, &cr.vbo);
-    glCreateBuffers(1, &cr.ebo);
-    glNamedBufferStorage(cr.vbo, static_cast<GLsizeiptr>(local_verts.size() * sizeof(RawCityVert)), local_verts.data(), 0);
-    glNamedBufferStorage(cr.ebo, static_cast<GLsizeiptr>(local_idx.size() * sizeof(uint32_t)), local_idx.data(), 0);
-    glVertexArrayVertexBuffer(cr.vao, 0, cr.vbo, 0, sizeof(RawCityVert));
+    glVertexArrayVertexBuffer(cr.vao, 0, cr.vbo, 0, kCityVertexBytes);
     glVertexArrayElementBuffer(cr.vao, cr.ebo);
     glEnableVertexArrayAttrib(cr.vao, 0); glVertexArrayAttribFormat(cr.vao, 0, 3, GL_FLOAT, GL_FALSE, 0); glVertexArrayAttribBinding(cr.vao, 0, 0);
     glEnableVertexArrayAttrib(cr.vao, 1); glVertexArrayAttribFormat(cr.vao, 1, 3, GL_BYTE, GL_TRUE, 12); glVertexArrayAttribBinding(cr.vao, 1, 0);
@@ -350,9 +350,8 @@ bool WorldObjects::stream_city_region_local(CityRegionGpu &cr, double cam_le, do
     glEnableVertexArrayAttrib(cr.vao, 4); glVertexArrayAttribIFormat(cr.vao, 4, 1, GL_UNSIGNED_INT, 24); glVertexArrayAttribBinding(cr.vao, 4, 0);
     glEnableVertexArrayAttrib(cr.vao, 5); glVertexArrayAttribFormat(cr.vao, 5, 4, GL_UNSIGNED_BYTE, GL_FALSE, 28); glVertexArrayAttribBinding(cr.vao, 5, 0);
     std::printf("[CITY-STREAM] %s local 22km: %zu/%zu chunks | %zu verts | %.1f MB GPU\n",
-                cr.region_id.c_str(), cr.chunks.size(), cr.disk_chunks.size(), local_verts.size(),
-                (local_verts.size() * sizeof(RawCityVert) + local_idx.size() * sizeof(uint32_t)) / (1024.0 * 1024.0));
-    return true;
+                cr.region_id.c_str(), cr.chunks.size(), cr.disk_chunks.size(), data.vertices.size() / kCityVertexBytes,
+                (data.vertices.size() + data.indices.size() * sizeof(uint32_t)) / (1024.0 * 1024.0));
 }
 
 void WorldObjects::unload_city_region_gpu(CityRegionGpu &cr) {
@@ -373,28 +372,100 @@ void WorldObjects::update_city_region_transforms() {
     }
 }
 
-void WorldObjects::ensure_city_regions_for_camera(double cam_east_m, double cam_north_m) {
+void WorldObjects::reset_city_stream() {
+    if (city_stream_.job.valid()) city_stream_.job.wait();
+    if (city_stream_.vbo) glDeleteBuffers(1, &city_stream_.vbo);
+    if (city_stream_.ebo) glDeleteBuffers(1, &city_stream_.ebo);
+    city_stream_ = {};
+}
+
+void WorldObjects::ensure_city_regions_for_camera(double cam_east_m, double cam_north_m, bool preload) {
+    constexpr double recenter_m = 4200.0;
+    constexpr size_t upload_budget = 2 * 1024 * 1024;
+    const double now = PlatformWindow::now_sec();
     double clat = pack_->anchor_lat() + cam_north_m / pack_->anchor_m_lat();
     double clon = pack_->anchor_lon() + cam_east_m / pack_->anchor_m_lon();
+    auto &pending = city_stream_;
     for (CityRegionGpu &cr : city_regions_) {
         double nearest_lat = std::clamp(clat, cr.lat_min, cr.lat_max);
         double nearest_lon = std::clamp(clon, cr.lon_min, cr.lon_max);
-        double d_m = nspain::haversine_m(clat, clon, nearest_lat, nearest_lon);
-        if (d_m <= 26000.0) {
-            const double cam_le = (cam_east_m  - cr.off_e) / cr.scl_e;
-            const double cam_ln = (cam_north_m - cr.off_n) / cr.scl_n;
-            const double moved = std::hypot(cam_le - cr.stream_le, cam_ln - cr.stream_ln);
-            if (!cr.gpu_streamed || moved > 4200.0) {
-                stream_city_region_local(cr, cam_le, cam_ln);
+        const bool in_range = nspain::haversine_m(clat, clon, nearest_lat, nearest_lon) <= 26000.0;
+        const double le = (cam_east_m - cr.off_e) / cr.scl_e;
+        const double ln = (cam_north_m - cr.off_n) / cr.scl_n;
+        if (&cr == pending.region) {
+            if (pending.job.valid() && pending.job.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+                continue;
+            if (!in_range || std::hypot(le - pending.le, ln - pending.ln) > recenter_m) {
+                reset_city_stream();
+            } else {
+                if (pending.job.valid()) {
+                    auto data = pending.job.get();
+                    if (!data) {
+                        cr.stream_retry_time = now + 5.0;
+                        reset_city_stream();
+                        continue;
+                    }
+                    pending.data = std::move(*data);
+                    if (!pending.data.vertices.empty()) {
+                        glCreateBuffers(1, &pending.vbo);
+                        glCreateBuffers(1, &pending.ebo);
+                        glNamedBufferStorage(pending.vbo, pending.data.vertices.size(), nullptr, GL_DYNAMIC_STORAGE_BIT);
+                        glNamedBufferStorage(pending.ebo, pending.data.indices.size() * sizeof(uint32_t), nullptr, GL_DYNAMIC_STORAGE_BIT);
+                    }
+                }
+                const size_t vertex_bytes = pending.data.vertices.size();
+                const size_t total_bytes = vertex_bytes + pending.data.indices.size() * sizeof(uint32_t);
+                if (pending.uploaded < vertex_bytes) {
+                    size_t bytes = std::min(upload_budget, vertex_bytes - pending.uploaded);
+                    glNamedBufferSubData(pending.vbo, pending.uploaded, bytes, pending.data.vertices.data() + pending.uploaded);
+                    pending.uploaded += bytes;
+                } else if (pending.uploaded < total_bytes) {
+                    size_t bytes = std::min(upload_budget, total_bytes - pending.uploaded);
+                    size_t offset = pending.uploaded - vertex_bytes;
+                    glNamedBufferSubData(pending.ebo, offset, bytes, pending.data.indices.data() + offset / sizeof(uint32_t));
+                    pending.uploaded += bytes;
+                }
+                if (pending.uploaded == total_bytes) {
+                    publish_city_region(cr, std::move(pending.data), pending.le, pending.ln, pending.vbo, pending.ebo);
+                    pending = {};
+                }
+                continue;
             }
-        } else if (cr.gpu_streamed || cr.vao != 0) {
-            unload_city_region_gpu(cr);
-            cr.stream_le = cr.stream_ln = 1e18;
         }
+        if (!in_range) {
+            if (cr.gpu_streamed) unload_city_region_gpu(cr);
+            continue;
+        }
+        if (pending.region || now < cr.stream_retry_time ||
+            (cr.gpu_streamed && std::hypot(le - cr.stream_le, ln - cr.stream_ln) <= recenter_m)) continue;
+        if (!load_city_region_meta(cr)) {
+            cr.stream_retry_time = now + 5.0;
+            continue;
+        }
+        if (preload) {
+            auto data = read_city_region(cr, le, ln);
+            if (!data) continue;
+            GLuint vbo = 0, ebo = 0;
+            if (!data->vertices.empty()) {
+                glCreateBuffers(1, &vbo);
+                glCreateBuffers(1, &ebo);
+                glNamedBufferStorage(vbo, data->vertices.size(), data->vertices.data(), 0);
+                glNamedBufferStorage(ebo, data->indices.size() * sizeof(uint32_t), data->indices.data(), 0);
+            }
+            publish_city_region(cr, std::move(*data), le, ln, vbo, ebo);
+            continue;
+        }
+        // City metadata is immutable once indexed. GL buffer creation and
+        // publication stay on the render thread while the pack is read here.
+        pending.region = &cr;
+        pending.le = le;
+        pending.ln = ln;
+        pending.job = std::async(std::launch::async, read_city_region, std::cref(cr), le, ln);
     }
 }
 
 bool WorldObjects::load_baked_cities(const std::string &pack_dir) {
+    reset_city_stream();
     for (auto &cr : city_regions_) unload_city_region_gpu(cr);
     city_regions_.clear();
     baked_city_bldgs_ = 0;
@@ -424,7 +495,7 @@ bool WorldObjects::load_baked_cities(const std::string &pack_dir) {
         }
     }
     update_city_region_transforms();
-    ensure_city_regions_for_camera(0.0, 0.0);
+    ensure_city_regions_for_camera(0.0, 0.0, true);
     for (const auto &cr : city_regions_) baked_city_bldgs_ += cr.bldgs;
     baked_map_wide_ = !city_regions_.empty();
     return baked_map_wide_;
@@ -870,6 +941,7 @@ bool WorldObjects::init(const PackReader *pack, const std::string &asset_root, c
 }
 
 void WorldObjects::shutdown() {
+    reset_city_stream();
     auto del_p = [](GLuint &p) { if (p) { glDeleteProgram(p); p = 0; } };
     auto del_v = [](GLuint &v) { if (v) { glDeleteVertexArrays(1, &v); v = 0; } };
     auto del_b = [](GLuint &b) { if (b) { glDeleteBuffers(1, &b); b = 0; } };

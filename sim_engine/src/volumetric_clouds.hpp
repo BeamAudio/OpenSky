@@ -53,9 +53,10 @@ public:
     void reset_temporal_history() { history_valid_ = false; post_history_valid_ = false; prev_camera_valid_ = false; }
     void update_reflection_map_if_needed(double sim_time_sec);
 
-    // Begin opaque 3D pass into Reverse-Z Main FBO & draw Rayleigh/Mie sky background
-    void begin_scene_pass(const Mat4 &inv_vp);
-    // Copy terrain-only depth before dynamic scene objects enter the depth buffer.
+    void begin_scene_pass();
+    // Fill the pixels left open by opaque terrain and scenery.
+    void draw_sky_background(const Mat4 &inv_vp);
+    // Snapshot opaque depth on the cloud ray grid before moving geometry draws.
     // Cloud history must not retain aircraft/car-shaped holes from prior frames.
     void capture_cloud_occlusion_depth();
     // Run 1/4-res temporally reprojected 3D volumetric cloud raymarch + AgX/LUT composite to backbuffer!
@@ -96,7 +97,7 @@ private:
     GLint u_cld_inv_vp_ = -1, u_cld_prev_vp_ = -1, u_cld_sun_ = -1, u_cld_cam_en_ = -1, u_cld_cam_alt_ = -1;
     GLint u_cld_cam_delta_ = -1;
     GLint u_cld_base_ = -1, u_cld_thick_ = -1, u_cld_cov_ = -1, u_cld_precip_ = -1, u_cld_time_ = -1;
-    GLint u_cld_frame_ = -1, u_cld_tblend_ = -1, u_cld_steps_ = -1, u_cld_sparse_ = -1;
+    GLint u_cld_frame_ = -1, u_cld_tblend_ = -1, u_cld_steps_ = -1;
     GLint u_cld_lit_ = -1, u_cld_sh_ = -1, u_cld_cool_ = -1, u_cld_warm_ = -1, u_cld_dom_ = -1, u_cld_local_dom_ = -1, u_cld_wx_fx_ = -1;
     GLint u_cld_advect_ = -1;
     GLint u_post_exp_ = -1, u_post_sun_uv_ = -1, u_post_warm_ = -1;
@@ -107,6 +108,7 @@ private:
     GLuint scene_fbo_ = 0;
     GLuint scene_col_ = 0;
     GLuint scene_depth_ = 0;
+    GLuint cloud_occlusion_fbo_ = 0;
     GLuint cloud_occlusion_depth_ = 0;
 
     GLuint refl_fbo_ = 0;

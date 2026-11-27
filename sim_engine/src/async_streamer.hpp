@@ -122,6 +122,7 @@ public:
     GLuint norm_array_tex() const { return norm_arr_; }
     GLuint surf_array_tex() const { return surf_arr_; }
     StreamStats stats() const;
+    int resident_pages() const { return static_cast<int>(key_to_slot_.size()); }
 
     static void quad_bounds_en(QuadKey k, double &out_center_e, double &out_center_n, double &out_half_span);
 

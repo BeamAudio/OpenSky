@@ -143,7 +143,10 @@ inline double online_tile_priority_score(uint64_t okey, double dist_m) {
 } // namespace
 
 PackReader::~PackReader() {
-    online_stop_.store(true, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lk(online_mtx_);
+        online_stop_.store(true, std::memory_order_release);
+    }
     online_cv_.notify_all();
     for (auto &t : online_workers_) {
         if (t.joinable()) t.join();
@@ -246,7 +249,7 @@ void PackReader::online_dl_worker() const {
         uint64_t okey = 0;
         {
             std::unique_lock<std::mutex> lk(online_mtx_);
-            online_cv_.wait_for(lk, std::chrono::milliseconds(150), [&]() {
+            online_cv_.wait(lk, [&]() {
                 return online_stop_.load(std::memory_order_acquire) || !online_dl_queue_.empty();
             });
             if (online_stop_.load(std::memory_order_acquire)) break;

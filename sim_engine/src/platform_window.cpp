@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -526,10 +527,8 @@ void PlatformWindow::destroy() {
     impl_ = nullptr;
 }
 
-void PlatformWindow::set_vsync(bool enabled) {
-    if (impl_ && impl_->swap_interval_fn) {
-        impl_->swap_interval_fn(enabled ? 1 : 0);
-    }
+bool PlatformWindow::set_vsync(bool enabled) {
+    return impl_ && impl_->swap_interval_fn && impl_->swap_interval_fn(enabled ? 1 : 0);
 }
 
 void PlatformWindow::poll_events() {
@@ -605,6 +604,7 @@ using PFN_glXCreateContextAttribsARB = GLXContext (*)(Display *, GLXFBConfig, GL
 using PFN_glXMakeCurrent = Bool (*)(Display *, GLXDrawable, GLXContext);
 using PFN_glXDestroyContext = void (*)(Display *, GLXContext);
 using PFN_glXSwapBuffers = void (*)(Display *, GLXDrawable);
+using PFN_glXQueryExtensionsString = const char *(*)(Display *, int);
 using PFN_glXSwapIntervalEXT = void (*)(Display *, GLXDrawable, int);
 using PFN_glXSwapIntervalMESA = int (*)(unsigned int);
 
@@ -927,8 +927,19 @@ bool PlatformWindow::create(const char *title, int aspect_w, int aspect_h, Displ
     }
 
     impl_->make_cur_fn(impl_->dpy, impl_->win, impl_->ctx);
-    impl_->swap_ext_fn = reinterpret_cast<PFN_glXSwapIntervalEXT>(get_proc("glXSwapIntervalEXT"));
-    impl_->swap_mesa_fn = reinterpret_cast<PFN_glXSwapIntervalMESA>(get_proc("glXSwapIntervalMESA"));
+    auto query_extensions = reinterpret_cast<PFN_glXQueryExtensionsString>(dlsym(impl_->gl_lib, "glXQueryExtensionsString"));
+    const char *extension_string = query_extensions ? query_extensions(impl_->dpy, scr) : nullptr;
+    std::string_view extensions = extension_string ? extension_string : "";
+    while (!extensions.empty()) {
+        const size_t end = extensions.find(' ');
+        const auto name = extensions.substr(0, end);
+        if (name == "GLX_EXT_swap_control")
+            impl_->swap_ext_fn = reinterpret_cast<PFN_glXSwapIntervalEXT>(get_proc("glXSwapIntervalEXT"));
+        else if (name == "GLX_MESA_swap_control")
+            impl_->swap_mesa_fn = reinterpret_cast<PFN_glXSwapIntervalMESA>(get_proc("glXSwapIntervalMESA"));
+        if (end == std::string_view::npos) break;
+        extensions.remove_prefix(end + 1);
+    }
 
     if (!load_gl_functions()) {
         return false;
@@ -952,11 +963,14 @@ void PlatformWindow::destroy() {
     impl_ = nullptr;
 }
 
-void PlatformWindow::set_vsync(bool enabled) {
-    if (!impl_ || !impl_->dpy) return;
+bool PlatformWindow::set_vsync(bool enabled) {
+    if (!impl_ || !impl_->dpy) return false;
     int v = enabled ? 1 : 0;
-    if (impl_->swap_ext_fn) impl_->swap_ext_fn(impl_->dpy, impl_->win, v);
-    else if (impl_->swap_mesa_fn) impl_->swap_mesa_fn(static_cast<unsigned int>(v));
+    if (impl_->swap_ext_fn) {
+        impl_->swap_ext_fn(impl_->dpy, impl_->win, v);
+        return true;
+    }
+    return impl_->swap_mesa_fn && impl_->swap_mesa_fn(static_cast<unsigned int>(v)) == 0;
 }
 
 void PlatformWindow::poll_events() {

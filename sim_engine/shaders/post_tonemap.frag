@@ -9,6 +9,7 @@ layout(binding = 1) uniform sampler2D u_cloud_tex;  // Quarter-res temporally re
 layout(binding = 2) uniform sampler2D u_lut_tex;    // 256x4 monotonic 1D RGB Spain filmic curve
 layout(binding = 3) uniform sampler2D u_scene_depth;// Reverse-Z scene depth for crepuscular sun-shaft scattering!
 layout(binding = 4) uniform sampler2D u_history_tex;
+layout(binding = 5) uniform sampler2D u_cloud_depth;
 
 uniform float u_exposure;
 uniform vec4 u_sun_uv_vis; // xy = projected sun screen UV, z = front-hemisphere visibility [0..1], w = sun elev vis [0..1]
@@ -40,14 +41,41 @@ vec3 agx_tonemap(vec3 val) {
     return clamp(agx_mat_inv * c, 0.0, 1.0);
 }
 
+vec4 reconstruct_cloud(float scene_depth) {
+    vec4 cloud = texture(u_cloud_tex, v_uv);
+    if (cloud.a < 0.004 || scene_depth <= 0.000001) return cloud;
+
+    // Reject sky samples from the cloud grid where they would bleed over a
+    // nearer mountain. Preserve clouds on the same side of the depth edge.
+    vec4 depth = textureGather(u_cloud_depth, v_uv);
+    float bias = max(0.000001, scene_depth * 0.1);
+    vec4 weights = smoothstep(vec4(scene_depth - bias * 3.0), vec4(scene_depth - bias), depth);
+    if (min(min(weights.x, weights.y), min(weights.z, weights.w)) >= 0.999) return cloud;
+    if (max(max(weights.x, weights.y), max(weights.z, weights.w)) <= 0.001) return vec4(0.0);
+
+    ivec2 limit = textureSize(u_cloud_tex, 0) - 1;
+    vec2 grid = v_uv * vec2(limit + 1) - 0.5;
+    ivec2 p = ivec2(floor(grid));
+    vec2 f = fract(grid);
+    weights *= vec4((1.0 - f.x) * f.y, f.x * f.y, f.x * (1.0 - f.y), (1.0 - f.x) * (1.0 - f.y));
+    vec4 filtered = texelFetch(u_cloud_tex, clamp(p + ivec2(0, 1), ivec2(0), limit), 0) * weights.x
+                  + texelFetch(u_cloud_tex, clamp(p + ivec2(1, 1), ivec2(0), limit), 0) * weights.y
+                  + texelFetch(u_cloud_tex, clamp(p + ivec2(1, 0), ivec2(0), limit), 0) * weights.z
+                  + texelFetch(u_cloud_tex, clamp(p, ivec2(0), limit), 0) * weights.w;
+    return filtered / max(0.20, dot(weights, vec4(1.0)));
+}
+
 void main() {
-    vec3 scene = texture(u_scene_tex, v_uv).rgb;
-    // Edge-aware resolve at the internal render resolution.
-    vec2 pixel = 1.0 / vec2(textureSize(u_scene_tex, 0));
-    vec3 north = texture(u_scene_tex, v_uv + vec2(0.0, pixel.y)).rgb;
-    vec3 south = texture(u_scene_tex, v_uv - vec2(0.0, pixel.y)).rgb;
-    vec3 east = texture(u_scene_tex, v_uv + vec2(pixel.x, 0.0)).rgb;
-    vec3 west = texture(u_scene_tex, v_uv - vec2(pixel.x, 0.0)).rgb;
+    // The resolve runs on the same grid as the scene. Fetch exact neighbours
+    // for the anti-aliasing clamp and use interpolation for diagonal FXAA taps.
+    ivec2 coord = ivec2(gl_FragCoord.xy);
+    ivec2 size = textureSize(u_scene_tex, 0);
+    vec2 pixel = 1.0 / vec2(size);
+    vec3 scene = texelFetch(u_scene_tex, coord, 0).rgb;
+    vec3 north = texelFetch(u_scene_tex, ivec2(coord.x, min(coord.y + 1, size.y - 1)), 0).rgb;
+    vec3 south = texelFetch(u_scene_tex, ivec2(coord.x, max(coord.y - 1, 0)), 0).rgb;
+    vec3 east = texelFetch(u_scene_tex, ivec2(min(coord.x + 1, size.x - 1), coord.y), 0).rgb;
+    vec3 west = texelFetch(u_scene_tex, ivec2(max(coord.x - 1, 0), coord.y), 0).rgb;
     const vec3 weights = vec3(0.2126, 0.7152, 0.0722);
     float centre_luma = dot(scene, weights);
     vec4 neighbours = vec4(dot(north, weights), dot(south, weights), dot(east, weights), dot(west, weights));
@@ -56,7 +84,9 @@ void main() {
     float grad_x = neighbours.z - neighbours.w;
     float grad_y = neighbours.x - neighbours.y;
     float strength = smoothstep(0.035, 0.16, edge / max(0.08, centre_luma));
-    if (strength > 0.10) {
+    vec3 nb_lo = min(scene, min(min(north, south), min(east, west)));
+    vec3 nb_hi = max(scene, max(max(north, south), max(east, west)));
+    if (u_aa_mode == 0 && strength > 0.10) {
         // Filter along the measured edge angle. The diagonal taps are only
         // needed on visible edges and reuse this composite pass.
         vec2 gradient = vec2(grad_x, grad_y);
@@ -65,11 +95,9 @@ void main() {
             vec2 span = vec2(-grad_y, grad_x) * (pixel * 0.58 / axis);
             vec3 edge_pair = 0.5 * (texture(u_scene_tex, v_uv + span).rgb +
                                     texture(u_scene_tex, v_uv - span).rgb);
-            scene = mix(scene, edge_pair, strength * (u_aa_mode != 0 ? 0.24 : 0.44));
+            scene = mix(scene, edge_pair, strength * 0.44);
         }
     }
-    vec3 nb_lo = min(min(north, south), min(east, west));
-    vec3 nb_hi = max(max(north, south), max(east, west));
     if (u_aa_mode != 0) {
         // Bounded reconstruction sharpening; crisp mode offsets the selected
         // low internal pixel budget without a second full-screen texture pass.
@@ -80,8 +108,8 @@ void main() {
         vec3 sharpened = scene + (scene - neighborhood) * (sharpen_amount * (1.0 - strength));
         scene = clamp(sharpened, nb_lo - vec3(0.012), nb_hi + vec3(0.012));
     }
-    vec4 cld = texture(u_cloud_tex, v_uv);
-    float d_here = textureLod(u_scene_depth, v_uv, 0.0).r;
+    float d_here = texelFetch(u_scene_depth, coord, 0).r;
+    vec4 cld = reconstruct_cloud(d_here);
 
     // clouds_qres.frag already stops rays conservatively at static terrain depth;
     // fade the distant cloud/rain veil off foreground objects (<~40m, e.g. chase/parked aircraft)

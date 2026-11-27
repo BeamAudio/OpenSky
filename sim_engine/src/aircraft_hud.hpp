@@ -310,6 +310,7 @@ private:
     GLint u_ac_tint_ = -1, u_ac_pbr_ = -1, u_ac_em_ = -1, u_ac_int_ = -1, u_ac_alpha_ = -1, u_ac_livery_ = -1;
     GLint u_ac_unlit_ = -1, u_ac_cabin_glass_ = -1, u_ac_glass_weather_ = -1;
     GLint u_ac_glass_flow_f_ = -1, u_ac_glass_flow_s_ = -1;
+    GLint u_ac_rain_luts_ = -1;
     GLint u_ac_glass_fx_ = -1, u_ac_plane_wx_ = -1, u_ac_dmg_zones_ = -1, u_ac_dmg_extra_ = -1;
     GLint u_ac_baked_reflection_ = -1, u_ac_detail_ = -1;
     GLint u_ac_native_output_ = -1, u_ac_output_exposure_ = -1, u_ac_output_lut_ = -1;

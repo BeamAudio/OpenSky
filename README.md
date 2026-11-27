@@ -9,7 +9,7 @@ The game is built around unhurried exploration rather than missions or ownership
 - **Supported development runtime:** C++20, OpenGL 4.6, Linux/X11/GLX.
 - **Aircraft simulation:** upstream JSBSim, dynamically linked under LGPL; the game advances it at 120 Hz independently of rendering.
 - **Release scenery baseline:** Aragón and Catalunya are included together in the standard game.
-- **Windows 10 / 11:** no native `.exe` or Windows installer is available yet; Windows users can run the Linux build through **WSL2 (Ubuntu + WSLg)** (see [Windows 10 / 11 (via WSL2)](#windows-10--11-via-wsl2)).
+- **Windows 10 / 11:** native WGL builds support Windows input and audio. See [Windows (native build)](#windows-native-build).
 - **Open-source release:** see the [release checklist](docs/OPEN_SOURCE_RELEASE.md) and [third-party notices](THIRD_PARTY_LICENSES.md).
 
 ## Screenshots
@@ -129,9 +129,20 @@ Prebuilt `.deb` installers are published on [GitHub Releases](https://github.com
    ./run_sim.sh
    ```
 
+### Windows (native build)
+
+Build in an MSYS2 UCRT64 environment with the MinGW-w64 C++ compiler, CMake and Ninja.
+
+```bash
+cmake -S . -B sim_engine/.build/win-release -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build sim_engine/.build/win-release --target OpenSky --parallel
+```
+
+Keep the built `sim_engine/OpenSky.exe` and its runtime DLLs together. Put the regional packs and sidecars in `packs/` and launch `run_sim.bat` from the checkout.
+
 ### Windows 10 / 11 (via WSL2)
 
-There is no native Windows `.exe` or installer yet (OpenSky uses Linux X11/GLX, ALSA audio, and Linux `evdev` for USB yokes). On **Windows 10 (build 19044+)** or **Windows 11**, you can run the Linux build through **WSL2** with **WSLg** graphics:
+On **Windows 10 (build 19044+)** or **Windows 11**, you can also run the Linux build through **WSL2** with **WSLg** graphics:
 
 1. Install or update your Windows **GPU drivers** (AMD, NVIDIA, or Intel) so WSLg provides hardware-accelerated OpenGL.
 2. Open **PowerShell as Administrator** and install WSL2 with Ubuntu:
@@ -154,6 +165,8 @@ On a new save the aircraft is based at Castejón de Sos. Open **World** to explo
 The optional live weather boundary feed can be disabled with `./run_sim.sh --no-live-weather`. Online PNOA imagery is controlled separately in Settings or with `./run_sim.sh --online-ortho off`.
 
 A first-flight guide introduces these steps. During flight the interface overlays are hidden by default; turn them back on in **Settings → In-flight overlays**, or press `T` to show the controls guide. Display mode can be set to windowed, fullscreen, or fullscreen windowed in Settings (applied on restart), while **VSync**, **FPS limit**, and **Flight Yoke & Pedals** settings apply live.
+
+**F2 Balanced 60 FPS** is the default for new installations. It keeps the cockpit instruments at output resolution and caps presentation at 60 FPS. On Windows, F1 and F2 use a software deadline by default. **F1 Laptop / Battery** reduces render load further. **F3 High Quality** and **F4 Max Dedicated GPU** increase terrain and cloud detail, with F4 unlocked for high-refresh displays. The function keys apply the same presets as the graphics settings screen.
 
 ## Architecture
 

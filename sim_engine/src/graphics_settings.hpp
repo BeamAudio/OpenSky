@@ -9,20 +9,28 @@
 
 namespace nsim {
 
+// The Windows laptop profiles use a software presentation deadline. On WGL
+// the swap-interval queue can bounce between one and two refresh intervals.
+#ifdef _WIN32
+inline constexpr bool kLaptopVsync = false;
+#else
+inline constexpr bool kLaptopVsync = true;
+#endif
+
 struct GraphicsSettings {
     // Percentage of native output pixels shaded before the spatial/temporal resolve (35..150%).
-    int pixel_percent = 68;
+    int pixel_percent = 40;
     // 0 = spatial FXAA, 1 = balanced TAA, 2 = crisp TAA.
-    int aa_mode = 2;
+    int aa_mode = 1;
     // Multiplier for terrain mesh LOD transition distances (50..250%).
-    int terrain_lod_percent = 100;
+    int terrain_lod_percent = 75;
     // Render the cockpit after scene reconstruction at output resolution.
     bool cockpit_native = true;
     bool terrain_streaming = true;
-    int aircraft_detail = 1; // Standard, High
+    int aircraft_detail = 0; // Standard, High
     int weather_detail = 0; // Follow preset, Low, Medium, High, Ultra
     int weather_grid_detail = 0; // 0: regional only, 1: 192^2 local tile, 2: 384^2 local tile
-    int terrain_detail = 0; // 0 = Follow preset, 1 = Fast, 2 = Balanced, 3 = High, 4 = Extreme
+    int terrain_detail = 1; // 0 = Follow preset, 1 = Fast, 2 = Balanced, 3 = High, 4 = Extreme
     int world_detail = 0; // 0 = Follow preset, 1 = Sparse, 2 = Medium, 3 = High, 4 = Max Cities & Traffic
     int vegetation_detail = 0; // 0 = Follow preset, 1 = Minimal, 2 = Standard, 3 = High, 4 = Dense
     int anisotropy = 4; // 1, 2, 4, 8, 16x anisotropic texture filtering
@@ -31,10 +39,10 @@ struct GraphicsSettings {
     int head_motion_mode = 2; // 0 = Off, 1 = Subtle, 2 = Realistic (G-inertia, turn-look, touchdown jolt)
     int audio_volume_percent = 85; // 0..100 master audio level
     int atmosphere_clarity = 0; // 0 = Crisp VFR, 1 = Natural, 2 = Hazy
-    int quality_preset = 2; // 0 = Low, 1 = Medium, 2 = High, 3 = Ultra
+    int quality_preset = 1; // 0 = Low, 1 = Medium, 2 = High, 3 = Ultra
     bool show_flight_hud = false;
     int display_mode = 0; // 0 = Windowed, 1 = Fullscreen, 2 = Fullscreen windowed
-    bool vsync = true;
+    bool vsync = kLaptopVsync;
     int fps_limit = 60; // 0 = Unlimited, otherwise 24..240 FPS
     int yoke_deadzone_pct = 5;  // 0..20% hardware yoke deadzone
     int yoke_curve_pct = 35;    // 0..80% cubic S-curve sensitivity
@@ -80,7 +88,7 @@ inline void apply_graphics_profile(GraphicsSettings &settings, int profile_id) {
     profile_id = std::clamp(profile_id, 0, 3);
     settings.quality_preset = profile_id;
     if (profile_id == 0) {
-        settings.pixel_percent = 50;
+        settings.pixel_percent = 38;
         settings.aa_mode = 0;
         settings.terrain_lod_percent = 75;
         settings.cockpit_native = false;
@@ -91,21 +99,21 @@ inline void apply_graphics_profile(GraphicsSettings &settings, int profile_id) {
         settings.world_detail = 1;
         settings.vegetation_detail = 1;
         settings.anisotropy = 2;
-        settings.vsync = true;
+        settings.vsync = kLaptopVsync;
         settings.fps_limit = 60;
     } else if (profile_id == 1) {
-        settings.pixel_percent = 65;
+        settings.pixel_percent = 40;
         settings.aa_mode = 1;
-        settings.terrain_lod_percent = 90;
+        settings.terrain_lod_percent = 75;
         settings.cockpit_native = true;
-        settings.aircraft_detail = 1;
-        settings.weather_detail = 2;
+        settings.aircraft_detail = 0;
+        settings.weather_detail = 0;
         settings.weather_grid_detail = 0;
-        settings.terrain_detail = 2;
-        settings.world_detail = 2;
-        settings.vegetation_detail = 2;
+        settings.terrain_detail = 1;
+        settings.world_detail = 0;
+        settings.vegetation_detail = 0;
         settings.anisotropy = 4;
-        settings.vsync = true;
+        settings.vsync = kLaptopVsync;
         settings.fps_limit = 60;
     } else if (profile_id == 2) {
         settings.pixel_percent = 68;

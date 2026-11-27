@@ -41,7 +41,10 @@ void main() {
     float cos_th = max(0.0, dot(dir, sdir));
     float sun_vis = clamp((sdir.y + 0.06) / 0.18, 0.0, 1.0);
     float mie_wide = pow(cos_th, 5.0) * 0.55 + pow(cos_th, 32.0) * 1.25;
-    float sun_disk = smoothstep(0.99945, 0.99982, dot(dir, sdir)) * 18.0 * sun_vis * (1.0 - u_cloud_cov * 0.75);
+    float sun_dot = dot(dir, sdir);
+    const float sun_edge = 0.9999894; // 0.264-degree angular radius
+    float sun_aa = max(0.0000006, fwidth(sun_dot) * 0.75);
+    float sun_disk = smoothstep(sun_edge - sun_aa, sun_edge + sun_aa, sun_dot) * 18.0 * sun_vis * (1.0 - u_cloud_cov * 0.75);
     sky += u_haze_warm * (mie_wide * sun_vis * (0.65 + 0.55 * ray_t)) + vec3(1.0, 0.94, 0.82) * sun_disk;
 
     // Subtle crisp stars during the compressed Short Night phase!
@@ -53,9 +56,7 @@ void main() {
         sky += vec3(0.86, 0.91, 1.0) * (star * 2.4);
     }
 
-    // Ground bounce color below horizon
-    if (dir.y < 0.0) {
-        sky = mix(horiz_col, horiz_col * 0.45, clamp(-dir.y * 4.0, 0.0, 1.0));
-    }
+    // Blend continuously from the horizon into the ground bounce color.
+    sky = mix(sky, horiz_col * 0.45, smoothstep(0.0, 0.25, -dir.y));
     frag_color = vec4(sky, 1.0);
 }

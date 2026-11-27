@@ -54,6 +54,7 @@ bool AircraftAndHud::init(const PackReader *pack, const std::string &asset_root,
     u_ac_glass_weather_ = glGetUniformLocation(ac_prog_, "u_glass_weather");
     u_ac_glass_flow_f_ = glGetUniformLocation(ac_prog_, "u_glass_flow_front");
     u_ac_glass_flow_s_ = glGetUniformLocation(ac_prog_, "u_glass_flow_side");
+    u_ac_rain_luts_ = glGetUniformLocation(ac_prog_, "u_rain_luts");
     u_ac_glass_fx_ = glGetUniformLocation(ac_prog_, "u_glass_fx");
     u_ac_plane_wx_ = glGetUniformLocation(ac_prog_, "u_plane_wx");
     u_ac_dmg_zones_ = glGetUniformLocation(ac_prog_, "u_dmg_zones");
@@ -2523,6 +2524,7 @@ void AircraftAndHud::draw_glb(
     glUniform1i(u_ac_native_output_, output_resolution ? 1 : 0);
     glUniform1f(u_ac_output_exposure_, atmo.exposure);
     glUniform1i(u_ac_output_lut_, 6);
+    glUniform1i(u_ac_rain_luts_, (windshield_rain_front_tex_ ? 1 : 0) | (windshield_rain_side_tex_ ? 2 : 0));
     glBindVertexArray(mesh.vao);
     const nspain::FlightState &flight_air = fdm_.state();
     // Use JSBSim true airspeed for the rain-flow driver. Ground speed varies

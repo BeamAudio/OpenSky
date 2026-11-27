@@ -29,6 +29,7 @@ uniform vec4 u_dmg_zones;     // x=nose, y=wing_l, z=wing_r, w=tail
 uniform vec4 u_dmg_extra;     // x=airframe, y=windshield_crack, z=scorch, w=is_interior
 uniform int u_native_output;
 uniform int u_aircraft_detail;
+uniform int u_rain_luts;
 uniform float u_output_exposure;
 
 in vec3 v_world_pos;
@@ -378,7 +379,7 @@ void main() {
             float sky_t = clamp(R.y * 0.5 + 0.5, 0.0, 1.0);
             vec3 sky_env = mix(u_haze_warm * 0.45, u_haze_cool * 1.15, smoothstep(0.35, 0.85, sky_t));
             float sun_fwd = pow(max(0.0, dot(-V, L)), 12.0) * daylight;
-            float dash_bounce = (u_cabin_glass == 2) ? (smoothstep(0.48, 0.04, v_uv.y) * 0.028 * daylight) : 0.0;
+            float dash_bounce = (u_cabin_glass == 2) ? ((1.0 - smoothstep(0.04, 0.48, v_uv.y)) * 0.028 * daylight) : 0.0;
             vec3 dry_col = sky_env * (0.28 + 0.72 * daylight)
                          + vec3(1.05, 0.96, 0.84) * (sun_fwd * 0.26)
                          + vec3(0.18, 0.20, 0.24) * (dash_bounce * 7.5);
@@ -388,7 +389,6 @@ void main() {
             return;
         }
 
-        float airspeed = clamp(u_glass_weather.z, 0.0, 160.0);
         float sim_time = u_glass_weather.y;
         bool front_glass = (u_cabin_glass == 2);
 
@@ -396,7 +396,22 @@ void main() {
         vec2 drop_nrm = vec2(0.0);
         float drop_mask = 0.0;
         float drop_relief = 0.0;
-        if (wet > 0.005) {
+        bool baked_rain = u_aircraft_detail == 0 && (u_rain_luts & (front_glass ? 1 : 2)) != 0;
+        if (wet > 0.005 && baked_rain) {
+            // The relief volume stores normals in RG, dome height in B and
+            // coverage in A. Advect the larger drops with the live pane flow.
+            float rate_slice = rain_mm < 2.5 ? smoothstep(0.35, 2.5, rain_mm) :
+                               rain_mm < 12.0 ? 1.0 + smoothstep(2.5, 12.0, rain_mm) :
+                                                2.0 + smoothstep(12.0, 45.0, rain_mm);
+            vec2 flow = front_glass ? u_glass_flow_front.xy : u_glass_flow_side.xy;
+            vec2 uv = vec2(v_uv.x, v_uv.y) * (front_glass ? vec2(1.25, 0.95) : vec2(0.95, 0.76)) - flow;
+            vec3 rain_uv = vec3(uv, (rate_slice + 0.5) * 0.25);
+            vec4 rain = front_glass ? textureLod(u_windscreen_rain_front, rain_uv, 0.0) :
+                                      textureLod(u_windscreen_rain_side, rain_uv, 0.0);
+            drop_mask = smoothstep(0.12, 0.60, rain.a) * wet;
+            drop_nrm = (rain.rg * 2.0 - 1.0) * vec2(1.0, -1.0) * drop_mask;
+            drop_relief = rain.b * wet;
+        } else if (wet > 0.005) {
             float rain_dens = clamp(0.24 + 0.48 * wet + 0.26 * heavy_rain, 0.0, 0.94);
             vec4 flow_in = front_glass ? u_glass_flow_front : u_glass_flow_side;
             vec2 flow_vel = flow_in.zw;
@@ -460,8 +475,8 @@ void main() {
         float fresnel = pow(1.0 - max(0.0, dot(N, V)), 4.5);
         float drop_alpha = smoothstep(0.02, 0.35, drop_mask);
         // Smooth continuous optical water sheen without cell-clipped wipe tiles
-        float sheen_n = cabin_grain(v_obj_pos * 12.0);
-        float film_alpha = front_glass ? (heavy_rain * 0.065 * (0.75 + 0.25 * sheen_n)) : 0.0;
+        float film_alpha = front_glass && heavy_rain > 0.01 ?
+            heavy_rain * 0.065 * (0.75 + 0.25 * cabin_grain(v_obj_pos * 12.0)) : 0.0;
         float non_drop_alpha = fresnel * 0.055 + frost_mask * 0.80 + mist_mask + grime_mask + crack_mask * 0.72;
         float glass_alpha = clamp(max(max(drop_alpha, film_alpha), non_drop_alpha), 0.0, 0.96);
         if (glass_alpha < 0.012) { frag_color = vec4(0.0); return; }
@@ -480,7 +495,7 @@ void main() {
             vec3 spec_col = mix(vec3(0.55, 0.65, 0.78), vec3(1.45, 1.48, 1.52), daylight);
             vec3 water_hdr;
             float out_drop_a;
-            if (front_glass || u_native_output != 0) {
+            {
                 // True optical HDR convex-lens refraction across both front windshield & side cabin glazing!
                 vec2 screen_uv = clamp((v_clip_pos.xy / max(1e-5, v_clip_pos.w)) * 0.5 + 0.5, vec2(0.002), vec2(0.998));
                 float edge_guard = smoothstep(0.0, 0.035, min(min(screen_uv.x, 1.0 - screen_uv.x), min(screen_uv.y, 1.0 - screen_uv.y)));
@@ -488,7 +503,7 @@ void main() {
                 vec2 refr_uv = clamp(screen_uv - drop_nrm * refr_scale * (0.55 + 0.65 * drop_relief) * edge_guard,
                                      vec2(0.002), vec2(0.998));
                 vec3 refr_hdr = textureLod(u_backdrop_tex, refr_uv, 0.0).rgb;
-                if (film_alpha > 0.02 && drop_alpha < 0.85) {
+                if (u_aircraft_detail != 0 && film_alpha > 0.02 && drop_alpha < 0.85) {
                     vec2 blur_r = vec2(0.0020, 0.0034) * edge_guard;
                     vec3 film_hdr = 0.25 * (
                         textureLod(u_backdrop_tex, clamp(screen_uv + vec2(blur_r.x, blur_r.y), vec2(0.002), vec2(0.998)), 0.0).rgb +
@@ -502,15 +517,6 @@ void main() {
                           + spec_col * (spec * 0.85)
                           + vec3(0.68, 0.84, 1.20) * (flash * (0.16 * drop_alpha + spec * 0.90));
                 out_drop_a = max(drop_alpha, film_alpha);
-            } else {
-                // Side windows: crystal-clear bead centers with optical dark meniscus & crisp sky/sun Fresnel rim.
-                float rim_dark_a = smoothstep(0.60, 0.95, slope_mag) * 0.28 * drop_alpha;
-                float rim_lit_a = clamp(water_fresnel * 0.42 + sky_arc * 0.24 + spec * 0.72, 0.0, 0.62);
-                vec3 dark_col = vec3(0.02, 0.03, 0.05) * (0.35 + 0.65 * daylight);
-                vec3 lit_col = sky_refl * (0.75 + 0.55 * sky_arc) + spec_col * (spec * 1.35)
-                             + vec3(0.68, 0.84, 1.20) * (flash * (0.18 + spec * 0.80));
-                out_drop_a = clamp(rim_dark_a + rim_lit_a + drop_alpha * 0.035, 0.0, 0.66);
-                water_hdr = mix(dark_col, lit_col, clamp(rim_lit_a / max(0.01, rim_dark_a + rim_lit_a), 0.0, 1.0));
             }
             water_hdr = mix(water_hdr, vec3(0.84, 0.90, 0.97) * (0.30 + 0.72 * daylight), snow_fac * 0.28 * drop_alpha);
 
@@ -537,6 +543,11 @@ void main() {
         float w_sum = max(0.001, fresnel * 0.055 + frost_mask * 0.80 + mist_mask + grime_mask + crack_mask * 0.72);
         glass_color = (base_glass * (fresnel * 0.055) + frost_col * (frost_mask * 0.80) +
                        mist_col * mist_mask + grime_col * grime_mask + crack_col * (crack_mask * 0.72)) / w_sum;
+        if (drop_alpha > 0.02) {
+            float rim = clamp(length(drop_nrm) * 1.8, 0.0, 1.0);
+            glass_color = mix(glass_color, mix(vec3(0.12), u_haze_cool, rim), drop_alpha * 0.55);
+            non_drop_alpha = max(non_drop_alpha, drop_alpha * (0.04 + rim * 0.20));
+        }
         frag_color = vec4(native_display_color(glass_color), clamp(non_drop_alpha, 0.0, 0.90));
         return;
     }

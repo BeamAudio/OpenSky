@@ -409,6 +409,9 @@ int main(int argc, char **argv) {
     std::string season_arg = "auto";
     std::string weather_arg = "auto";
     bool quick_profile = false;
+    bool uncapped_profile = false;
+    bool vsync_profile = false;
+    int graphics_profile_override = -1;
     bool debug_overlays = false;
     bool weather_model_debug = false;
     bool no_audio = false;
@@ -453,6 +456,19 @@ int main(int argc, char **argv) {
         else if (a == "--weather-model-debug") weather_model_debug = true;
         else if (a == "--no-audio") no_audio = true;
         else if (a == "--no-live-weather") no_live_weather = true;
+        else if (a == "--uncapped-profile") uncapped_profile = true;
+        else if (a == "--vsync-profile") vsync_profile = true;
+        else if (a == "--graphics-profile" && i + 1 < argc) {
+            const std::string value = argv[++i];
+            if (value == "laptop") graphics_profile_override = 0;
+            else if (value == "balanced") graphics_profile_override = 1;
+            else if (value == "high") graphics_profile_override = 2;
+            else if (value == "ultra") graphics_profile_override = 3;
+            else {
+                std::fprintf(stderr, "[GRAPHICS] --graphics-profile expects laptop, balanced, high, or ultra\n");
+                return 2;
+            }
+        }
         else if ((a == "--profile" || a == "--quick-profile") && i + 1 < argc) {
             profile_dir = argv[++i];
             quick_profile = a == "--quick-profile";
@@ -506,6 +522,10 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "[PROFILE] --quick-profile is a standalone capture mode\n");
         return 2;
     }
+    if ((uncapped_profile && vsync_profile) || ((uncapped_profile || vsync_profile) && !quick_profile)) {
+        std::fprintf(stderr, "[PROFILE] Choose one of --uncapped-profile or --vsync-profile with --quick-profile\n");
+        return 2;
+    }
     int season_override = -1;
     if (season_arg == "winter") season_override = 0;
     else if (season_arg == "spring") season_override = 1;
@@ -555,6 +575,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     GraphicsSettings graphics_settings = load_graphics_settings();
+    if (graphics_profile_override >= 0) apply_graphics_profile(graphics_settings, graphics_profile_override);
     if (weather_refinement_override >= 0)
         graphics_settings.weather_grid_detail = weather_refinement_override;
     if (promo_only) {
@@ -655,8 +676,13 @@ int main(int argc, char **argv) {
         }
         return 1;
     }
-    bool active_vsync = interactive_run && graphics_settings.vsync;
-    if (interactive_run) win.set_vsync(active_vsync);
+    bool requested_vsync = (interactive_run && graphics_settings.vsync) || vsync_profile;
+    bool active_vsync = requested_vsync && win.set_vsync(true);
+    const auto set_vsync = [&](bool enabled) {
+        if (enabled == requested_vsync) return;
+        requested_vsync = enabled;
+        active_vsync = win.set_vsync(enabled) && enabled;
+    };
     std::printf("[OPENSKY] OpenGL %s | Renderer: %s | %dx%d output, %dx%d window (%.0f Hz, limit %d FPS, VSync %s) | %zu region(s) | %d tiles | %zu airfields | %zu OSM bldgs | %zu OSM roads\n",
                 reinterpret_cast<const char *>(glGetString(GL_VERSION)),
                 reinterpret_cast<const char *>(glGetString(GL_RENDERER)),
@@ -668,7 +694,7 @@ int main(int argc, char **argv) {
     profiler.set_overlay(debug_overlays);
     profiler.startup_stage("window_and_gl");
 
-    int quality = interactive_run ? graphics_settings.quality_preset : 2; // 0=LOW iGPU, 1=MEDIUM, 2=HIGH, 3=ULTRA
+    int quality = (interactive_run || graphics_profile_override >= 0) ? graphics_settings.quality_preset : 2;
     if (promo_only) quality = 3;
     int tod_slot = (quick_profile || !autotest_dir.empty() || !topdown_dir.empty() || !airport_qa_dir.empty()) ? 2 : graphics_settings.time_of_day;
     // CLI selection enables repeatable QA captures; N cycles the same states during play.
@@ -702,7 +728,8 @@ int main(int argc, char **argv) {
     if (!terrain.init(root + "/game/assets", root + "/sim_engine/shaders")) return 1;
     profiler.startup_stage("terrain_resources");
     if (!sky_clouds.init(root + "/sim_engine/shaders", output_w, output_h, quality,
-                         graphics_settings.pixel_percent, graphics_settings.aa_mode)) return 1;
+                         graphics_settings.pixel_percent, graphics_settings.aa_mode,
+                         graphics_settings.weather_detail)) return 1;
     profiler.startup_stage("sky_cloud_resources");
     if (!interactive_run) reg_atmo.set_solver_seed(0x1725);
     if (!reg_atmo.init(&pack, true, "", interactive_run && !no_live_weather)) return 1;
@@ -861,6 +888,7 @@ int main(int argc, char **argv) {
                 vegetation.invalidate();
                 objects.commit_reanchor(std::move(async_cross.prepared.world_objs));
                 living_traffic.on_reanchor();
+                sky_clouds.reset_temporal_history();
                 reg_atmo.sync_region(pack.anchor_lat(), pack.anchor_lon());
                 reg_atmo.update_field(sky_clouds.atmo().sun_dir, sim_time, false, wx_advance);
             } else {
@@ -914,6 +942,23 @@ int main(int argc, char **argv) {
     std::vector<double> frame_hist(60, 16.6);
     int hist_pos = 0;
     double cur_fps = 60.0, cur_avg_ms = 16.6, cur_p95_ms = 16.6;
+    double present_deadline = 0.0;
+    double paced_fps = 0.0;
+    const auto pace_present = [&](int limit) {
+        if (limit <= 0 || (active_vsync && limit >= win.refresh_hz() - 1.5)) {
+            paced_fps = 0.0;
+            return;
+        }
+        const double period = 1.0 / limit;
+        const double now = PlatformWindow::now_sec();
+        if (paced_fps != limit || present_deadline < now - period) present_deadline = now;
+        paced_fps = limit;
+        if (present_deadline > now) {
+            glFlush();
+            PlatformWindow::sleep_sec(present_deadline - PlatformWindow::now_sec());
+        }
+        present_deadline += period;
+    };
 
     auto regime_fog_mult = [&]() -> float {
         const int clarity = ac_hud.graphics_settings().atmosphere_clarity;
@@ -1006,9 +1051,11 @@ int main(int argc, char **argv) {
         streamer.begin_frame(frame_idx);
         streamer.refine_online_pages(PlatformWindow::now_sec());
         // Frame-time-budgeted upload cap; drains PBO staging bursts quickly without long frame stalls.
-        const int steady_up = (streamer.stats().resident_pages >= 200) ? 1 : 3;
-        const int max_up = streamer.has_async_transition() ? 6 : ((quality == 0) ? 1 : (quality <= 2 ? steady_up : 6));
-        const double up_budget_ms = streamer.has_async_transition() ? 2.4 : ((quality == 0) ? 0.5 : (quality <= 2 ? 0.65 : 2.2));
+        const int steady_up = (streamer.resident_pages() >= 200) ? 1 : 3;
+        const int max_up = streamer.has_async_transition() ? (quality <= 1 ? 2 : 6) :
+                           (quality <= 1 ? 1 : (quality == 2 ? steady_up : 6));
+        const double up_budget_ms = quality <= 1 ? 0.55 :
+                                    (streamer.has_async_transition() ? 2.4 : (quality == 2 ? 0.65 : 2.2));
         profiler.begin(FlightProfiler::Upload);
         streamer.pump_gpu_uploads(static_cast<float>(sim_time), max_up, up_budget_ms);
         profiler.end(FlightProfiler::Upload);
@@ -1078,11 +1125,9 @@ int main(int argc, char **argv) {
 
         profiler.cpu_end(FlightProfiler::Prepare, prepare_start);
 
-        // 1. Begin Reverse-Z Scene Pass + Rayleigh/Mie Sky
+        // Initialize reverse-Z depth before submitting opaque geometry.
         const double t_p0 = PlatformWindow::now_sec();
-        profiler.begin(FlightProfiler::Sky);
-        sky_clouds.begin_scene_pass(inv_vp);
-        profiler.end(FlightProfiler::Sky);
+        sky_clouds.begin_scene_pass();
         const double t_p1 = PlatformWindow::now_sec();
 
         // 2. Smooth Continuous CDLOD Quadtree Terrain + 16-Pattern Array + Cliffs + IBL Reflections + Peak Fog + RT Night!
@@ -1147,6 +1192,10 @@ int main(int argc, char **argv) {
         );
         profiler.end(FlightProfiler::Terrain);
         const double t_p2 = PlatformWindow::now_sec();
+
+        profiler.begin(FlightProfiler::Sky);
+        sky_clouds.draw_sky_background(inv_vp);
+        profiler.end(FlightProfiler::Sky);
 
         // 3. Static world geometry (settlements, hangars, roads & volumetric airfield trees) BEFORE cloud depth capture
         // so high-altitude airfields & city towers properly occlude clouds behind them, while moving aircraft/ships
@@ -1280,9 +1329,13 @@ int main(int argc, char **argv) {
             // Keep capture frames on the GPU without presenting a desktop window.
             glFlush();
         } else {
-            const double present_start = profiler.cpu_start();
             const PixelRect viewport = win.presentation_rect(output_w, output_h);
+            const double blit_start = profiler.cpu_start();
             sky_clouds.present(viewport.x, viewport.y, viewport.w, viewport.h, win.width(), win.height());
+            profiler.cpu_end(FlightProfiler::Present, blit_start);
+            if (interactive_run) pace_present(render_settings.fps_limit);
+            if (quick_profile && !uncapped_profile) pace_present(60);
+            const double present_start = profiler.cpu_start();
             if (offscreen) glFlush();
             else win.swap_buffers();
             profiler.cpu_end(FlightProfiler::Present, present_start);
@@ -1308,24 +1361,22 @@ int main(int argc, char **argv) {
 
     if (quick_profile) {
         tod_slot = (weather_arg == "fog") ? 0 : 2;
-        const auto route = [&](const char *name, double lat, double lon, double agl, double heading) {
-            streamer.clear_pending_requests();
-            ac_hud.reset_flight(lat, lon, pack.sample_elevation(lat, lon) + agl, heading, 100.0, false);
-            sky_clouds.reset_temporal_history();
+        const auto route = [&](const char *name, double lat, double lon, double agl, double heading, bool stress = false) {
             profiler.set_scene(std::string(name) + "_warmup");
-            for (int i = 0; i < 30 && !win.should_close(); ++i) {
+            transition_world(lat, lon);
+            ac_hud.reset_flight(lat, lon, pack.sample_elevation(lat, lon) + agl, heading, 100.0, false);
+            ac_hud.state().slew_fast = stress;
+            sky_clouds.reset_temporal_history();
+            for (int i = 0; i < 240 && !win.should_close(); ++i) {
                 win.poll_events();
                 step_flight(1.0 / 60.0);
-                capture_frame(1.0 / 60.0, true);
+                capture_frame(1.0 / 60.0, debug_overlays);
             }
             profiler.set_scene(name);
             for (int i = 0; i < 240 && !win.should_close(); ++i) {
-                double f0 = PlatformWindow::now_sec();
                 win.poll_events();
                 step_flight(1.0 / 60.0);
-                capture_frame(1.0 / 60.0, true);
-                double spare = (1.0 / 60.0) - (PlatformWindow::now_sec() - f0);
-                if (spare > 0.0005) PlatformWindow::sleep_sec(spare);
+                capture_frame(1.0 / 60.0, debug_overlays);
             }
             if (!win.should_close()) {
                 profiler.set_scene(std::string(name) + "_capture");
@@ -1333,11 +1384,7 @@ int main(int argc, char **argv) {
             }
         };
         if (req_region == "es_catalonia_coast") {
-            auto reanchor_route = [&](const char *name, double lat, double lon, double agl, double heading) {
-                transition_world(lat, lon);
-                route(name, lat, lon, agl, heading);
-            };
-            reanchor_route("barcelona_downtown", 41.3680, 2.1550, 290.0, 38.0);
+            route("barcelona_downtown", 41.3680, 2.1550, 290.0, 38.0);
             // Also grab an external chase shot over Eixample / Barcelona skyline for visual inspection.
             if (!win.should_close()) {
                 ac_hud.state().view_mode = 1;
@@ -1352,11 +1399,13 @@ int main(int argc, char **argv) {
                 ac_hud.state().look_yaw_deg = 0.0f;
                 ac_hud.state().look_pitch_deg = 0.0f;
             }
-            reanchor_route("valles_sabadell", 41.5220, 2.1050, 250.0, 175.0);
-            reanchor_route("girona_city", 41.9680, 2.8120, 240.0, 52.0);
+            route("valles_sabadell", 41.5220, 2.1050, 250.0, 175.0);
+            route("girona_city", 41.9680, 2.8120, 240.0, 52.0);
         } else {
             route("pyrenees", 42.53131, 0.47676, 120.0, 160.0);
             route("zaragoza", 41.6420, -0.8920, 260.0, 28.0);
+            route("mediano", 42.3120, 0.1940, 185.0, 12.0);
+            route("stress_350kt", 42.2000, 0.1000, 420.0, 15.0, true);
         }
         if (debug_overlays && !win.should_close()) {
             profiler.set_scene("debug_chase");
@@ -1369,7 +1418,7 @@ int main(int argc, char **argv) {
         }
         profiler.finish();
         std::printf("[PROFILE] Capture complete -> %s\n", profile_dir.c_str());
-        return 0;
+        return win.should_close() ? 1 : 0;
     }
 
     // Autonomous All-Region Visual + Real JSBSim Assisted Takeoff/Departure & Landing Verification
@@ -1925,8 +1974,9 @@ int main(int argc, char **argv) {
             s.view_mode = vmode;
             if (promo_only && vmode == 1) s.chase_dist_m = 24.0f;
             double gnd = pack.sample_elevation(lat, lon);
+            const bool reanchored = promo_only || nspain::haversine_m(lat, lon, pack.anchor_lat(), pack.anchor_lon()) > 40000.0;
+            if (reanchored) transition_world(lat, lon);
             if (promo_only) {
-                transition_world(lat, lon);
                 // At photo altitude, prioritize the foreground visible below
                 // the nose rather than the ground directly below the aircraft.
                 double metres_lat, metres_lon;
@@ -1940,7 +1990,7 @@ int main(int argc, char **argv) {
             // Ordinary QA shots share one region anchor. Promo shots move
             // across large areas, so transition_world reanchors and cancels
             // stale work while preserving the target site's prewarm requests.
-            if (!promo_only) streamer.clear_pending_requests();
+            if (!reanchored) streamer.clear_pending_requests();
             s.pitch_deg = pitch;
             s.roll_deg = roll;
             s.aileron = ail;
@@ -2871,8 +2921,15 @@ int main(int argc, char **argv) {
 
         // 2. Live Flight & HIGH-SPEED 350 KT Async Streaming p95 Benchmarks!
         auto bench = [&](const char *tag, double lat, double lon, double agl, double hdg, double pitch, bool fast_350kt) {
-            for (int q : {2, 1, 0}) {
+            transition_world(lat, lon);
+            for (int q : {3, 2, 1, 0}) {
+                if (graphics_profile_override >= 0 && graphics_profile_override != q) continue;
                 quality = q;
+                GraphicsSettings bench_settings = graphics_settings;
+                apply_graphics_profile(bench_settings, q);
+                if (weather_refinement_override >= 0) bench_settings.weather_grid_detail = weather_refinement_override;
+                ac_hud.set_graphics_settings(bench_settings);
+                reg_atmo.set_grid_detail(bench_settings.weather_grid_detail, lat, lon);
                 profiler.set_scene(std::string(tag) + " warmup");
                 FlightSimState &s = ac_hud.state();
                 s.view_mode = 0;
@@ -2884,13 +2941,13 @@ int main(int argc, char **argv) {
                 sky_clouds.reset_temporal_history();
                 for (int w = 0; w < 10; w++) {
                     win.poll_events();
-                    capture_frame(1.0 / 60.0, true, 128);
+                    capture_frame(1.0 / 60.0, debug_overlays, 128);
                     streamer.flush_pending_sync(20, 0.20);
                 }
                 for (int w = 0; w < 6; w++) {
                     win.poll_events();
                     step_flight(1.0 / 60.0);
-                    capture_frame(1.0 / 60.0, true, 128);
+                    capture_frame(1.0 / 60.0, debug_overlays, 128);
                 }
                 streamer.flush_pending_sync(20, 0.20);
                 profiler.set_scene(tag);
@@ -2904,7 +2961,7 @@ int main(int argc, char **argv) {
                 for (int f = 0; f < N; f++) {
                     win.poll_events();
                     step_flight(1.0 / 60.0);
-                    capture_frame(1.0 / 60.0, true);
+                    capture_frame(1.0 / 60.0, debug_overlays);
                     double now = PlatformWindow::now_sec();
                     ms.push_back((now - prev) * 1000.0);
                     prev = now;
@@ -3235,11 +3292,6 @@ int main(int argc, char **argv) {
             step_flight_world_transition(rs.lat_deg, rs.lon_deg, rs.vel_east_mps, rs.vel_north_mps);
             render_one_frame(false, 1, "", 50.0f, true);
             push_audio_state(dt, true);
-            const int lim = ac_hud.graphics_settings().fps_limit;
-            const bool vsync_paces = active_vsync && (lim <= 0 || static_cast<double>(lim) >= win.refresh_hz() - 1.5);
-            const double eff_period = (!vsync_paces && lim > 0) ? (1.0 / static_cast<double>(lim)) : 0.0;
-            const double spare = eff_period - (PlatformWindow::now_sec() - now);
-            if (spare > 0.0004) PlatformWindow::sleep_sec(spare);
             continue;
         }
 
@@ -3273,25 +3325,18 @@ int main(int argc, char **argv) {
             }
             frontend.draw_menu(ac_hud, sky_clouds, win, !airfield_pages.empty(), tod_slot, &reg_atmo, sim_time);
             quality = ac_hud.graphics_settings().quality_preset;
-            if (ac_hud.graphics_settings().vsync != active_vsync) {
-                active_vsync = ac_hud.graphics_settings().vsync;
-                win.set_vsync(active_vsync);
-            }
+            set_vsync(ac_hud.graphics_settings().vsync);
             const auto viewport = win.presentation_rect(output_w, output_h);
             sky_clouds.present(viewport.x, viewport.y, viewport.w, viewport.h, win.width(), win.height());
+            const int limit = ac_hud.graphics_settings().fps_limit;
+            pace_present(limit > 0 ? std::min(limit, 60) : 60);
             win.swap_buffers();
             const auto provider = ac_hud.graphics_settings().terrain_streaming ? OnlineOrthoProvider::PNOA : OnlineOrthoProvider::OFF;
             if (pack.online_provider() != provider) {
                 pack.set_online_provider(provider);
                 streamer.invalidate_close_pages();
             }
-            const int lim = ac_hud.graphics_settings().fps_limit;
-            const double user_p = lim > 0 ? (1.0 / static_cast<double>(lim)) : 0.0;
-            const double menu_period = std::max(user_p, 1.0 / 60.0);
-            const bool vsync_paces = active_vsync && ((1.0 / menu_period) >= win.refresh_hz() - 1.5);
-            const double spare = vsync_paces ? 0.0 : (menu_period - (PlatformWindow::now_sec() - now));
             push_audio_state(dt, true);
-            if (spare > 0.0004) PlatformWindow::sleep_sec(spare);
             continue;
         }
         if (frontend.walking()) {
@@ -3300,19 +3345,18 @@ int main(int argc, char **argv) {
             update_environment();
             render_one_frame(true);
             push_audio_state(dt, false);
-            const int lim = ac_hud.graphics_settings().fps_limit;
-            const bool vsync_paces = active_vsync && (lim <= 0 || static_cast<double>(lim) >= win.refresh_hz() - 1.5);
-            const double walk_period = (!vsync_paces && lim > 0) ? (1.0 / static_cast<double>(lim)) : 0.0;
-            const double spare = walk_period - (PlatformWindow::now_sec() - now);
-            if (spare > 0.0004) PlatformWindow::sleep_sec(spare);
             continue;
         }
 
         if (win.key_pressed(KEY_T)) frontend.toggle_tutorial();
         auto set_quality_preset = [&](int q) {
-            quality = std::clamp(q, 0, 3);
             auto s = ac_hud.graphics_settings();
-            s.quality_preset = quality;
+            const int old_grid = s.weather_grid_detail;
+            apply_graphics_profile(s, q);
+            quality = s.quality_preset;
+            if (s.weather_grid_detail != old_grid)
+                reg_atmo.set_grid_detail(s.weather_grid_detail, ac_hud.state().lat_deg, ac_hud.state().lon_deg);
+            set_vsync(s.vsync);
             ac_hud.set_graphics_settings(s);
             save_graphics_settings(s);
         };
@@ -3400,12 +3444,6 @@ int main(int argc, char **argv) {
             ac_hud.graphics_settings().show_flight_hud || frontend.tutorial_open();
         render_one_frame(show_flight_overlays);
         push_audio_state(dt, ac_hud.state().paused || ac_hud.state().menu_open);
-        // Frame pacing respects the user FPS limit without double-sleeping against VSync.
-        const int lim = ac_hud.graphics_settings().fps_limit;
-        const bool vsync_paces = active_vsync && (lim <= 0 || static_cast<double>(lim) >= win.refresh_hz() - 1.5);
-        const double eff_period = (!vsync_paces && lim > 0) ? (1.0 / static_cast<double>(lim)) : 0.0;
-        const double spare = eff_period - (PlatformWindow::now_sec() - now);
-        if (spare > 0.0004) PlatformWindow::sleep_sec(spare);
     }
 
     cancel_async_crossing();

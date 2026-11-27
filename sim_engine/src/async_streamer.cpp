@@ -200,7 +200,10 @@ bool AsyncTerrainStreamer::init(const PackReader *pack, int worker_count, OrthoF
 }
 
 void AsyncTerrainStreamer::shutdown() {
-    stop_.store(true);
+    {
+        std::lock_guard<std::mutex> lk(req_mtx_);
+        stop_.store(true);
+    }
     req_cv_.notify_all();
     for (auto &t : workers_) {
         if (t.joinable()) t.join();
@@ -307,10 +310,14 @@ void AsyncTerrainStreamer::worker_loop() {
 
         {
             std::unique_lock<std::mutex> lk(req_mtx_);
+            const auto has_work = [&]() {
+                return !pending_reqs_.empty() || (pending_gen_.load(std::memory_order_acquire) != 0 && !pending_reqs_next_.empty());
+            };
+            req_cv_.wait(lk, [&]() { return stop_.load(std::memory_order_relaxed) || has_work(); });
+            // Staging fences are reclaimed by the render thread. Retry only
+            // while work is queued, in case a fence wake races this wait.
             req_cv_.wait_for(lk, std::chrono::milliseconds(8), [&]() {
-                if (stop_.load(std::memory_order_relaxed)) return true;
-                const bool have_next = (pending_gen_.load(std::memory_order_acquire) != 0) && !pending_reqs_next_.empty();
-                if (!have_next && pending_reqs_.empty()) return false;
+                if (stop_.load(std::memory_order_relaxed) || !has_work()) return true;
                 for (int i = 0; i < NUM_STAGING; i++) {
                     if (staging_[i].state.load(std::memory_order_acquire) == StageState::FREE) return true;
                 }

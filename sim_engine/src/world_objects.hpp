@@ -7,6 +7,8 @@
 
 #include <cmath>
 #include <cstdint>
+#include <future>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -148,10 +150,25 @@ private:
         std::vector<CityChunkDiskMeta> disk_chunks;
         bool gpu_streamed = false;
         double stream_le = 1e18, stream_ln = 1e18;
+        double stream_retry_time = 0.0;
         GLuint vao = 0, vbo = 0, ebo = 0;
         std::vector<CityChunkInfo> chunks;
         std::unordered_map<int64_t, std::vector<uint32_t>> macro_grid;
         std::unordered_map<int64_t, uint8_t> dense_cells;
+    };
+    struct CityRegionData {
+        std::vector<uint8_t> vertices;
+        std::vector<uint32_t> indices;
+        std::vector<CityChunkInfo> chunks;
+        std::unordered_map<int64_t, std::vector<uint32_t>> macro_grid;
+    };
+    struct CityStream {
+        CityRegionGpu *region = nullptr;
+        double le = 0.0, ln = 0.0;
+        std::future<std::optional<CityRegionData>> job;
+        CityRegionData data;
+        GLuint vbo = 0, ebo = 0;
+        size_t uploaded = 0;
     };
 
     static constexpr int MAX_PER_ARCH = 16000;
@@ -167,10 +184,12 @@ private:
     GLuint load_tex2d(const std::string &path, bool srgb, bool repeat = true);
     bool load_baked_cities(const std::string &pack_dir);
     bool load_city_region_meta(CityRegionGpu &cr);
-    bool stream_city_region_local(CityRegionGpu &cr, double cam_le, double cam_ln);
+    static std::optional<CityRegionData> read_city_region(const CityRegionGpu &cr, double cam_le, double cam_ln);
+    void publish_city_region(CityRegionGpu &cr, CityRegionData &&data, double le, double ln, GLuint vbo, GLuint ebo);
+    void reset_city_stream();
     void unload_city_region_gpu(CityRegionGpu &cr);
     void update_city_region_transforms();
-    void ensure_city_regions_for_camera(double cam_east_m, double cam_north_m);
+    void ensure_city_regions_for_camera(double cam_east_m, double cam_north_m, bool preload = false);
     bool is_dense_urban_en(double e, double n) const;
     std::vector<BldgGpu> build_buildings_cpu(const PackReader::WorldFrame &frame) const;
     std::vector<float> build_runways_cpu(const PackReader::WorldFrame &frame) const;
@@ -205,6 +224,7 @@ private:
     GLuint city_prog_ = 0;
     GLuint city_far_prog_ = 0;
     std::vector<CityRegionGpu> city_regions_;
+    CityStream city_stream_;
     GLuint mtn_gi_tex_ = 0; // 512x384 RG8: R=50km mountain 10-TOD shadow, G=valley Sky AO (updated only on TOD shift!)
     float mtn_gi_phase_ = -10.0f;
     std::vector<uint8_t> mtn_gi_cpu_;

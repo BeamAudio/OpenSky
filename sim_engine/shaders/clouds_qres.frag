@@ -25,7 +25,6 @@ uniform float u_coverage;
 uniform float u_precip;
 uniform float u_time;
 uniform int u_frame_idx;
-uniform int u_sparse_period; // 1=full rays, 2=half, 4=one 2x2 Bayer phase.
 uniform float u_temporal_blend;
 uniform int u_steps;
 uniform vec3 u_cloud_lit;
@@ -39,10 +38,6 @@ uniform vec2 u_cloud_advect; // Integrated rigid upwind offset (prevents UV pinc
 
 const float R_EARTH = 6378137.0;
 const float MACRO_FREQ = 0.000112;
-
-float ign_noise(vec2 px) {
-    return fract(52.9829189 * fract(dot(px, vec2(0.06711056, 0.00583715))));
-}
 
 float remap01(float v, float lo, float hi) {
     return clamp((v - lo) / max(0.001, hi - lo), 0.0, 1.0);
@@ -233,7 +228,7 @@ float sample_cloud_shadow(vec2 p_en, float h01, vec2 wind_base, vec2 shear_en, f
 }
 
 // Modern Schneider Perlin-Worley 3D cumulus sampler with crisp cauliflower turrets.
-float sample_cloud_modern(vec2 p_en, float h01, float altitude_msl, vec2 wind_base, vec2 shear_en, float eff_cov, float dist_m,
+float sample_cloud_modern(vec2 p_en, float h01, float altitude_msl, vec2 wind_base, vec2 shear_en, float eff_cov, float dist_m, float step_m,
                           out float out_ero, out float out_billow, out vec3 out_wcoord, out float out_wlod, out float out_base) {
     out_ero = 0.5;
     out_billow = 0.5;
@@ -250,23 +245,30 @@ float sample_cloud_modern(vec2 p_en, float h01, float altitude_msl, vec2 wind_ba
     // Gentle multi-scale 3D Worley lobes aligned with solved flow (zero boiling artifacts).
     vec2 curl = vec2(macro_b.g - 0.5, macro_a.g - 0.5) * (95.0 * (0.20 + 0.80 * h_eff));
     vec3 w_coord = vec3((p + curl) * 0.00070, (altitude_msl - u_cloud_base_m) * 0.00078 - u_time * 0.00035);
-    float w_lod = clamp(log2(max(1.0, dist_m * 0.00014)), 0.0, 1.05);
+    // Band-limit density along the march as well as across the screen. Large
+    // steps through tiny lobes otherwise alternate opaque and clear pixels.
+    float footprint = max(dist_m * 0.00014, step_m / 300.0);
+    float w_lod = clamp(log2(max(1.0, footprint)), 0.0, 2.8);
     vec4 w = textureLod(u_cloud_detail, w_coord, w_lod);
     vec4 w2 = w;
     if (dist_m < 10000.0) {
         vec3 w2_coord = vec3(mat2(0.80, 0.60, -0.60, 0.80) * p * 0.00185 + vec2(0.19, 0.73), w_coord.z * 1.4);
-        w2 = textureLod(u_cloud_detail, w2_coord, clamp(w_lod + 0.20, 0.0, 1.35));
+        w2 = textureLod(u_cloud_detail, w2_coord, min(w_lod + 0.45, 3.25));
     } else {
         w2 = w.barg;
     }
 
-    // Solid dense cumulus core + sharp cauliflower edge carving (zero milky fog, zero hollow cores!)
+    // The broad 3D body modulates the weather envelope at all heights so a
+    // single 2D coverage mask cannot extrude into an unbroken flat slab.
+    vec3 body_uv = vec3((p + curl * 0.35) * 0.00024, altitude_msl * 0.00021);
+    float body = textureLod(u_cloud_vol3d, body_uv, 0.0).r;
+    float volume = base_shape * mix(0.47, 1.20, smoothstep(0.18, 0.84, body));
     float worley_lo = w.a * 0.52 + w.b * 0.30 + w2.a * 0.18;
     float worley_hi = w.b * 0.28 + w.g * 0.42 + w2.b * 0.22 + w.r * 0.08;
-    float base_d = remap01(base_shape, (1.0 - worley_lo) * 0.58, 1.0);
+    float base_d = remap01(volume, (1.0 - worley_lo) * 0.56, 1.0);
     float edge = 1.0 - base_d;
     float fine_carve = (1.0 - worley_hi) * mix(0.28, 0.52, h_eff) * (edge * edge + 0.18);
-    float density = smoothstep(0.08, 0.26, max(0.0, base_d - fine_carve) * 1.60);
+    float density = smoothstep(0.015, 0.62, max(0.0, base_d - fine_carve) * 1.25);
 
     out_billow = clamp(worley_lo * 0.52 + worley_hi * 0.48, 0.0, 1.0);
     out_ero = worley_hi;
@@ -385,33 +387,6 @@ void main() {
         }
     }
 
-    // Interleave expensive cloud rays with a 2x2 Bayer phase. One quarter of
-    // pixels gets a fresh volume march each frame; the first frame remains full
-    // rate so every pixel has valid history before sparse reprojection begins.
-    ivec2 bayer_xy = ivec2(gl_FragCoord.xy) & ivec2(1);
-    int bayer_rank = (bayer_xy.y == 0)
-        ? ((bayer_xy.x == 0) ? 0 : 2)
-        : ((bayer_xy.x == 0) ? 3 : 1);
-    bool march_cloud = u_sparse_period <= 1 ||
-        (u_sparse_period == 2 && ((bayer_rank & 1) == (u_frame_idx & 1))) ||
-        (u_sparse_period >= 4 && bayer_rank == (u_frame_idx & 3));
-    if (!march_cloud) {
-        // Reproject previous converged cloud+precip frame directly (avoid double-blending
-        // foreground rain onto history_cloud, which caused 2x2 Bayer checkerboard dots!)
-        if (u_temporal_blend > 0.01) {
-            float ref_t = (valid && t1 > t0 && t0 < 74000.0) ? mix(t0, t1, in_slab ? 0.48 : 0.36) : min(max_ray_t * 0.5, 4500.0);
-            vec4 prev_clip = u_prev_vp * vec4(view_dir * ref_t + u_camera_delta, 1.0);
-            vec2 prev_uv = (prev_clip.xy / max(1e-5, prev_clip.w)) * 0.5 + 0.5;
-            if (prev_clip.w > 0.0 && prev_uv.x > 0.005 && prev_uv.x < 0.995 &&
-                prev_uv.y > 0.005 && prev_uv.y < 0.995) {
-                out_cloud = textureLod(u_prev_cloud, prev_uv, 0.0);
-                return;
-            }
-        }
-        out_cloud = vec4(accum, clamp(1.0 - trans, 0.0, 0.995));
-        return;
-    }
-
     if (valid && t1 > t0 && t0 < 74000.0) {
         vec2 wind_base = u_cloud_advect;
         // Smooth synoptic upper-level shear across the slab (immune to pitch/ridge artifacts).
@@ -430,13 +405,23 @@ void main() {
             float s_y = max(0.06, sdir.y);
             float inv_thick = 1.0 / max(150.0, u_cloud_thick_m);
 
-            int steps = clamp(u_steps, 7, 18);
-            float dt_cur = march_len / float(steps);
-            float jit = fract(ign_noise(gl_FragCoord.xy) + float(u_frame_idx & 3) * 0.25);
-            float t = t0 + dt_cur * (0.34 + 0.32 * jit);
-            float t_end = t0 + march_len;
+            int steps = clamp(u_steps, 8, 36);
+            float inv_steps = 1.0 / float(steps);
+            // Coherent stratified quadrature keeps adjacent rays on the same
+            // integration phase. Accumulate substep phases over time, avoiding
+            // stippled silhouettes on thin cloud boundaries.
+            float jitter = fract(float(u_frame_idx & 15) * 0.618034);
+            float segment_start = t0;
             for (int i = 0; i < steps; i++) {
-                if (trans < 0.025 || t >= t_end) break;
+                if (trans < 0.025) break;
+                // Allocate more samples where nearby lobes have the largest
+                // screen footprint. Integrate extinction over the actual interval.
+                float u = float(i + 1) * inv_steps;
+                float segment_end = t0 + march_len * mix(u, u * u, 0.55);
+                float dt_cur = segment_end - segment_start;
+                float phase = fract(jitter + float(i) * 0.75487766);
+                float t = mix(segment_start, segment_end, 0.37 + 0.26 * phase);
+                segment_start = segment_end;
                 vec3 rp = view_dir * t;
                 float curv_rise = dot(rp.xz, rp.xz) / (2.0 * R_EARTH);
                 float sample_alt_msl = u_cam_alt_m + rp.y + curv_rise;
@@ -444,17 +429,19 @@ void main() {
                 vec2 p_en = u_cam_en + ray_en * t;
                 float ero = 0.5, billow = 0.5, w_lod = 0.0, base_g = 0.0;
                 vec3 w_coord = vec3(0.0);
-                float d = sample_cloud_modern(p_en, h01, sample_alt_msl, wind_base, shear_en, eff_cov, t,
+                float d = sample_cloud_modern(p_en, h01, sample_alt_msl, wind_base, shear_en, eff_cov, t, dt_cur,
                                               ero, billow, w_coord, w_lod, base_g);
-                if (d > 0.012) {
+                if (d > 0.004) {
                     // Fast 3-step logarithmic sun cone raymarch:
                     // Step 0 uses local 3D Worley gradient (1 tap) for crisp cauliflower ridge self-shadowing!
                     vec4 sw0 = textureLod(u_cloud_detail, w_coord + vec3(s_en * 0.085, s_y * 0.11), w_lod);
                     float billow_s0 = sw0.a * 0.52 + sw0.b * 0.30 + sw0.g * 0.18;
                     float d_s0 = clamp(billow_s0 * base_g * 1.35, 0.0, 1.0);
                     float d_s1 = sample_cloud_shadow(p_en + s_en * 440.0,  h01 + s_y * (440.0  * inv_thick), wind_base, shear_en, eff_cov, w_lod + 0.50);
-                    float d_s2 = sample_cloud_shadow(p_en + s_en * 1250.0, h01 + s_y * (1250.0 * inv_thick), wind_base, shear_en, eff_cov, w_lod + 0.90);
-                    float tau_sun = (d_s0 * 0.45 + d_s1 * 1.05 + d_s2 * 1.90) * (1.0 + storm_tint * 0.72);
+                    float d_s2 = u_steps >= 22
+                        ? sample_cloud_shadow(p_en + s_en * 1250.0, h01 + s_y * (1250.0 * inv_thick), wind_base, shear_en, eff_cov, w_lod + 0.90)
+                        : d_s1 * 0.65;
+                    float tau_sun = (d_s0 * 0.72 + d_s1 * 1.10 + d_s2 * 1.72) * (1.0 + storm_tint * 0.72);
 
                     // Calibrated Hillaire/Wrenninge 2-octave multiple scattering: bright snow-white
                     // sunlit cauliflower peaks + luminous creamy multi-scatter + cool slate-blue bases!
@@ -467,9 +454,9 @@ void main() {
 
                     // Vertical sky-to-ground ambient bounce: cool slate undersides -> bright sky-lit domes
                     float h_amb = smoothstep(0.0, 0.80, h01);
-                    float amb_occ = mix(0.42, 1.0, 0.50 * h_amb + 0.50 * ero);
-                    vec3 gnd_amb = u_cloud_shadow * mix(0.36, 0.14, storm_tint) + u_haze_warm * (0.040 * sun_vis * (1.0 - storm_tint));
-                    vec3 sky_amb = mix(u_haze_cool, vec3(0.92, 0.95, 1.0), 0.50);
+                    float amb_occ = mix(0.40, 1.0, 0.62 * h_amb + 0.38 * billow) * mix(0.72, 1.0, exp(-0.35 * tau_sun));
+                    vec3 gnd_amb = u_cloud_shadow * mix(0.30, 0.14, storm_tint) + u_haze_warm * (0.040 * sun_vis * (1.0 - storm_tint));
+                    vec3 sky_amb = mix(u_haze_cool, vec3(0.98, 0.99, 1.0), 0.73);
                     vec3 ambient = mix(gnd_amb, sky_amb, h_amb) * amb_occ * (1.0 - storm_tint * 0.36);
 
                     vec3 step_c = ambient + u_cloud_lit * sun_energy;
@@ -490,7 +477,7 @@ void main() {
 
                     // Solid volumetric cumulus extinction + soft 180m mountain-wrap fade
                     float terrain_wrap = smoothstep(0.0, 180.0, max_ray_t - t);
-                    float extinction = mix(0.0115, 0.0052, smoothstep(100.0, 3800.0, t)) * terrain_wrap;
+                    float extinction = mix(0.0085, 0.0038, smoothstep(100.0, 3800.0, t)) * terrain_wrap;
                     float seg_tau = d * dt_cur * extinction * (1.0 + u_precip * 0.35);
                     float seg_trans = exp(-seg_tau);
                     float w = trans * (1.0 - seg_trans);
@@ -499,7 +486,6 @@ void main() {
                     w_sum += w;
                     trans *= seg_trans;
                 }
-                t += dt_cur;
             }
         }
 

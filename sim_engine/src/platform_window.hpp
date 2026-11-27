@@ -34,7 +34,7 @@ public:
     void poll_events();
     void set_relative_mouse(bool enabled);
     void swap_buffers();
-    void set_vsync(bool enabled);
+    bool set_vsync(bool enabled);
 
     bool should_close() const { return should_close_; }
     void request_close() { should_close_ = true; }

@@ -45,7 +45,7 @@ public:
     double get_roll_deg() const { return current_pose_.roll_deg; }
 
 private:
-    int sock_fd_ = -1;
+    intptr_t sock_fd_ = -1;
     int port_ = 4242;
     OpenTrackPose raw_pose_{};
     OpenTrackPose tare_pose_{};

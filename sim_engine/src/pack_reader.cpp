@@ -10,12 +10,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <fcntl.h>
 #include <filesystem>
 #include <set>
-#include <sys/stat.h>
 #include <thread>
-#include <unistd.h>
 
 namespace nsim {
 
@@ -42,16 +39,6 @@ inline uint32_t hash2i(int x, int y, uint32_t seed) {
     uint32_t h = static_cast<uint32_t>(x) * 374761393u ^ static_cast<uint32_t>(y) * 668265263u ^ seed;
     h = (h ^ (h >> 13)) * 1274126177u;
     return h ^ (h >> 16);
-}
-
-std::string shell_quote(const std::string &value) {
-    std::string quoted = "'";
-    for (char c : value) {
-        if (c == '\'') quoted += "'\\''";
-        else quoted += c;
-    }
-    quoted += '\'';
-    return quoted;
 }
 
 inline float vnoise2(float x, float y, uint32_t seed) {
@@ -166,8 +153,8 @@ PackReader::~PackReader() {
 
 void PackReader::clear_regions() {
     for (LoadedRegion &r : regions_) {
-        if (r.pack_fd >= 0) { ::close(r.pack_fd); r.pack_fd = -1; }
-        if (r.sh_fd >= 0)   { ::close(r.sh_fd);   r.sh_fd = -1; }
+        close_file(r.pack_fd);
+        close_file(r.sh_fd);
     }
     regions_.clear();
     index_.clear();
@@ -240,18 +227,17 @@ bool PackReader::download_online_tile_to_disk(
 
     std::string tmp_path = cache_path + ".tmp." + std::to_string(
         std::hash<std::thread::id>{}(std::this_thread::get_id()) & 0xFFFFu);
-    const std::string cmd = "curl -sS -f -L --connect-timeout 2 --max-time 4 -A \"OpenSky-VFR/0.3 (+https://github.com/BeamAudio/OpenSky)\" -o " +
-        shell_quote(tmp_path) + " " + shell_quote(url) + " 2>/dev/null";
-    int rc = std::system(cmd.c_str());
-    struct stat st{};
+    const bool dl_ok = http_download_to_file(
+        url, "OpenSky-VFR/0.3 (+https://github.com/BeamAudio/OpenSky)", 2000, 4000, tmp_path);
     int w = 0, h = 0, channels = 0;
-    if (rc == 0 && ::stat(tmp_path.c_str(), &st) == 0 && st.st_size > 512 &&
+    if (dl_ok && file_larger_than(tmp_path, 512) &&
         stbi_info(tmp_path.c_str(), &w, &h, &channels) && w == 256 && h == 256 &&
-        ::rename(tmp_path.c_str(), cache_path.c_str()) == 0) {
+        atomic_replace_file(tmp_path, cache_path)) {
         online_fetched_count_.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
-    ::unlink(tmp_path.c_str());
+    std::error_code rm_ec;
+    std::filesystem::remove(tmp_path, rm_ec);
     return false;
 }
 
@@ -299,8 +285,7 @@ void PackReader::online_dl_worker() const {
         auto prov = OnlineOrthoProvider::PNOA;
         const std::string cpath = (opensky_cache_dir() / "online_tiles" /
             ("pnoa_z" + std::to_string(z) + "_" + std::to_string(x) + "_" + std::to_string(y) + ".jpg")).string();
-        struct stat st{};
-        bool ok = (::stat(cpath.c_str(), &st) == 0 && st.st_size > 512);
+        bool ok = file_larger_than(cpath, 512);
         if (!ok) {
             ok = download_online_tile_to_disk(prov, z, x, y, cpath);
         }
@@ -333,8 +318,7 @@ std::shared_ptr<DecodedRgbTile> PackReader::get_online_rgb_tile(
 
     const std::string cpath = (opensky_cache_dir() / "online_tiles" /
         ("pnoa_z" + std::to_string(z) + "_" + std::to_string(x) + "_" + std::to_string(y) + ".jpg")).string();
-    struct stat st{};
-    if (::stat(cpath.c_str(), &st) != 0 || st.st_size <= 512) {
+    if (!file_larger_than(cpath, 512)) {
         if (!queue_download) return nullptr;
         bool should_notify = false;
         {
@@ -372,14 +356,8 @@ std::shared_ptr<DecodedRgbTile> PackReader::get_online_rgb_tile(
         return nullptr;
     }
 
-    int fd = ::open(cpath.c_str(), O_RDONLY);
-    if (fd < 0) return nullptr;
-    struct stat fst{};
-    if (::fstat(fd, &fst) != 0 || fst.st_size <= 512) { ::close(fd); return nullptr; }
-    std::vector<uint8_t> raw(static_cast<size_t>(fst.st_size));
-    ssize_t got = ::read(fd, raw.data(), raw.size());
-    ::close(fd);
-    if (got != static_cast<ssize_t>(raw.size())) return nullptr;
+    std::vector<uint8_t> raw;
+    if (!read_entire_file_checked(cpath, 512, raw)) return nullptr;
 
     int w = 0, h = 0, ch = 0;
     unsigned char *pix = stbi_load_from_memory(raw.data(), static_cast<int>(raw.size()), &w, &h, &ch, 3);
@@ -422,8 +400,7 @@ void PackReader::prefetch_online_box(double center_lat, double center_lon, doubl
     auto warm = [&](int tx, int ty) {
         const std::string cpath = (opensky_cache_dir() / "online_tiles" /
             ("pnoa_z" + std::to_string(zoom) + "_" + std::to_string(tx) + "_" + std::to_string(ty) + ".jpg")).string();
-        struct stat st{};
-        if (::stat(cpath.c_str(), &st) != 0 || st.st_size <= 512) download_online_tile_to_disk(prov, zoom, tx, ty, cpath);
+        if (!file_larger_than(cpath, 512)) download_online_tile_to_disk(prov, zoom, tx, ty, cpath);
         get_online_rgb_tile(prov, zoom, tx, ty);
     };
     if (nw <= 1) {
@@ -453,24 +430,24 @@ int PackReader::city_shadow_tile_count() const {
 bool PackReader::load_city_shadows(const std::string &nsshd_path, uint32_t region_idx) {
     if (region_idx >= regions_.size()) return false;
     LoadedRegion &reg = regions_[region_idx];
-    if (reg.sh_fd >= 0) { ::close(reg.sh_fd); reg.sh_fd = -1; }
+    close_file(reg.sh_fd);
     reg.sh_idx.clear();
-    int fd = ::open(nsshd_path.c_str(), O_RDONLY);
-    if (fd < 0) return false;
+    FileHandle fd = open_read_only(nsshd_path);
+    if (fd == kInvalidFileHandle) return false;
 #pragma pack(push, 1)
     struct RawShHdr { char magic[4]; uint32_t version; uint32_t res; float chunk_m; uint32_t count; };
     struct RawShIdx { int32_t cx, cy; uint32_t offset, comp_size; };
 #pragma pack(pop)
     RawShHdr hdr{};
-    if (::pread(fd, &hdr, sizeof(hdr), 0) != static_cast<ssize_t>(sizeof(hdr)) ||
+    if (!read_at_offset(fd, &hdr, sizeof(hdr), 0) ||
         std::memcmp(hdr.magic, "NSSH", 4) != 0 || hdr.version != 2 || hdr.res < 16 || hdr.res > 512) {
-        ::close(fd);
+        close_file(fd);
         return false;
     }
     std::vector<RawShIdx> idx(hdr.count);
-    ssize_t idx_bytes = static_cast<ssize_t>(idx.size() * sizeof(RawShIdx));
-    if (idx_bytes > 0 && ::pread(fd, idx.data(), static_cast<size_t>(idx_bytes), sizeof(hdr)) != idx_bytes) {
-        ::close(fd);
+    const size_t idx_bytes = idx.size() * sizeof(RawShIdx);
+    if (idx_bytes > 0 && !read_at_offset(fd, idx.data(), idx_bytes, sizeof(hdr))) {
+        close_file(fd);
         return false;
     }
     reg.sh_res = static_cast<int>(hdr.res);
@@ -487,7 +464,7 @@ const PackReader::LoadedRegion *PackReader::find_sh_region_at_ll(double lat_deg,
     const LoadedRegion *best = nullptr;
     double best_area = 1e18;
     for (const auto &r : regions_) {
-        if (r.sh_fd < 0 || r.sh_idx.empty()) continue;
+        if (r.sh_fd == kInvalidFileHandle || r.sh_idx.empty()) continue;
         if (lon_deg >= r.hdr.lon_min && lon_deg <= r.hdr.lon_max &&
             lat_deg >= r.hdr.lat_min && lat_deg <= r.hdr.lat_max) {
             double area = (r.hdr.lon_max - r.hdr.lon_min) * (r.hdr.lat_max - r.hdr.lat_min);
@@ -498,7 +475,7 @@ const PackReader::LoadedRegion *PackReader::find_sh_region_at_ll(double lat_deg,
 }
 
 std::shared_ptr<std::vector<uint32_t>> PackReader::get_city_sh_tile(const LoadedRegion &reg, int32_t cx, int32_t cy) const {
-    if (reg.sh_fd < 0 || reg.sh_idx.empty()) return nullptr;
+    if (reg.sh_fd == kInvalidFileHandle || reg.sh_idx.empty()) return nullptr;
     int64_t k = pack_cell(cx, cy);
     uint64_t uk = (static_cast<uint64_t>(reg.idx) << 44u) ^ (static_cast<uint64_t>(k) & 0x00000FFFFFFFFFFFULL);
     if (auto hit = city_sh_cache_.get(uk)) return hit;
@@ -506,7 +483,7 @@ std::shared_ptr<std::vector<uint32_t>> PackReader::get_city_sh_tile(const Loaded
     if (it == reg.sh_idx.end()) return nullptr;
     const CityShEntry &e = it->second;
     std::vector<uint8_t> comp(e.comp_size);
-    if (::pread(reg.sh_fd, comp.data(), e.comp_size, static_cast<off_t>(e.offset)) != static_cast<ssize_t>(e.comp_size)) {
+    if (!read_at_offset(reg.sh_fd, comp.data(), e.comp_size, e.offset)) {
         return nullptr;
     }
     size_t n_px = static_cast<size_t>(reg.sh_res) * static_cast<size_t>(reg.sh_res);
@@ -519,25 +496,24 @@ std::shared_ptr<std::vector<uint32_t>> PackReader::get_city_sh_tile(const Loaded
 }
 
 bool PackReader::append_pack_internal(const std::string &nspack_path) {
-    int fd = ::open(nspack_path.c_str(), O_RDONLY);
-    if (fd < 0) {
+    FileHandle fd = open_read_only(nspack_path);
+    if (fd == kInvalidFileHandle) {
         std::fprintf(stderr, "[PACK] Failed to open %s\n", nspack_path.c_str());
         return false;
     }
     nspain::PackHeader hdr{};
-    if (::pread(fd, &hdr, sizeof(hdr), 0) != static_cast<ssize_t>(sizeof(hdr)) ||
+    if (!read_at_offset(fd, &hdr, sizeof(hdr), 0) ||
         std::memcmp(hdr.magic, nspain::PACK_MAGIC, 4) != 0 || hdr.version != nspain::PACK_VERSION) {
         std::fprintf(stderr, "[PACK] Invalid .nspack header in %s\n", nspack_path.c_str());
-        ::close(fd);
+        close_file(fd);
         return false;
     }
 
-    struct stat info{};
-    if (::fstat(fd, &info) != 0 || info.st_size < 0) {
-        ::close(fd);
+    uint64_t file_size = 0;
+    if (!get_file_size(fd, file_size)) {
+        close_file(fd);
         return false;
     }
-    const auto file_size = static_cast<uint64_t>(info.st_size);
     const auto within_file = [file_size](uint64_t offset, uint64_t size) {
         return offset >= sizeof(nspain::PackHeader) && offset <= file_size &&
                size <= file_size - offset;
@@ -551,14 +527,14 @@ bool PackReader::append_pack_internal(const std::string &nspack_path) {
         !(hdr.lat_min >= -90 && hdr.lat_min < hdr.lat_max && hdr.lat_max <= 90 &&
           hdr.lon_min >= -180 && hdr.lon_min < hdr.lon_max && hdr.lon_max <= 180)) {
         std::fprintf(stderr, "[PACK] Invalid bounds, index or manifest in %s\n", nspack_path.c_str());
-        ::close(fd);
+        close_file(fd);
         return false;
     }
 
     std::vector<nspain::PackTileEntry> raw_idx(hdr.index_count);
-    ssize_t idx_bytes = static_cast<ssize_t>(raw_idx.size() * sizeof(nspain::PackTileEntry));
-    if (idx_bytes > 0 && ::pread(fd, raw_idx.data(), static_cast<size_t>(idx_bytes), static_cast<off_t>(hdr.index_offset)) != idx_bytes) {
-        ::close(fd);
+    const size_t idx_bytes = raw_idx.size() * sizeof(nspain::PackTileEntry);
+    if (idx_bytes > 0 && !read_at_offset(fd, raw_idx.data(), idx_bytes, hdr.index_offset)) {
+        close_file(fd);
         return false;
     }
     for (const auto &tile : raw_idx) {
@@ -571,14 +547,14 @@ bool PackReader::append_pack_internal(const std::string &nspack_path) {
             tile.width == 0 || tile.width > max_tile_side || tile.height == 0 || tile.height > max_tile_side ||
             zoom > 23 || x >= (1u << zoom) || y >= (1u << zoom)) {
             std::fprintf(stderr, "[PACK] Invalid tile record in %s\n", nspack_path.c_str());
-            ::close(fd);
+            close_file(fd);
             return false;
         }
     }
     std::string manifest(hdr.manifest_size, '\0');
     if (hdr.manifest_size > 0 &&
-        ::pread(fd, manifest.data(), hdr.manifest_size, static_cast<off_t>(hdr.manifest_offset)) != static_cast<ssize_t>(hdr.manifest_size)) {
-        ::close(fd);
+        !read_at_offset(fd, manifest.data(), hdr.manifest_size, hdr.manifest_offset)) {
+        close_file(fd);
         return false;
     }
 
@@ -1693,13 +1669,12 @@ std::shared_ptr<DecodedElevTile> PackReader::get_elev_tile(int z, int x, int y) 
     const IndexedTile *it = find_entry(key);
     if (!it || it->pack_idx >= regions_.size()) return nullptr;
     const nspain::PackTileEntry *e = &it->entry;
-    int fd = regions_[it->pack_idx].pack_fd;
-    if (fd < 0) return nullptr;
+    FileHandle fd = regions_[it->pack_idx].pack_fd;
+    if (fd == kInvalidFileHandle) return nullptr;
 
     thread_local std::vector<uint8_t> raw;
     raw.resize(e->size);
-    ssize_t got = ::pread(fd, raw.data(), e->size, static_cast<off_t>(e->offset));
-    if (got != static_cast<ssize_t>(e->size)) return nullptr;
+    if (!read_at_offset(fd, raw.data(), e->size, e->offset)) return nullptr;
 
     const size_t count = static_cast<size_t>(e->width) * e->height;
     const size_t expected = sizeof(nspain::HeightTileHeader) + count * sizeof(uint16_t);
@@ -1738,13 +1713,12 @@ std::shared_ptr<DecodedRgbTile> PackReader::get_rgb_tile(uint8_t layer, int z, i
     const IndexedTile *it = find_entry(key);
     if (!it || it->pack_idx >= regions_.size()) return nullptr;
     const nspain::PackTileEntry *e = &it->entry;
-    int fd = regions_[it->pack_idx].pack_fd;
-    if (fd < 0) return nullptr;
+    FileHandle fd = regions_[it->pack_idx].pack_fd;
+    if (fd == kInvalidFileHandle) return nullptr;
 
     thread_local std::vector<uint8_t> raw;
     raw.resize(e->size);
-    ssize_t got = ::pread(fd, raw.data(), e->size, static_cast<off_t>(e->offset));
-    if (got != static_cast<ssize_t>(e->size)) return nullptr;
+    if (!read_at_offset(fd, raw.data(), e->size, e->offset)) return nullptr;
 
     int w = 0, h = 0, ch = 0;
     unsigned char *pix = stbi_load_from_memory(raw.data(), static_cast<int>(raw.size()), &w, &h, &ch, 3);
@@ -2541,8 +2515,13 @@ PackReader::ObjectCollisionHit PackReader::query_object_collision(
     const double r = std::max(0.25, probe_r_m);
     auto consider_obb = [&](double obj_lat, double obj_lon, float ground_m, float height_m,
                             float width_m, float depth_m, float yaw_rad, uint8_t kind) {
+        const double top_m = static_cast<double>(ground_m) + height_m + r;
+        const double bot_m = static_cast<double>(ground_m) - 1.5;
+        if (alt_msl_m >= top_m || alt_msl_m <= bot_m) return;
         const double de = (lon_deg - obj_lon) * wf->metres_lon;
         const double dn = (lat_deg - obj_lat) * wf->metres_lat;
+        const double max_ext = 0.5 * (static_cast<double>(width_m) + static_cast<double>(depth_m)) + r;
+        if (std::abs(de) >= max_ext || std::abs(dn) >= max_ext) return;
         const double dx = de;
         const double dz = -dn;
         const double c = std::cos(yaw_rad), s = std::sin(yaw_rad);
@@ -2550,9 +2529,7 @@ PackReader::ObjectCollisionHit PackReader::query_object_collision(
         const double lz = dx * s + dz * c;
         const double hx = width_m * 0.5 + r;
         const double hz = depth_m * 0.5 + r;
-        const double top_m = static_cast<double>(ground_m) + height_m + r;
-        const double bot_m = static_cast<double>(ground_m) - 1.5;
-        if (std::abs(lx) >= hx || std::abs(lz) >= hz || alt_msl_m >= top_m || alt_msl_m <= bot_m) return;
+        if (std::abs(lx) >= hx || std::abs(lz) >= hz) return;
 
         const double pen_x = hx - std::abs(lx);
         const double pen_z = hz - std::abs(lz);

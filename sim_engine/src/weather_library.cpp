@@ -6,8 +6,6 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
-#include <fcntl.h>
-#include <unistd.h>
 
 namespace nsim {
 
@@ -34,7 +32,7 @@ WeatherLibrary::~WeatherLibrary() {
 }
 
 void WeatherLibrary::shutdown() {
-    if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
+    close_file(fd_);
     cache_.clear();
     lru_.clear();
     valid_ = false;
@@ -42,12 +40,12 @@ void WeatherLibrary::shutdown() {
 
 bool WeatherLibrary::load(const std::string &path) {
     shutdown();
-    fd_ = ::open(path.c_str(), O_RDONLY);
-    if (fd_ < 0) {
+    fd_ = open_read_only(path);
+    if (fd_ == kInvalidFileHandle) {
         std::fprintf(stderr, "[WX] Missing %s — run `python3 builder/bake_weather.py`\n", path.c_str());
         return false;
     }
-    if (::pread(fd_, &hdr_, sizeof(hdr_), 0) != static_cast<ssize_t>(sizeof(hdr_)) ||
+    if (!read_at_offset(fd_, &hdr_, sizeof(hdr_), 0) ||
         std::memcmp(hdr_.magic, nspain::NSWX_MAGIC, 4) != 0 || hdr_.version != nspain::NSWX_VERSION ||
         hdr_.state_count != nspain::NSWX_STATE_COUNT ||
         hdr_.grid_w != nspain::NSWX_GRID_W || hdr_.grid_h != nspain::NSWX_GRID_H ||
@@ -57,8 +55,7 @@ bool WeatherLibrary::load(const std::string &path) {
         return false;
     }
     entries_.resize(hdr_.state_count);
-    if (::pread(fd_, entries_.data(), entries_.size() * sizeof(nspain::NswxStateEntry), sizeof(hdr_)) !=
-        static_cast<ssize_t>(entries_.size() * sizeof(nspain::NswxStateEntry))) {
+    if (!read_at_offset(fd_, entries_.data(), entries_.size() * sizeof(nspain::NswxStateEntry), sizeof(hdr_))) {
         shutdown();
         return false;
     }
@@ -90,8 +87,7 @@ const WeatherLibrary::DecodedState *WeatherLibrary::state(int idx) const {
     const size_t raw_sz = static_cast<size_t>(hdr_.levels) * hdr_.grid_w * hdr_.grid_h * 4;
     std::vector<uint8_t> comp(entries_[idx].comp_size);
     std::vector<uint8_t> raw(raw_sz);
-    if (::pread(fd_, comp.data(), comp.size(), static_cast<off_t>(entries_[idx].offset)) !=
-        static_cast<ssize_t>(comp.size())) return nullptr;
+    if (!read_at_offset(fd_, comp.data(), comp.size(), entries_[idx].offset)) return nullptr;
     if (tinfl_decompress_mem_to_mem(raw.data(), raw_sz, comp.data(), comp.size(),
                                    TINFL_FLAG_PARSE_ZLIB_HEADER) != raw_sz) return nullptr;
 

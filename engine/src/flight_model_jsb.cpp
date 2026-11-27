@@ -108,7 +108,7 @@ bool FlightModel::load(const std::string &aircraft_dir) {
     try {
         if (!exec.LoadModel(SGPath(dir.string()), SGPath((dir / "engine").string()),
                             SGPath(dir.string()), dir.filename().string(), false)) {
-            std::fprintf(stderr, "[JSBSIM] Failed to load aircraft from %s\n", dir.c_str());
+            std::fprintf(stderr, "[JSBSIM] Failed to load aircraft from %s\n", dir.string().c_str());
             return false;
         }
 
@@ -149,8 +149,14 @@ void FlightModel::apply_controls() {
     fcs->SetDrCmd(std::clamp(controls_.rudder + neutral_rudder_, -1.0, 1.0));
     fcs->SetDsCmd(std::clamp(controls_.rudder, -1.0, 1.0));
     fcs->SetPitchTrimCmd(-std::clamp(controls_.elevator_trim, -1.0, 1.0));
-    fcs->SetThrottleCmd(0, std::clamp(controls_.throttle, 0.0, 1.0) *
-                           std::clamp(engine_.power_multiplier, 0.0, 1.0));
+    // Mechanical idle stop keeps a running IO-360 idling smoothly when throttle is closed
+    // (shutdown requires mixture idle-cutoff, magnetos OFF, or fuel starvation).
+    constexpr double kIdleThrottleStop = 0.032;
+    const double raw_throttle = std::clamp(controls_.throttle, 0.0, 1.0);
+    const double eff_throttle = impl_->engine_permitted
+        ? (kIdleThrottleStop + (1.0 - kIdleThrottleStop) * raw_throttle)
+        : raw_throttle;
+    fcs->SetThrottleCmd(0, eff_throttle * std::clamp(engine_.power_multiplier, 0.0, 1.0));
     fcs->SetMixtureCmd(0, std::clamp(controls_.mixture, 0.0, 1.0));
     fcs->SetDfCmd(std::clamp(controls_.flaps, 0.0, 1.0));
     fcs->SetLBrake(std::clamp(controls_.brake_left, 0.0, 1.0));
@@ -231,7 +237,11 @@ bool FlightModel::initialize(double lat_deg, double lon_deg, double altitude_m, 
             JSBSim::FGTrim trim(&exec, JSBSim::tFull);
             if (trim.DoTrim()) {
                 const auto fcs = exec.GetFCS();
-                controls_.throttle = fcs->GetThrottleCmd(0);
+                constexpr double kIdleThrottleStop = 0.032;
+                const double trimmed_cmd = fcs->GetThrottleCmd(0);
+                controls_.throttle = impl_->engine_permitted
+                    ? std::clamp((trimmed_cmd - kIdleThrottleStop) / (1.0 - kIdleThrottleStop), 0.0, 1.0)
+                    : std::clamp(trimmed_cmd, 0.0, 1.0);
                 controls_.elevator_trim = -fcs->GetPitchTrimCmd();
                 controls_.elevator = -fcs->GetDeCmd();
                 neutral_aileron_ = fcs->GetDaCmd();

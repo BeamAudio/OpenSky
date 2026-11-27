@@ -220,7 +220,6 @@ public:
         return last > 0 ? std::max<int64_t>(0, static_cast<int64_t>(std::time(nullptr)) - last) : -1;
     }
     void set_solver_seed(uint32_t seed, bool synchronous = false) { solver_seed_ = seed; synchronous_solver_ = synchronous; }
-    void set_thermal_sleep_ms(int ms) { thermal_sleep_ms_.store(std::clamp(ms, 0, 120), std::memory_order_relaxed); }
     void request_outlook();
     void cancel_outlook();
     WeatherOutlook outlook() const;
@@ -415,7 +414,6 @@ private:
     mutable std::mutex weather_job_mtx_;
     std::condition_variable weather_job_cv_;
     std::atomic<bool> weather_worker_stop_{false};
-    std::atomic<int> thermal_sleep_ms_{0};
     int weather_pending_steps_ = 0;
     bool weather_pending_climate_ = false;
     std::vector<float> weather_pending_climate_field_;

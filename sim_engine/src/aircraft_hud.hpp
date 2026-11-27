@@ -86,6 +86,24 @@ struct FlightSimState {
     Vec3 free_cam_off_m{0.0f, 3.0f, 12.0f};
     double visual_rpm_override = -1.0;
     double visual_flaps_deg = 0.0;
+    // Live GNS 430 / Cockpit Glass Avionics State
+    struct GpsWaypoint {
+        double lat = 0.0;
+        double lon = 0.0;
+        std::string label;
+    };
+    std::vector<GpsWaypoint> gps_route;
+    size_t gps_active_leg = 0;
+    bool gps_direct_active = false;
+    double gps_direct_lat = 0.0;
+    double gps_direct_lon = 0.0;
+    std::string gps_direct_label;
+    int gps_page = 0;         // 0=MAP, 1=TERR (TAWS), 2=NRST, 3=NAV (HSI)
+    int gps_range_idx = 1;    // 0=5NM, 1=10NM, 2=20NM, 3=40NM
+    bool gps_north_up = false;
+    int gps_nrst_cursor = 0;
+    uint8_t audio_sel_mask = 0x25; // bit0=COM1, 1=COM2, 2=NAV1, 3=MKR, 4=SPKR, 5=ICS
+    double hobbs_hours = 1482.6;
 };
 
 struct FlightAssistOut {
@@ -179,7 +197,8 @@ private:
     void apply_autopilot(const nspain::FlightState &fs, double dt, double &roll_cmd, double &pitch_cmd,
                          double &ap_ail_out, double &ap_elv_out, double &ap_rud_out);
     void init_avionics_display_texture();
-    void update_avionics_display_texture(float sim_time_sec);
+    void update_avionics_display_texture(float sim_time_sec, const AtmosphereState &atmo);
+    void update_davtron_and_steam_textures(float sim_time_sec, const AtmosphereState &atmo);
     void advance_aircraft(double dt, const AtmosphereState &atmo, const RegionalAtmosphere &reg_atmo,
                           double sim_time_sec, double rudder, double brake_left, double brake_right);
     void resolve_world_collisions(double dt);
@@ -311,11 +330,25 @@ private:
     std::vector<uint8_t> avionics_work_rgba_;
     std::string avionics_last_key_;
     float avionics_last_upd_s_ = -1.0f;
+    GLuint panel_face_tex_ = 0;
+    int panel_face_w_ = 0, panel_face_h_ = 0;
+    std::vector<uint8_t> davtron_base_rgba_;
+    std::vector<uint8_t> davtron_work_rgba_;
+    std::string davtron_last_key_;
+    float davtron_last_upd_s_ = -1.0f;
+    GLuint steam_dials_tex_ = 0;
+    int steam_dials_w_ = 0, steam_dials_h_ = 0;
+    std::vector<uint8_t> steam_base_rgba_;
+    std::vector<uint8_t> steam_cell_rgba_;
+    std::string steam_vor_key_, steam_eng_key_, steam_kol_key_, steam_tc_key_, steam_hobbs_key_;
+    float steam_last_upd_s_ = -1.0f;
+    int xpdr_edit_pos_ = 0;
     Mat4 last_ckpt_vp_{};
     Mat4 last_ckpt_root_{};
     std::vector<Mat4> last_ckpt_world_m_;
     bool last_ckpt_valid_ = false;
     bool mouse_starter_cranking_ = false;
+    bool cockpit_hotspot_hovered_ = false;
     int vor_cycle_idx_ = 0;
 };
 

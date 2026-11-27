@@ -4,6 +4,7 @@
 #include "aircraft_session.hpp"
 #include "async_streamer.hpp"
 #include "flight_replay.hpp"
+#include "platform_io.hpp"
 #include "simulation_clock.hpp"
 
 #include <chrono>
@@ -26,8 +27,7 @@ const Vec3 check_sun = normalize(Vec3(0.7f, 0.65f, 0.2f));
 struct TemporaryProfile {
     std::filesystem::path directory;
     TemporaryProfile() {
-        auto pattern = (std::filesystem::temp_directory_path() / "opensky-runtime-XXXXXX").string();
-        if (::mkdtemp(pattern.data())) directory = pattern;
+        directory = create_unique_temp_dir("opensky-runtime-XXXXXX");
     }
     ~TemporaryProfile() {
         std::error_code ec;

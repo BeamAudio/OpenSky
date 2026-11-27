@@ -515,7 +515,7 @@ void SkyAndClouds::render_clouds_and_post(
         camera_forward.z * prev_camera_forward_.z,
         -1.0f, 1.0f);
     const float camera_turn_rad = prev_camera_valid_ ? std::acos(forward_dot) : 0.0f;
-    const int sparse_period = (cloud_quality_ == 0 || thermal_sparse_clouds_) ? 2 : 1;
+    const int sparse_period = (cloud_quality_ == 0) ? 2 : 1;
     const float temporal_blend = (!history_valid_ || camera_step_m > 40.0)
         ? 0.0f
         : std::clamp(0.68f - static_cast<float>(camera_step_m) * 0.008f - camera_turn_rad * 2.5f, 0.35f, 0.68f);

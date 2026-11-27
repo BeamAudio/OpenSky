@@ -92,7 +92,6 @@ public:
     void refine_online_pages(double now_sec);
     // Drop queued pages left behind after a QA teleport; resident pages remain available.
     void clear_pending_requests();
-    void set_thermal_sleep_ms(int ms) { thermal_sleep_ms_.store(std::clamp(ms, 0, 140), std::memory_order_relaxed); }
     // Clear all resident pages and prewarm coarse root pages cleanly when jumping across regions!
     void invalidate_all_and_prewarm(const Vec3 &sun_dir);
     void begin_async_transition(std::shared_ptr<const PackReader::WorldFrame> next_frame,
@@ -225,7 +224,6 @@ private:
 
     std::atomic<bool> stop_{false};
     std::atomic<bool> sync_flushing_{false};
-    std::atomic<int> thermal_sleep_ms_{0};
     std::vector<std::thread> workers_;
 
     int uploads_this_frame_ = 0;

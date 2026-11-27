@@ -1,6 +1,7 @@
 #include "flight_replay.hpp"
 
 #include "flight_model_jsb.hpp"
+#include "platform_io.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -69,8 +70,7 @@ void add_default_route(FlightReplayTrace &trace, const AirportInfo &lesu) {
 } // namespace
 
 ScopedTempDir::ScopedTempDir(const char *prefix) {
-    auto pattern = (std::filesystem::temp_directory_path() / prefix).string();
-    if (::mkdtemp(pattern.data())) dir = pattern;
+    dir = create_unique_temp_dir(prefix);
 }
 
 ScopedTempDir::~ScopedTempDir() {
@@ -219,7 +219,7 @@ bool verify_replay_persistence(
 
     FleetProfile raw_check;
     if (read_fleet_profile(profile_path, raw_check) != ProfileLoad::Loaded) {
-        std::fprintf(stderr, "[REPLAY] Saved profile unreadable at %s\n", profile_path.c_str());
+        std::fprintf(stderr, "[REPLAY] Saved profile unreadable at %s\n", profile_path.string().c_str());
         return false;
     }
 
@@ -552,18 +552,18 @@ bool record_castejon_catalonia_flight(PackReader &pack, const std::filesystem::p
     if (!verify_replay_persistence(pack, session, aircraft, profile_path, trace, start_fuel, crossed_region))
         return false;
     if (!save_flight_replay(trace_path, trace)) {
-        std::fprintf(stderr, "[RECORD] Could not save trace to %s\n", trace_path.c_str());
+        std::fprintf(stderr, "[RECORD] Could not save trace to %s\n", trace_path.string().c_str());
         return false;
     }
     std::printf("[RECORD-FLIGHT OK] Saved %zu steps (%.1f sim min) -> %s\n",
-                trace.steps.size(), sim_time / 60.0, trace_path.c_str());
+                trace.steps.size(), sim_time / 60.0, trace_path.string().c_str());
     return true;
 }
 
 bool replay_flight_headless(PackReader &pack, const std::filesystem::path &trace_path) {
     FlightReplayTrace trace;
     if (!load_flight_replay(trace_path, trace)) {
-        std::fprintf(stderr, "[REPLAY] Failed to load %s\n", trace_path.c_str());
+        std::fprintf(stderr, "[REPLAY] Failed to load %s\n", trace_path.string().c_str());
         return false;
     }
     const AirportInfo *dep = pack.find_airport(trace.start_airport);

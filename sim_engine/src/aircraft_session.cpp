@@ -68,14 +68,14 @@ void AircraftSession::init(const PackReader &pack, std::filesystem::path profile
     }
     if (preserve_invalid_profile_) {
         profile_error_ = "Aircraft save could not be read. The original file has been kept.";
-        std::fprintf(stderr, "[FLEET] Invalid or unreadable profile: %s\n", profile_file_.c_str());
+        std::fprintf(stderr, "[FLEET] Invalid or unreadable profile: %s\n", profile_file_.string().c_str());
     }
 }
 
 void AircraftSession::save_profile() const {
     if (profile_file_.empty() || preserve_invalid_profile_) return;
     if (!write_fleet_profile(profile_file_, profile_, profile_error_))
-        std::fprintf(stderr, "[FLEET] %s (%s)\n", profile_error_.c_str(), profile_file_.c_str());
+        std::fprintf(stderr, "[FLEET] %s (%s)\n", profile_error_.c_str(), profile_file_.string().c_str());
 }
 
 bool AircraftSession::full_service(const std::string &id) {
@@ -325,13 +325,37 @@ void AircraftSession::step_flight(AircraftAndHud &aircraft, double dt) {
     prev_lat_ = flight.lat_deg;
     prev_lon_ = flight.lon_deg;
 
-    // Feed live VFR route waypoint bearing directly into the cockpit Autopilot NAV bus!
-    if (active_leg_ < profile_.route_.size()) {
+    // Feed live VFR route & GNS 430 Direct-To into cockpit glass avionics and Autopilot NAV bus!
+    auto &st = aircraft.state();
+    st.hobbs_hours = 1482.6 + profile_.hours_;
+    st.gps_active_leg = active_leg_;
+    bool route_changed = (st.gps_route.size() != profile_.route_.size());
+    if (!route_changed) {
+        for (size_t i = 0; i < profile_.route_.size(); ++i) {
+            if (st.gps_route[i].lat != profile_.route_[i].lat ||
+                st.gps_route[i].lon != profile_.route_[i].lon ||
+                st.gps_route[i].label != profile_.route_[i].label) {
+                route_changed = true;
+                break;
+            }
+        }
+    }
+    if (route_changed) {
+        st.gps_route.clear();
+        st.gps_route.reserve(profile_.route_.size());
+        for (const auto &wp : profile_.route_) {
+            st.gps_route.push_back({wp.lat, wp.lon, wp.label});
+        }
+    }
+    if (st.gps_direct_active) {
+        st.ap_nav_brg_deg = bearing(flight.lat_deg, flight.lon_deg, st.gps_direct_lat, st.gps_direct_lon);
+        st.ap_nav_valid = true;
+    } else if (active_leg_ < profile_.route_.size()) {
         const auto &wp = profile_.route_[active_leg_];
-        aircraft.state().ap_nav_brg_deg = bearing(flight.lat_deg, flight.lon_deg, wp.lat, wp.lon);
-        aircraft.state().ap_nav_valid = true;
+        st.ap_nav_brg_deg = bearing(flight.lat_deg, flight.lon_deg, wp.lat, wp.lon);
+        st.ap_nav_valid = true;
     } else {
-        aircraft.state().ap_nav_valid = false;
+        st.ap_nav_valid = false;
     }
 
     // Surface-aware wear during ground roll (gravel/rough grass wear tires & nick prop at high RPM)

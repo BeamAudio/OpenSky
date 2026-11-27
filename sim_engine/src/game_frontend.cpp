@@ -372,7 +372,7 @@ void GameFrontend::step_walk(const PlatformWindow &win, double dt) {
 
 void GameFrontend::board(AircraftAndHud &aircraft, double ambient_temp_c) {
     walking_ = inspecting_ = false;
-    kneeboard_open_ = !session_.profile().care_.engine_running;
+    kneeboard_open_ = false;
     session_.board(aircraft, ambient_temp_c);
 }
 
@@ -1499,7 +1499,11 @@ void GameFrontend::draw_settings(AircraftAndHud &ui, int &time_of_day, RegionalA
                       (yk.has_throttle ? yk.throttle : ui.state().throttle) * 100.0);
         label(ui, 1180, 966, 16, yk_line, true);
     } else {
+#ifdef _WIN32
+        label(ui, 91, 965, 18, "Flight Yoke & Pedals: No USB controller detected (plug & play via Windows DirectInput)");
+#else
         label(ui, 91, 965, 18, "Flight Yoke & Pedals: No USB controller detected (plug & play via Linux evdev)");
+#endif
         label(ui, 1180, 966, 16, "Connect a yoke, stick, throttle quadrant, or rudder pedals.", true);
     }
     if (button(ui, {91, 996, 228, 36}, s.yoke_direct ? "Mode: Direct Yoke" : "Mode: Flight Assist", true, s.yoke_direct)) {
@@ -1617,8 +1621,13 @@ void GameFrontend::draw_controls(AircraftAndHud &ui) {
         label(ui, 90, 1007, 16, yk_msg);
         if (button(ui, {1628, 998, 202, 36}, "Center Yoke")) ui.calibrate_yoke();
     } else {
+#ifdef _WIN32
+        label(ui, 90, 1007, 16,
+              "USB Yoke / Rudder Pedals / Throttle: Plug & Play via Windows DirectInput  (Settings -> Deadzone, Curve, Direct Mode, Calibration)", true);
+#else
         label(ui, 90, 1007, 16,
               "USB Yoke / Rudder Pedals / Throttle: Plug & Play via Linux evdev  (Settings -> Deadzone, Curve, Direct Mode, Calibration)", true);
+#endif
         if (button(ui, {1628, 998, 202, 36}, "Yoke Settings")) page_ = Page::Settings;
     }
 }
@@ -1995,7 +2004,7 @@ void GameFrontend::draw_navigation(AircraftAndHud &ui, const PlatformWindow &win
     const bool show_yoke = ui.state().mouse_yoke_enabled && ui.state().view_mode != 2;
     const bool on_gnd = ui.jsb_state().on_ground;
     panel(ui, {28, 28, 768, ui.state().runway_tracking || show_yoke ? 128 : 96});
-    label(ui, 48, 44, 17, "Tab: Systems  K: Quick Start/Stop  T: Tutorial  C: View  Esc: Menu", true);
+    label(ui, 48, 44, 17, "Click 3D cockpit switches  |  K: Quick Start/Stop  |  T: Controls  |  C: View  |  Esc: Menu", true);
     label(ui, 48, 76, 17, on_gnd
         ? (show_yoke
             ? "TAXI ASSIST ON | Trackpad/A-D: steer  W/S: gas/brake  Click/R: straight  Y: yoke"
@@ -2082,306 +2091,13 @@ void GameFrontend::draw_navigation(AircraftAndHud &ui, const PlatformWindow &win
         label(ui, 584, 880, 16, "Taxi clear of the runway, shut down (K), then Esc -> Park to log this flight.", true);
     }
 
-    // Clickable Study-Level In-Flight Systems, Avionics & Circuit Breaker Kneeboard (Tab)
-    if (kneeboard_open_) {
-        const int kx = 28, ky = caution.empty() ? 174 : 238;
-        panel(ui, {kx, ky, 636, 656});
-        label(ui, kx + 22, ky + 16, 22, "Cockpit Systems & Avionics");
-        if (button(ui, {kx + 502, ky + 10, 112, 32}, "Hide (Tab)")) kneeboard_open_ = false;
-
-        if (button(ui, {kx + 22, ky + 48, 190, 32}, "Engine & Lights", true, kneeboard_tab_ == 0)) kneeboard_tab_ = 0;
-        if (button(ui, {kx + 222, ky + 48, 190, 32}, "Avionics & AP", true, kneeboard_tab_ == 1)) kneeboard_tab_ = 1;
-        if (button(ui, {kx + 422, ky + 48, 192, 32}, "Breakers (12)", true, kneeboard_tab_ == 2)) kneeboard_tab_ = 2;
-
-        const auto &fs = ui.jsb_state();
-        auto &st = ui.state();
-        if (kneeboard_tab_ == 0) {
-            std::snprintf(line, sizeof(line), "RPM %4.0f | Oil %.1fqt %.0fF %.0fpsi | CHT %.0fF | Vac %.1f inHg",
-                          fs.rpm, sys.get_oil_quarts(), sys.get_oil_temp_f(), sys.get_oil_press_psi(),
-                          sys.get_cht_f(), sys.get_vacuum_inhg());
-            label(ui, kx + 22, ky + 92, 15, line);
-            std::snprintf(line, sizeof(line), "Bus %.1fV (%+.0fA, Bat %.0f%%) | Mix %.0f%% | CarbIce %.0f%% | Plugs %.0f%%",
-                          sys.get_bus_volts(), sys.get_ammeter_amps(), sys.get_battery_soc() * 100.0,
-                          st.mixture * 100.0, sys.get_carb_ice_level() * 100.0, (1.0 - sys.get_spark_fouling()) * 100.0);
-            label(ui, kx + 22, ky + 116, 14, line, true);
-            std::snprintf(line, sizeof(line), "Fuel: L %.1f / R %.1f gal (%.1f gph) | Baro %.0f hPa (Ind %.0f ft)",
-                          sys.get_left_tank_gal(), sys.get_right_tank_gal(),
-                          sys.get_fuel_flow_gph(), sys.get_baro_hpa(), st.ind_alt_ft);
-            label(ui, kx + 22, ky + 140, 14, line, true);
-
-            if (button(ui, {kx + 22, ky + 168, 190, 34},
-                       sys.get_master_battery() ? "[1] Master: ON" : "[1] Master: OFF", true, sys.get_master_battery())) {
-                const bool next = !sys.get_master_battery();
-                sys.set_master_battery(next);
-                sys.set_master_alternator(next);
-                sys.set_light_switch(0, next);
-            }
-            if (button(ui, {kx + 222, ky + 168, 190, 34},
-                       sys.get_avionics_master() ? "[2] Avionics: ON" : "[2] Avionics: OFF", true, sys.get_avionics_master())) {
-                sys.set_avionics_master(!sys.get_avionics_master());
-            }
-            static constexpr const char *kMagNames[5] = {"OFF", "R", "L", "BOTH", "START"};
-            std::snprintf(line, sizeof(line), "[3] Mags: %s", kMagNames[std::clamp(sys.get_magnetos(), 0, 4)]);
-            if (button(ui, {kx + 422, ky + 168, 192, 34}, line, true, sys.get_magnetos() == 3)) {
-                sys.set_magnetos((sys.get_magnetos() + 1) % 4);
-            }
-
-            if (button(ui, {kx + 22, ky + 208, 140, 34}, "[5] Mix -10%", st.mixture > 0.01)) {
-                st.mixture = std::max(0.0, st.mixture - 0.10);
-            }
-            if (button(ui, {kx + 168, ky + 208, 140, 34}, "[6] Mix +10%", st.mixture < 0.99)) {
-                st.mixture = std::min(1.0, st.mixture + 0.10);
-            }
-            static constexpr const char *kFuelNames[4] = {"OFF", "LEFT", "BOTH", "RIGHT"};
-            std::snprintf(line, sizeof(line), "Fuel: %s", kFuelNames[std::clamp(sys.get_fuel_selector(), 0, 3)]);
-            if (button(ui, {kx + 314, ky + 208, 146, 34}, line, true, sys.get_fuel_selector() == 2)) {
-                sys.cycle_fuel_selector();
-            }
-            if (button(ui, {kx + 466, ky + 208, 148, 34},
-                       sys.get_fuel_shutoff_pulled() ? "Valve: SHUTOFF" : "Valve: OPEN", true, sys.get_fuel_shutoff_pulled())) {
-                sys.set_fuel_shutoff_pulled(!sys.get_fuel_shutoff_pulled());
-            }
-
-            if (button(ui, {kx + 22, ky + 248, 140, 34},
-                       sys.get_carb_heat() > 0.5 ? "[7] CarbHt ON" : "[7] CarbHt", true, sys.get_carb_heat() > 0.5)) {
-                sys.set_carb_heat(sys.get_carb_heat() > 0.5 ? 0.0 : 1.0);
-            }
-            if (!sys.is_engine_running()) {
-                std::snprintf(line, sizeof(line), "[8] Prime (%d)", sys.get_primer_strokes());
-                if (button(ui, {kx + 168, ky + 248, 140, 34}, line, true, sys.get_primer_strokes() >= 2))
-                    sys.actuate_primer();
-            } else {
-                if (button(ui, {kx + 168, ky + 248, 140, 34},
-                           sys.get_pitot_heat_switch() ? "[8] PitotHt ON" : "[8] PitotHt", true, sys.get_pitot_heat_switch()))
-                    sys.set_pitot_heat_switch(!sys.get_pitot_heat_switch());
-            }
-            if (button(ui, {kx + 314, ky + 248, 146, 34},
-                       sys.get_fuel_pump_switch() ? "Aux Pump ON" : "Aux Pump", true, sys.is_fuel_pump_active())) {
-                sys.set_fuel_pump_switch(!sys.get_fuel_pump_switch());
-            }
-            if (button(ui, {kx + 466, ky + 248, 148, 34},
-                       sys.is_starter_cranking() ? "Cranking..." : "[4] Hold Start",
-                       !sys.is_engine_running() && sys.get_master_battery(), sys.is_starter_cranking())) {
-                sys.set_magnetos(4);
-            }
-
-            static constexpr const char *kLightLbls[5] = {"BCN", "LDG", "NAV", "STRB", "INST"};
-            for (int li = 0; li < 5; ++li) {
-                std::snprintf(line, sizeof(line), "%s %s", kLightLbls[li], sys.get_light_switch(li) ? "ON" : "OFF");
-                if (button(ui, {kx + 22 + li * 119, ky + 288, 113, 32}, line, true, sys.is_light_powered(li))) {
-                    sys.set_light_switch(li, !sys.get_light_switch(li));
-                }
-            }
-
-            if (button(ui, {kx + 22, ky + 328, 592, 36},
-                       sys.is_engine_running() ? "[K] Clean Shutdown (idle-cutoff, mags & master OFF)"
-                                               : "[K] Quick Start Engine (helper)",
-                       true, !sys.is_engine_running())) {
-                ui.quick_start_or_shutdown();
-            }
-
-            ui.hud_rect(kx + 22, ky + 374, 592, 1, .21f, .32f, .39f, .85f);
-            if (!sys.is_engine_running()) {
-                label(ui, kx + 22, ky + 388, 17, "Cold-and-Dark Start Checklist:");
-                std::snprintf(line, sizeof(line), "[%c] 1. Exterior chocks & pitot cover removed", !ui.is_chocked_or_tied() && !sys.is_pitot_cover_on() ? 'x' : ' ');
-                label(ui, kx + 22, ky + 420, 15, line, !ui.is_chocked_or_tied() && !sys.is_pitot_cover_on());
-                std::snprintf(line, sizeof(line), "[%c] 2. Fuel BOTH & Open, Master ON (1), BCN ON", sys.get_fuel_selector() == 2 && !sys.get_fuel_shutoff_pulled() && sys.get_master_battery() ? 'x' : ' ');
-                label(ui, kx + 22, ky + 448, 15, line, sys.get_fuel_selector() == 2 && sys.get_master_battery());
-                std::snprintf(line, sizeof(line), "[%c] 3. Mixture Rich (6), Prime 2x if cold (8)", st.mixture >= 0.8 ? 'x' : ' ');
-                label(ui, kx + 22, ky + 476, 15, line, st.mixture >= 0.8);
-                label(ui, kx + 22, ky + 504, 15, "[ ] 4. Hold Start (4) until oil pressure rises (or press K)", false);
-                label(ui, kx + 22, ky + 540, 14, "After start: switch Avionics ON (2), check oil >110 F before takeoff.", true);
-            } else if (fs.on_ground) {
-                label(ui, kx + 22, ky + 388, 17, "Run-Up & Before-Takeoff Checklist:");
-                std::snprintf(line, sizeof(line), "[%c] 1. Oil temp >110 F & pressure green (%.0f F / %.0f psi)",
-                              sys.get_oil_temp_f() >= 110.0 && sys.get_oil_press_psi() >= 40.0 ? 'x' : ' ',
-                              sys.get_oil_temp_f(), sys.get_oil_press_psi());
-                label(ui, kx + 22, ky + 420, 15, line, sys.get_oil_temp_f() >= 110.0);
-                std::snprintf(line, sizeof(line), "[%c] 2. Magnetos BOTH & L/R drop check at 1700 RPM (key 3)", sys.get_magnetos() == 3 ? 'x' : ' ');
-                label(ui, kx + 22, ky + 448, 15, line, sys.get_magnetos() == 3);
-                std::snprintf(line, sizeof(line), "[%c] 3. Carb Heat OFF (7) & Avionics ON (2) & Vacuum %.1f\"",
-                              sys.get_carb_heat() < 0.1 && sys.get_avionics_master() ? 'x' : ' ', sys.get_vacuum_inhg());
-                label(ui, kx + 22, ky + 476, 15, line, sys.get_carb_heat() < 0.1 && sys.get_avionics_master());
-                std::snprintf(line, sizeof(line), "[%c] 4. Set Kollsman Baro, XPDR ALT, Brake off (X), rotate 55 kt",
-                              !st.parking_brake ? 'x' : ' ');
-                label(ui, kx + 22, ky + 504, 15, line, !st.parking_brake);
-                label(ui, kx + 22, ky + 540, 14, "After landing: clear runway, press K to shut down, then Esc -> Park.", true);
-            } else {
-                label(ui, kx + 22, ky + 388, 17, "Cruise & Avionics Management:");
-                label(ui, kx + 22, ky + 420, 15, "- Tune VOR1 (e.g. 114.50 HUE, 115.90 BLB, 116.40 STG) in Avionics tab.", true);
-                label(ui, kx + 22, ky + 448, 15, "- Engage 2-Axis AP (HDG/NAV GPS|VOR1 + VS/ALT ARM) for enroute legs.", true);
-                label(ui, kx + 22, ky + 476, 15, "- Lean mixture (5) above 1,500 m MSL; Carb Heat (7) before descents.", true);
-                label(ui, kx + 22, ky + 504, 15, "- Pull Pitot Heat (8) in icing/rain; monitor Vacuum & Bus Volts.", true);
-                label(ui, kx + 22, ky + 540, 14, "After landing: clear runway, shut down (K), then Esc -> Park.", true);
-            }
-        } else if (kneeboard_tab_ == 1) {
-            const bool av1 = sys.is_avionics_bus_powered(1);
-            const bool av2 = sys.is_avionics_bus_powered(2);
-            // COM 1 & NAV 1 (Bus 1)
-            std::snprintf(line, sizeof(line), "COM 1: ACT %.2f  |  STBY %.2f   %s",
-                          sys.get_com_active(1), sys.get_com_standby(1), av1 ? "" : "[BUS1 OFF]");
-            label(ui, kx + 22, ky + 94, 16, line, !av1);
-            if (button(ui, {kx + 22, ky + 120, 86, 32}, "SWAP", av1)) sys.swap_com(1);
-            if (button(ui, {kx + 114, ky + 120, 74, 32}, "-1M", av1)) sys.step_com_standby(1, -1.0);
-            if (button(ui, {kx + 194, ky + 120, 74, 32}, "-25k", av1)) sys.step_com_standby(1, -0.025);
-            if (button(ui, {kx + 274, ky + 120, 74, 32}, "+25k", av1)) sys.step_com_standby(1, 0.025);
-            if (button(ui, {kx + 354, ky + 120, 74, 32}, "+1M", av1)) sys.step_com_standby(1, 1.0);
-
-            const char *tf_s = sys.get_nav_to_from(1) > 0 ? "TO" : (sys.get_nav_to_from(1) < 0 ? "FR" : "--");
-            std::snprintf(line, sizeof(line), "NAV 1: %.2f / %.2f | %s %s %.1fNM CDI%+.2f",
-                          sys.get_nav_active(1), sys.get_nav_standby(1), sys.get_nav_ident(1).c_str(),
-                          tf_s, sys.get_nav_dme_nm(1), sys.get_nav_cdi(1));
-            label(ui, kx + 22, ky + 162, 15, line, !av1);
-            if (button(ui, {kx + 22, ky + 188, 86, 32}, "SWAP", av1)) sys.swap_nav(1);
-            if (button(ui, {kx + 114, ky + 188, 74, 32}, "-1M", av1)) sys.step_nav_standby(1, -1.0);
-            if (button(ui, {kx + 194, ky + 188, 74, 32}, "-50k", av1)) sys.step_nav_standby(1, -0.05);
-            if (button(ui, {kx + 274, ky + 188, 74, 32}, "+50k", av1)) sys.step_nav_standby(1, 0.05);
-            if (button(ui, {kx + 354, ky + 188, 74, 32}, "+1M", av1)) sys.step_nav_standby(1, 1.0);
-            std::snprintf(line, sizeof(line), "OBS %03d", sys.get_nav_obs_deg(1));
-            label(ui, kx + 440, ky + 195, 15, line);
-            if (button(ui, {kx + 516, ky + 188, 46, 32}, "-10", av1)) sys.set_nav_obs_deg(1, sys.get_nav_obs_deg(1) - 10);
-            if (button(ui, {kx + 566, ky + 188, 46, 32}, "+10", av1)) sys.set_nav_obs_deg(1, sys.get_nav_obs_deg(1) + 10);
-
-            // COM 2 & NAV 2 (Bus 2)
-            std::snprintf(line, sizeof(line), "COM2 %.2f/%.2f | NAV2 %.2f/%.2f (%s)",
-                          sys.get_com_active(2), sys.get_com_standby(2),
-                          sys.get_nav_active(2), sys.get_nav_standby(2),
-                          av2 ? sys.get_nav_ident(2).c_str() : "OFF");
-            label(ui, kx + 22, ky + 232, 15, line, !av2);
-            if (button(ui, {kx + 22, ky + 258, 96, 30}, "SWAP C2", av2)) sys.swap_com(2);
-            if (button(ui, {kx + 124, ky + 258, 72, 30}, "C2-.05", av2)) sys.step_com_standby(2, -0.05);
-            if (button(ui, {kx + 202, ky + 258, 72, 30}, "C2+.05", av2)) sys.step_com_standby(2, 0.05);
-            if (button(ui, {kx + 292, ky + 258, 96, 30}, "SWAP N2", av2)) sys.swap_nav(2);
-            if (button(ui, {kx + 394, ky + 258, 72, 30}, "N2-.05", av2)) sys.step_nav_standby(2, -0.05);
-            if (button(ui, {kx + 472, ky + 258, 72, 30}, "N2+.05", av2)) sys.step_nav_standby(2, 0.05);
-
-            // Kollsman Baro & Transponder
-            ui.hud_rect(kx + 22, ky + 298, 592, 1, .21f, .32f, .39f, .85f);
-            std::snprintf(line, sizeof(line), "Altimeter Baro: %.1f hPa (Ind %.0f ft) | QNH %.1f hPa",
-                          sys.get_baro_hpa(), st.ind_alt_ft, ui.last_air().qnh_hpa);
-            label(ui, kx + 22, ky + 308, 15, line);
-            if (button(ui, {kx + 22, ky + 334, 88, 30}, "Baro -1")) sys.set_baro_hpa(sys.get_baro_hpa() - 1.0);
-            if (button(ui, {kx + 116, ky + 334, 108, 30}, "STD 1013")) sys.set_baro_hpa(1013.25);
-            if (button(ui, {kx + 230, ky + 334, 88, 30}, "Baro +1")) sys.set_baro_hpa(sys.get_baro_hpa() + 1.0);
-            if (button(ui, {kx + 328, ky + 334, 138, 30}, "Match QNH")) sys.set_baro_hpa(ui.last_air().qnh_hpa);
-
-            static constexpr const char *kXpdrTxt[4] = {"OFF", "STBY", "ON", "ALT"};
-            std::snprintf(line, sizeof(line), "XPDR: %s  Code %04d  %s",
-                          kXpdrTxt[std::clamp(sys.get_xpdr_mode(), 0, 3)], sys.get_xpdr_squawk(),
-                          sys.is_xpdr_ident_active() ? "[IDENT]" : "");
-            label(ui, kx + 22, ky + 374, 15, line, !av1);
-            if (button(ui, {kx + 22, ky + 400, 94, 32}, "Mode", av1)) sys.cycle_xpdr_mode();
-            if (button(ui, {kx + 122, ky + 400, 82, 32}, "7000", av1)) sys.set_xpdr_vfr_7000();
-            const int sq = sys.get_xpdr_squawk();
-            auto step_oct = [&](int mul) {
-                const int d = ((sq / mul) % 10 + 1) % 8;
-                const int prev = ((sq / mul) % 10);
-                sys.set_xpdr_squawk(sq + (d - prev) * mul);
-            };
-            if (button(ui, {kx + 210, ky + 400, 72, 32}, "D1+", av1)) step_oct(1000);
-            if (button(ui, {kx + 288, ky + 400, 72, 32}, "D2+", av1)) step_oct(100);
-            if (button(ui, {kx + 366, ky + 400, 72, 32}, "D3+", av1)) step_oct(10);
-            if (button(ui, {kx + 444, ky + 400, 72, 32}, "D4+", av1)) step_oct(1);
-            if (button(ui, {kx + 522, ky + 400, 92, 32}, "IDENT", av1, sys.is_xpdr_ident_active())) sys.trigger_xpdr_ident();
-
-            // 2-Axis Autopilot Full Panel inside Kneeboard
-            ui.hud_rect(kx + 22, ky + 442, 592, 1, .21f, .32f, .39f, .85f);
-            const bool ap_ok = av1 && sys.is_circuit_powered(nspain::CB_TURN_COORD) && sys.get_bus_volts() >= 19.5;
-            std::snprintf(line, sizeof(line), "2-Axis Autopilot (%s)  |  %s  |  %s",
-                          ap_ok ? (st.ap_master ? "ENGAGED" : "READY") : "UNPOWERED/CB",
-                          st.ap_trim_annunc > 0 ? "TRIM UP" : (st.ap_trim_annunc < 0 ? "TRIM DN" : "Trim OK"),
-                          st.ap_disconnect_warn_s > 0.0f ? "AP DISC ALERT!" : "");
-            label(ui, kx + 22, ky + 452, 16, line, !ap_ok);
-            if (button(ui, {kx + 22, ky + 480, 94, 34}, st.ap_master ? "AP ON" : "AP OFF", ap_ok && !fs.on_ground, st.ap_master)) {
-                st.ap_master = !st.ap_master;
-                st.ap_disconnect_warn_s = 0.0f;
-                if (st.ap_master) st.ap_rol_bank_deg = std::clamp(st.roll_deg, -22.0, 22.0);
-            }
-            if (button(ui, {kx + 122, ky + 480, 78, 34}, "ROL", true, st.ap_master && !st.ap_hdg_hold && !st.ap_nav_hold)) {
-                st.ap_hdg_hold = false; st.ap_nav_hold = false;
-                st.ap_rol_bank_deg = (std::abs(st.roll_deg) > 4.0) ? std::clamp(st.roll_deg, -22.0, 22.0) : 0.0;
-                if (ap_ok && !fs.on_ground) st.ap_master = true;
-            }
-            if (button(ui, {kx + 206, ky + 480, 78, 34}, "HDG", true, st.ap_master && st.ap_hdg_hold && !st.ap_nav_hold)) {
-                st.ap_hdg_hold = true; st.ap_nav_hold = false;
-                if (ap_ok && !fs.on_ground) st.ap_master = true;
-            }
-            if (button(ui, {kx + 290, ky + 480, 108, 34}, st.ap_nav_source ? "NAV:VOR1" : "NAV:GPS", true, st.ap_master && st.ap_nav_hold)) {
-                st.ap_nav_hold = true; st.ap_hdg_hold = false;
-                if (ap_ok && !fs.on_ground) st.ap_master = true;
-            }
-            if (button(ui, {kx + 404, ky + 480, 102, 34}, "SRC GPS/VOR", true)) {
-                st.ap_nav_source = (st.ap_nav_source + 1) % 2;
-            }
-            if (button(ui, {kx + 512, ky + 480, 102, 34}, "CLR DISC", st.ap_disconnect_warn_s > 0.0f)) {
-                st.ap_disconnect_warn_s = 0.0f;
-            }
-
-            std::snprintf(line, sizeof(line), "HDG %03d", (int(std::round(st.ap_hdg_deg)) % 360 + 360) % 360);
-            label(ui, kx + 22, ky + 528, 16, line);
-            if (button(ui, {kx + 114, ky + 522, 54, 32}, "-10")) st.ap_hdg_deg = std::fmod(st.ap_hdg_deg + 350.0, 360.0);
-            if (button(ui, {kx + 174, ky + 522, 46, 32}, "-1"))  st.ap_hdg_deg = std::fmod(st.ap_hdg_deg + 359.0, 360.0);
-            if (button(ui, {kx + 226, ky + 522, 46, 32}, "+1"))  st.ap_hdg_deg = std::fmod(st.ap_hdg_deg + 1.0, 360.0);
-            if (button(ui, {kx + 278, ky + 522, 54, 32}, "+10")) st.ap_hdg_deg = std::fmod(st.ap_hdg_deg + 10.0, 360.0);
-            if (button(ui, {kx + 346, ky + 522, 130, 32}, "VS MODE", true, st.ap_vs_hold)) {
-                st.ap_vs_hold = true; st.ap_alt_hold = false;
-                st.ap_vs_fpm = std::clamp(std::round((st.vsi_mps * 196.85) / 100.0) * 100.0, -1500.0, 1200.0);
-                if (ap_ok && !fs.on_ground) st.ap_master = true;
-            }
-            if (button(ui, {kx + 482, ky + 522, 132, 32}, "ALT ARM", true, st.ap_alt_arm)) {
-                st.ap_alt_arm = !st.ap_alt_arm;
-            }
-
-            std::snprintf(line, sizeof(line), "VS %+4.0f fpm | ALT %.0f ft", st.ap_vs_fpm, st.ap_alt_ft);
-            label(ui, kx + 22, ky + 570, 15, line);
-            if (button(ui, {kx + 22, ky + 598, 78, 34}, "VS-100")) st.ap_vs_fpm = std::max(-1500.0, st.ap_vs_fpm - 100.0);
-            if (button(ui, {kx + 106, ky + 598, 78, 34}, "VS+100")) st.ap_vs_fpm = std::min(1200.0, st.ap_vs_fpm + 100.0);
-            if (button(ui, {kx + 194, ky + 598, 108, 34}, "ALT HOLD", true, st.ap_master && st.ap_alt_hold)) {
-                st.ap_alt_hold = true; st.ap_vs_hold = false; st.ap_alt_arm = false;
-                if (ap_ok && !fs.on_ground) st.ap_master = true;
-            }
-            if (button(ui, {kx + 312, ky + 598, 70, 34}, "-500")) { st.ap_alt_ft = std::max(1000.0, st.ap_alt_ft - 500.0); st.ap_alt_arm = st.ap_vs_hold; }
-            if (button(ui, {kx + 388, ky + 598, 70, 34}, "-100")) { st.ap_alt_ft = std::max(1000.0, st.ap_alt_ft - 100.0); st.ap_alt_arm = st.ap_vs_hold; }
-            if (button(ui, {kx + 464, ky + 598, 70, 34}, "+100")) { st.ap_alt_ft = std::min(14500.0, st.ap_alt_ft + 100.0); st.ap_alt_arm = st.ap_vs_hold; }
-            if (button(ui, {kx + 540, ky + 598, 74, 34}, "+500")) { st.ap_alt_ft = std::min(14500.0, st.ap_alt_ft + 500.0); st.ap_alt_arm = st.ap_vs_hold; }
-        } else {
-            // Tab 2: 28V Electrical Bus, Vacuum & 12 Individual Circuit Breakers
-            std::snprintf(line, sizeof(line), "Bus: %.1fV | Ammeter: %+.1fA | Load: %.1fA | Batt: %.0f%% | Vac: %.2f inHg",
-                          sys.get_bus_volts(), sys.get_ammeter_amps(), sys.get_load_amps(),
-                          sys.get_battery_soc() * 100.0, sys.get_vacuum_inhg());
-            label(ui, kx + 22, ky + 96, 15, line);
-            label(ui, kx + 22, ky + 124, 14,
-                  "Click a circuit breaker to pull (OUT) or reset (IN). Pulling TURN_COORD or AVN1 disconnects AP.", true);
-
-            for (int cb = 0; cb < nspain::CB_COUNT; ++cb) {
-                const bool pulled = sys.is_breaker_pulled(cb);
-                const bool pwr = sys.is_circuit_powered(cb);
-                const int col = cb % 3;
-                const int row = cb / 3;
-                std::snprintf(line, sizeof(line), "%s: %s",
-                              nspain::PistonAircraftSystems::get_breaker_name(cb),
-                              pulled ? "OUT" : (pwr ? "IN (PWR)" : "IN"));
-                if (button(ui, {kx + 22 + col * 200, ky + 160 + row * 56, 192, 44}, line, true, !pulled)) {
-                    sys.toggle_breaker(cb);
-                }
-            }
-            ui.hud_rect(kx + 22, ky + 394, 592, 1, .21f, .32f, .39f, .85f);
-            label(ui, kx + 22, ky + 410, 16, "Live Fault Simulation Matrix:");
-            label(ui, kx + 22, ky + 442, 14, "- ALT_FIELD OUT: Alternator drops offline; battery discharges under load.", true);
-            label(ui, kx + 22, ky + 468, 14, "- AVIONICS_BUS_1 OUT: NAV/GPS1, XPDR, and Autopilot lose 28V power.", true);
-            label(ui, kx + 22, ky + 494, 14, "- AVIONICS_BUS_2 OUT: COM 2 / NAV 2 display shuts down.", true);
-            label(ui, kx + 22, ky + 520, 14, "- TURN_COORD OUT: Turn coordinator stops; Autopilot trips AP DISC.", true);
-            label(ui, kx + 22, ky + 546, 14, "- FLAPS OUT: Electric flap actuator motor freezes at current position.", true);
-        }
-    }
-
     if (tutorial_open_) {
         panel(ui, {1346, 28, 546, 366});
         label(ui, 1368, 44, 21, "Flight Controls Tutorial");
         if (button(ui, {1786, 38, 86, 30}, "Hide (T)")) tutorial_open_ = false;
         const bool on_ground = ui.jsb_state().on_ground;
         label(ui, 1368, 84, 16, !sys.is_engine_running()
-            ? "1. STARTUP: Press Tab for Checklist, or press K Quick Start"
+            ? "1. STARTUP: Click 3D cockpit switches/knobs, or press K Quick Start"
             : (on_ground ? "1. TAXI & TAKEOFF: X releases brake, W adds power, Q/E steer"
                          : "1. CRUISE: W/S throttle, 5/6 mixture, F/V flaps"), false);
         label(ui, 1368, 112, 16, on_ground
@@ -2390,83 +2106,14 @@ void GameFrontend::draw_navigation(AircraftAndHud &ui, const PlatformWindow &win
         label(ui, 1368, 148, 16, "2. YOKE & FLIGHT CONTROLS:");
         label(ui, 1368, 176, 16, "   Y toggles mouse yoke (holds deflection, R centers).", true);
         label(ui, 1368, 202, 16, "   Mouse down = pitch UP | Keyboard: A/D, Up/Down, Q/E.", true);
-        label(ui, 1368, 238, 16, "3. ENGINE & SYSTEMS (Tab Kneeboard):");
-        label(ui, 1368, 266, 16, "   1 Master | 2 Avn | 3 Mags | 4 Start | 5/6 Mix | 7 Carb | 8 Prime", true);
+        label(ui, 1368, 238, 16, "3. 3D COCKPIT CONTROLS (Click / Shift+Click):");
+        label(ui, 1368, 266, 16, "   Click 3D switches, breakers, radios, GPS & AP directly in cockpit.", true);
         label(ui, 1368, 302, 16, "4. CAMERA & SEAT ADJUSTMENT:");
         label(ui, 1368, 330, 16, "   RMB drag: look | C: view | PgUp/Dn Home/End Arrows: seat/cam", true);
         label(ui, 1368, 356, 16, "   Backspace resets seat/cam | T hides tutorial.", true);
     }
 
-    // Integrated Study-Level 2-Axis Autopilot Strip (powered by AVN1 + TURN_COORD breakers, drives real 3D yoke/trim)
-    const bool ap_powered = !ui.jsb_state().on_ground &&
-                            sys.is_avionics_bus_powered(1) &&
-                            sys.is_circuit_powered(nspain::CB_TURN_COORD) &&
-                            sys.get_bus_volts() >= 19.5;
-    if (ap_powered) {
-        auto &st = ui.state();
-        constexpr int ax = 1044, ay = 946;
-        panel(ui, {ax, ay, 848, 91});
-        std::snprintf(line, sizeof(line),
-                      "2-AXIS COCKPIT AUTOPILOT  (%s | %s | Baro %.0f hPa)%s",
-                      st.ap_master ? "ACTIVE" : "STANDBY",
-                      st.ap_trim_annunc > 0 ? "TRIM UP" : (st.ap_trim_annunc < 0 ? "TRIM DN" : "Trim OK"),
-                      sys.get_baro_hpa(),
-                      st.ap_disconnect_warn_s > 0.0f ? "  |  AP DISC!" : "");
-        label(ui, ax + 16, ay + 10, 14, line, st.ap_disconnect_warn_s <= 0.0f);
-        if (button(ui, {ax + 14, ay + 38, 76, 40}, st.ap_master ? "AP ON" : "AP OFF", true, st.ap_master)) {
-            st.ap_master = !st.ap_master;
-            st.ap_disconnect_warn_s = 0.0f;
-            if (st.ap_master) {
-                st.ap_hdg_deg = std::round(st.heading_deg);
-                st.ap_rol_bank_deg = std::clamp(st.roll_deg, -22.0, 22.0);
-                if (!st.ap_vs_hold) st.ap_alt_ft = std::round(st.ind_alt_ft / 100.0) * 100.0;
-            }
-        }
-        if (button(ui, {ax + 96, ay + 38, 56, 40}, "ROL", true, st.ap_master && !st.ap_hdg_hold && !st.ap_nav_hold)) {
-            st.ap_hdg_hold = false; st.ap_nav_hold = false;
-            st.ap_rol_bank_deg = (std::abs(st.roll_deg) > 4.0) ? std::clamp(st.roll_deg, -22.0, 22.0) : 0.0;
-            st.ap_master = true;
-        }
-        std::snprintf(line, sizeof(line), "HDG %03d", (int(std::round(st.ap_hdg_deg)) % 360 + 360) % 360);
-        if (button(ui, {ax + 158, ay + 38, 92, 40}, line, true, st.ap_master && st.ap_hdg_hold && !st.ap_nav_hold)) {
-            st.ap_hdg_hold = true;
-            st.ap_nav_hold = false;
-            st.ap_master = true;
-        }
-        if (button(ui, {ax + 256, ay + 38, 36, 40}, "-", true)) st.ap_hdg_deg = std::fmod(st.ap_hdg_deg + 350.0, 360.0);
-        if (button(ui, {ax + 296, ay + 38, 36, 40}, "+", true)) st.ap_hdg_deg = std::fmod(st.ap_hdg_deg + 10.0, 360.0);
-
-        const bool vor1_valid = (sys.get_nav_to_from(1) != 0);
-        const bool nav_ready = st.ap_nav_source ? vor1_valid : st.ap_nav_valid;
-        if (button(ui, {ax + 340, ay + 38, 126, 40},
-                   st.ap_nav_source ? (vor1_valid ? "NAV:VOR1" : "VOR1 NONE")
-                                    : (st.ap_nav_valid ? "NAV:GPS" : "GPS NONE"),
-                   nav_ready, st.ap_master && st.ap_nav_hold && nav_ready)) {
-            st.ap_nav_hold = !st.ap_nav_hold;
-            if (st.ap_nav_hold) st.ap_hdg_hold = false;
-            st.ap_master = true;
-        }
-
-        std::snprintf(line, sizeof(line), st.ap_vs_hold ? "VS %+4.0f" : (st.ap_alt_arm ? "ARM %.0f" : "ALT %.0f"),
-                      st.ap_vs_hold ? st.ap_vs_fpm : st.ap_alt_ft);
-        if (button(ui, {ax + 474, ay + 38, 114, 40}, line, true, st.ap_master && (st.ap_alt_hold || st.ap_vs_hold))) {
-            st.ap_alt_hold = !st.ap_alt_hold;
-            st.ap_vs_hold = !st.ap_alt_hold;
-            if (st.ap_vs_hold) st.ap_vs_fpm = std::clamp(std::round((st.vsi_mps * 196.85) / 100.0) * 100.0, -1500.0, 1200.0);
-            st.ap_master = true;
-        }
-        if (button(ui, {ax + 594, ay + 38, 60, 40}, st.ap_vs_hold ? "VS-1" : "-500", true)) {
-            if (st.ap_vs_hold) st.ap_vs_fpm = std::max(-1500.0, st.ap_vs_fpm - 100.0);
-            else st.ap_alt_ft = std::max(1000.0, st.ap_alt_ft - 500.0);
-        }
-        if (button(ui, {ax + 658, ay + 38, 60, 40}, st.ap_vs_hold ? "VS+1" : "+500", true)) {
-            if (st.ap_vs_hold) st.ap_vs_fpm = std::min(1200.0, st.ap_vs_fpm + 100.0);
-            else st.ap_alt_ft = std::min(14500.0, st.ap_alt_ft + 500.0);
-        }
-        if (button(ui, {ax + 724, ay + 38, 110, 40}, st.ap_alt_arm ? "ARM ON" : "ALT ARM", true, st.ap_alt_arm)) {
-            st.ap_alt_arm = !st.ap_alt_arm;
-        }
-    } else if (!ui.jsb_state().on_ground && ui.state().ap_disconnect_warn_s > 0.0f) {
+    if (!ui.jsb_state().on_ground && ui.state().ap_disconnect_warn_s > 0.0f) {
         panel(ui, {1340, 946, 552, 64});
         label(ui, 1364, 968, 17, "AUTOPILOT DISCONNECTED (Check Avionics / Turn Coord Breaker)");
     }
@@ -2475,7 +2122,7 @@ void GameFrontend::draw_navigation(AircraftAndHud &ui, const PlatformWindow &win
         panel(ui, {1240, 946, 652, 91});
         label(ui, 1261, 974, 19, sys.is_engine_running()
             ? "Parking brake set. X releases it, W adds power."
-            : "Engine stopped (cold & dark). Press Tab for Checklist or K to start.");
+            : "Engine stopped (cold & dark). Click 3D cockpit switches or press K.");
     }
     if (session_.profile().route_.empty()) {
         ui.flush_hud(w, h, font_);

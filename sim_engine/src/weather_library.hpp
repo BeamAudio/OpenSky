@@ -2,6 +2,7 @@
 
 #include "gl_loader.hpp"
 #include "math3d.hpp"
+#include "platform_io.hpp"
 #include "../../protocol/weather_format.h"
 
 #include <cstdint>
@@ -79,7 +80,7 @@ private:
     };
     const DecodedState *state(int idx) const;
 
-    int fd_ = -1;
+    FileHandle fd_ = kInvalidFileHandle;
     bool valid_ = false;
     nspain::NswxHeader hdr_{};
     std::vector<nspain::NswxStateEntry> entries_;

@@ -105,12 +105,13 @@ void test_grass_takeoff_roll_and_liftoff() {
 
     // Sit at idle briefly on grass with parking brake, then release brake and apply full throttle.
     for (int i = 0; i < 180; ++i) assert(flight.advance(1.0 / 60.0));
-    assert(flight.state().rpm > 550.0);
+    assert(flight.state().engine_running && flight.state().rpm > 580.0);
 
     controls.brake_left = controls.brake_right = 0.0;
     controls.throttle = 1.0;
     flight.set_controls(controls);
     bool lifted_off = false;
+    double liftoff_dist_m = 0.0;
     for (int i = 0; i < 1500; ++i) {
         if (flight.state().ias_kt >= 55.0) {
             controls.elevator = 0.30;
@@ -119,12 +120,53 @@ void test_grass_takeoff_roll_and_liftoff() {
         assert(flight.advance(1.0 / 60.0));
         if (!flight.state().on_ground && flight.state().agl_m > 5.0 && flight.state().vsi_mps > 1.0) {
             lifted_off = true;
+            const double dn = (flight.state().lat_deg - 42.5225) * 111132.0;
+            const double de = (flight.state().lon_deg - 0.4811) * 111320.0 * std::cos(42.5225 * 3.14159265358979 / 180.0);
+            liftoff_dist_m = std::hypot(dn, de);
             break;
         }
     }
-    assert(lifted_off);
+    assert(lifted_off && liftoff_dist_m < 450.0);
     std::cout << "[PASS] Grass airfield (900m MSL) idle -> full-throttle takeoff roll & liftoff ("
-              << flight.state().ias_kt << " kt, AGL " << flight.state().agl_m << " m)\n";
+              << flight.state().ias_kt << " kt, AGL " << flight.state().agl_m
+              << " m, dist " << liftoff_dist_m << " m)\n";
+}
+
+void test_closed_throttle_never_stalls_engine() {
+    auto verify_idle = [](double alt_m, double cas_kt, bool on_ground, double mix) {
+        FlightModel flight;
+        flight.set_ground_provider([alt_m](double, double) { return FlightGround{alt_m, 0.62, 0.18, true}; });
+        FlightEnvironment weather{};
+        weather.terrain_elev_m = alt_m;
+        weather.air_temp_c = 22.0;
+        weather.relative_humidity = 0.55;
+        weather.qnh_hpa = 1013.25;
+        flight.set_environment(weather);
+        FlightEngineInputs engine{};
+        engine.running = true;
+        flight.set_engine(engine);
+        FlightControls controls{};
+        controls.throttle = 1.0;
+        controls.mixture = mix;
+        if (on_ground) controls.brake_left = controls.brake_right = 1.0;
+        flight.set_controls(controls);
+        assert(flight.load("game/aircraft/c172s"));
+        assert(flight.initialize(42.5225, 0.4811, alt_m + (on_ground ? 1.30 : 0.0), 340.0, cas_kt, on_ground));
+        for (int i = 0; i < 120; ++i) assert(flight.advance(1.0 / 60.0));
+        controls = flight.controls();
+        controls.throttle = 0.0;
+        controls.mixture = mix;
+        flight.set_controls(controls);
+        for (int i = 0; i < 480; ++i) {
+            assert(flight.advance(1.0 / 60.0));
+            assert(flight.state().engine_running);
+            assert(flight.state().rpm >= 550.0);
+        }
+    };
+    verify_idle(900.0, 0.0, true, 1.0);
+    verify_idle(900.0, 0.0, true, 0.7);
+    verify_idle(2500.0, 85.0, false, 0.8);
+    std::cout << "[PASS] Closed throttle (0%) holds smooth idle on ground and at altitude without stalling\n";
 }
 
 void test_ownership_care_and_cold_start_systems() {
@@ -248,6 +290,7 @@ int main() {
     test_trimmed_flight_and_air_response();
     test_dem_contact_and_brakes();
     test_grass_takeoff_roll_and_liftoff();
+    test_closed_throttle_never_stalls_engine();
     test_ownership_care_and_cold_start_systems();
     return 0;
 }

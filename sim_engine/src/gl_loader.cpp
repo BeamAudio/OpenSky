@@ -24,9 +24,10 @@ using ProcFn = void *(*)(const char *);
 void *load_proc(const char *name) {
 #ifdef _WIN32
     void *p = reinterpret_cast<void *>(wglGetProcAddress(name));
-    if (!p) {
+    const auto addr = reinterpret_cast<uintptr_t>(p);
+    if (p == nullptr || addr <= 3u || addr == static_cast<uintptr_t>(-1)) {
         static HMODULE gl_mod = LoadLibraryA("opengl32.dll");
-        if (gl_mod) p = reinterpret_cast<void *>(GetProcAddress(gl_mod, name));
+        p = gl_mod ? reinterpret_cast<void *>(GetProcAddress(gl_mod, name)) : nullptr;
     }
     return p;
 #else

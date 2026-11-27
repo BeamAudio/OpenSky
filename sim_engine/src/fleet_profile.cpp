@@ -1,11 +1,11 @@
 #include "fleet_profile.hpp"
+#include "platform_io.hpp"
 
 #include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <fstream>
 #include <iomanip>
-#include <unistd.h>
 
 namespace nsim {
 namespace {
@@ -127,13 +127,11 @@ bool write_fleet_profile(const std::filesystem::path &path, const FleetProfile &
         return false;
     }
     // Use a unique temporary path in the destination directory so rename is atomic.
-    auto pattern = path.string() + ".tmp.XXXXXX";
-    const int fd = ::mkstemp(pattern.data());
-    if (fd < 0) {
+    const std::string pattern = create_unique_temp_file(path);
+    if (pattern.empty()) {
         error = "Could not create a temporary aircraft save.";
         return false;
     }
-    ::close(fd);
     std::ofstream out(pattern, std::ios::trunc);
     const auto &c = profile.care_;
     const auto &pos = profile.parking_spot_;
@@ -159,8 +157,7 @@ bool write_fleet_profile(const std::filesystem::path &path, const FleetProfile &
             << e.minutes << ' ' << e.distance_nm << ' ' << e.fuel_gal << ' ' << e.touchdown_fpm << ' ' << e.crosswind_kt << '\n';
     out << c.windshield_crack << ' ' << c.dmg_nose << ' ' << c.dmg_wing_l << ' ' << c.dmg_wing_r << ' ' << c.dmg_tail << '\n';
     out.close();
-    if (out) std::filesystem::rename(pattern, path, ec);
-    if (!out || ec) {
+    if (!out || !atomic_replace_file(pattern, path)) {
         std::filesystem::remove(pattern, ec);
         error = "Could not save the aircraft. The previous save has been kept.";
         return false;

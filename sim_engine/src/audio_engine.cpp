@@ -7,7 +7,16 @@
 #include <cstring>
 #include <fstream>
 
-#ifndef _WIN32
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <mmsystem.h>
+#else
 #include <dlfcn.h>
 #endif
 
@@ -262,7 +271,29 @@ AudioEngine::~AudioEngine() {
 }
 
 bool AudioEngine::open_alsa() {
-#ifndef _WIN32
+#ifdef _WIN32
+    WAVEFORMATEX wf{};
+    wf.wFormatTag = WAVE_FORMAT_PCM;
+    wf.nChannels = 2;
+    wf.nSamplesPerSec = kSampleRate;
+    wf.wBitsPerSample = 16;
+    wf.nBlockAlign = static_cast<WORD>(wf.nChannels * (wf.wBitsPerSample / 8));
+    wf.nAvgBytesPerSec = wf.nSamplesPerSec * wf.nBlockAlign;
+
+    HANDLE evt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!evt) return false;
+
+    HWAVEOUT hwo = nullptr;
+    const MMRESULT rc = waveOutOpen(&hwo, WAVE_MAPPER, &wf, reinterpret_cast<DWORD_PTR>(evt), 0, CALLBACK_EVENT);
+    if (rc != MMSYSERR_NOERROR || !hwo) {
+        CloseHandle(evt);
+        return false;
+    }
+    pcm_ = hwo;
+    win_event_ = evt;
+    std::printf("[AUDIO] Procedural C172S audio engine active (%u Hz stereo via Windows waveOut)\n", kSampleRate);
+    return true;
+#else
     alsa_lib_ = dlopen("libasound.so.2", RTLD_LAZY);
     if (!alsa_lib_ || !g_alsa.load(alsa_lib_)) {
         if (alsa_lib_) { dlclose(alsa_lib_); alsa_lib_ = nullptr; }
@@ -285,12 +316,23 @@ bool AudioEngine::open_alsa() {
     }
     dlclose(alsa_lib_);
     alsa_lib_ = nullptr;
-#endif
     return false;
+#endif
 }
 
 void AudioEngine::close_alsa() {
-#ifndef _WIN32
+#ifdef _WIN32
+    if (pcm_) {
+        HWAVEOUT hwo = reinterpret_cast<HWAVEOUT>(pcm_);
+        waveOutReset(hwo);
+        waveOutClose(hwo);
+        pcm_ = nullptr;
+    }
+    if (win_event_) {
+        CloseHandle(reinterpret_cast<HANDLE>(win_event_));
+        win_event_ = nullptr;
+    }
+#else
     if (pcm_) {
         g_alsa.drop(pcm_);
         g_alsa.close(pcm_);
@@ -307,7 +349,7 @@ bool AudioEngine::init(bool enable_output) {
     shutdown();
     if (!enable_output) return true;
     if (!open_alsa()) {
-        std::printf("[AUDIO] No ALSA playback device available; running silently.\n");
+        std::printf("[AUDIO] No audio playback device available; running silently.\n");
         return true; // Non-fatal so headless / muted machines still fly.
     }
     running_.store(true, std::memory_order_release);
@@ -319,6 +361,9 @@ bool AudioEngine::init(bool enable_output) {
 void AudioEngine::shutdown() {
     running_.store(false, std::memory_order_release);
     active_.store(false, std::memory_order_release);
+#ifdef _WIN32
+    if (win_event_) SetEvent(reinterpret_cast<HANDLE>(win_event_));
+#endif
     if (thread_.joinable()) thread_.join();
     close_alsa();
 }
@@ -337,6 +382,41 @@ void AudioEngine::set_muted(bool muted) {
 
 void AudioEngine::audio_thread_main() {
     SynthState synth;
+#ifdef _WIN32
+    constexpr int kRingBlocks = 4;
+    HWAVEOUT hwo = reinterpret_cast<HWAVEOUT>(pcm_);
+    HANDLE evt = reinterpret_cast<HANDLE>(win_event_);
+    std::array<std::array<int16_t, kPeriodFrames * 2>, kRingBlocks> ring{};
+    std::array<WAVEHDR, kRingBlocks> hdrs{};
+    for (int i = 0; i < kRingBlocks; ++i) {
+        hdrs[i].lpData = reinterpret_cast<LPSTR>(ring[i].data());
+        hdrs[i].dwBufferLength = static_cast<DWORD>(ring[i].size() * sizeof(int16_t));
+        waveOutPrepareHeader(hwo, &hdrs[i], sizeof(WAVEHDR));
+        hdrs[i].dwFlags |= WHDR_DONE;
+    }
+    while (running_.load(std::memory_order_acquire)) {
+        bool submitted = false;
+        for (int i = 0; i < kRingBlocks; ++i) {
+            if ((hdrs[i].dwFlags & WHDR_DONE) != 0) {
+                const AudioState st = slots_[read_slot_.load(std::memory_order_acquire)];
+                synth.render_stereo(st, ring[i].data(), kPeriodFrames);
+                hdrs[i].dwFlags &= ~WHDR_DONE;
+                if (waveOutWrite(hwo, &hdrs[i], sizeof(WAVEHDR)) == MMSYSERR_NOERROR) {
+                    submitted = true;
+                } else {
+                    hdrs[i].dwFlags |= WHDR_DONE;
+                }
+            }
+        }
+        if (!submitted) {
+            WaitForSingleObject(evt, 20);
+        }
+    }
+    waveOutReset(hwo);
+    for (int i = 0; i < kRingBlocks; ++i) {
+        waveOutUnprepareHeader(hwo, &hdrs[i], sizeof(WAVEHDR));
+    }
+#else
     std::array<int16_t, kPeriodFrames * 2> pcm_buf{};
     while (running_.load(std::memory_order_acquire)) {
         const AudioState st = slots_[read_slot_.load(std::memory_order_acquire)];
@@ -349,6 +429,7 @@ void AudioEngine::audio_thread_main() {
             }
         }
     }
+#endif
 }
 
 bool AudioEngine::run_selftest() {

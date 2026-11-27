@@ -252,6 +252,12 @@ void AircraftAndHud::shutdown() {
     avionics_tex_ = 0;
     avionics_base_rgba_.clear();
     avionics_work_rgba_.clear();
+    panel_face_tex_ = 0;
+    davtron_base_rgba_.clear();
+    davtron_work_rgba_.clear();
+    steam_dials_tex_ = 0;
+    steam_base_rgba_.clear();
+    steam_cell_rgba_.clear();
     if (windshield_rain_front_tex_) { glDeleteTextures(1, &windshield_rain_front_tex_); windshield_rain_front_tex_ = 0; }
     if (windshield_rain_side_tex_) { glDeleteTextures(1, &windshield_rain_side_tex_); windshield_rain_side_tex_ = 0; }
     if (white_tex_)    { glDeleteTextures(1, &white_tex_); white_tex_ = 0; }
@@ -626,7 +632,8 @@ void AircraftAndHud::step_inputs_and_physics(const PlatformWindow &win, double d
         yoke_anchor_valid_ = true;
     }
     const bool mouse_yoke = st_.mouse_yoke_enabled && st_.view_mode != 2;
-    if (win.mouse_right_down() || (win.mouse_left_down() && !mouse_yoke)) {
+    const bool hovering_ckpt_ctrl = (st_.view_mode == 0 && cockpit_hotspot_hovered_);
+    if (win.mouse_right_down() || (win.mouse_left_down() && !mouse_yoke && !hovering_ckpt_ctrl)) {
         st_.look_yaw_deg   = std::clamp(st_.look_yaw_deg   - win.mouse_dx() * 0.22f, -165.0f, 165.0f);
         st_.look_pitch_deg = std::clamp(st_.look_pitch_deg - win.mouse_dy() * 0.18f, -75.0f,  75.0f);
     }
@@ -734,7 +741,7 @@ void AircraftAndHud::step_inputs_and_physics(const PlatformWindow &win, double d
             anchor_mx_ = cur_mx - raw_yoke_x_ * rad;
             anchor_my_ = cur_my - raw_yoke_y_ * rad;
         }
-        if (win.mouse_left_clicked()) {
+        if (win.mouse_left_clicked() && !hovering_ckpt_ctrl) {
             anchor_mx_ = cur_mx;
             anchor_my_ = cur_my;
             raw_yoke_x_ = raw_yoke_y_ = 0.0;
@@ -1304,7 +1311,7 @@ void AircraftAndHud::resolve_world_collisions(double dt) {
     prev_ground_coll_ = fs.on_ground;
     prev_vsi_coll_ = fs.vsi_mps;
 
-    if (!pack_ || impact_cooldown_s_ > 0.0) return;
+    if (!pack_ || impact_cooldown_s_ > 0.0 || fs.agl_m > 125.0) return;
 
     double mlat = 111132.0, mlon = 82600.0;
     nspain::meters_per_degree(fs.lat_deg, mlat, mlon);
@@ -1509,35 +1516,225 @@ void avn_text(std::vector<uint8_t> &buf, int W, int H, int cx, int cy, int scale
         }
     }
 }
+
+struct AvnClip { int x0, y0, x1, y1; };
+
+inline void avn_px(std::vector<uint8_t> &buf, int W, int H, const AvnClip &c,
+                   int x, int y, uint8_t r, uint8_t g, uint8_t b, uint8_t a = 255) {
+    if (x < c.x0 || x >= c.x1 || y < c.y0 || y >= c.y1 || x < 0 || x >= W || y < 0 || y >= H) return;
+    uint8_t *p = buf.data() + static_cast<size_t>(y * W + x) * 4u;
+    if (a >= 250) {
+        p[0] = r; p[1] = g; p[2] = b; p[3] = 255;
+    } else {
+        const int ia = 255 - a;
+        p[0] = static_cast<uint8_t>((int(r) * a + int(p[0]) * ia) >> 8);
+        p[1] = static_cast<uint8_t>((int(g) * a + int(p[1]) * ia) >> 8);
+        p[2] = static_cast<uint8_t>((int(b) * a + int(p[2]) * ia) >> 8);
+        p[3] = 255;
+    }
+}
+
+void avn_rect_clip(std::vector<uint8_t> &buf, int W, int H, const AvnClip &c,
+                   int x, int y, int w, int h, uint8_t r, uint8_t g, uint8_t b, uint8_t a = 255) {
+    const int x0 = std::max({0, c.x0, x});
+    const int y0 = std::max({0, c.y0, y});
+    const int x1 = std::min({W, c.x1, x + w});
+    const int y1 = std::min({H, c.y1, y + h});
+    for (int py = y0; py < y1; ++py) {
+        uint8_t *row = buf.data() + static_cast<size_t>(py * W + x0) * 4u;
+        if (a >= 250) {
+            for (int px = x0; px < x1; ++px, row += 4) {
+                row[0] = r; row[1] = g; row[2] = b; row[3] = 255;
+            }
+        } else {
+            const int ia = 255 - a;
+            for (int px = x0; px < x1; ++px, row += 4) {
+                row[0] = static_cast<uint8_t>((int(r) * a + int(row[0]) * ia) >> 8);
+                row[1] = static_cast<uint8_t>((int(g) * a + int(row[1]) * ia) >> 8);
+                row[2] = static_cast<uint8_t>((int(b) * a + int(row[2]) * ia) >> 8);
+                row[3] = 255;
+            }
+        }
+    }
+}
+
+void avn_text_clip(std::vector<uint8_t> &buf, int W, int H, const AvnClip &c,
+                   int cx, int cy, int scale, const char *txt,
+                   uint8_t r, uint8_t g, uint8_t b, bool centered = true) {
+    if (!txt || !*txt || scale < 1) return;
+    const int len = static_cast<int>(std::strlen(txt));
+    const int adv = 6 * scale;
+    const int x0 = centered ? (cx - (len * adv - scale) / 2) : cx;
+    const int y0 = centered ? (cy - (7 * scale) / 2) : cy;
+    for (int ci = 0; ci < len; ++ci) {
+        char ch = txt[ci];
+        if (ch >= 'a' && ch <= 'z') ch = static_cast<char>(ch - 'a' + 'A');
+        const Glyph5x7 *gl = nullptr;
+        for (const auto &g_it : kAvnFont) {
+            if (g_it.ch == ch) { gl = &g_it; break; }
+        }
+        if (!gl) continue;
+        for (int ry = 0; ry < 7; ++ry) {
+            for (int rx = 0; rx < 5; ++rx) {
+                if (gl->r[ry] & (16 >> rx))
+                    avn_rect_clip(buf, W, H, c, x0 + ci * adv + rx * scale, y0 + ry * scale, scale, scale, r, g, b);
+            }
+        }
+    }
+}
+
+void avn_fill_circle(std::vector<uint8_t> &buf, int W, int H, const AvnClip &c,
+                     int cx, int cy, int rad, uint8_t r, uint8_t g, uint8_t b, uint8_t a = 255) {
+    const int r2 = rad * rad;
+    const int y0 = std::max({0, c.y0, cy - rad});
+    const int y1 = std::min({H - 1, c.y1 - 1, cy + rad});
+    for (int py = y0; py <= y1; ++py) {
+        const int dy = py - cy;
+        const int dx_max = static_cast<int>(std::sqrt(std::max(0, r2 - dy * dy)));
+        const int x0 = std::max({0, c.x0, cx - dx_max});
+        const int x1 = std::min({W - 1, c.x1 - 1, cx + dx_max});
+        for (int px = x0; px <= x1; ++px) avn_px(buf, W, H, c, px, py, r, g, b, a);
+    }
+}
+
+void avn_circle(std::vector<uint8_t> &buf, int W, int H, const AvnClip &c,
+                int cx, int cy, int rad, int thickness, uint8_t r, uint8_t g, uint8_t b, uint8_t a = 255) {
+    if (rad <= 0) return;
+    const int steps = std::max(32, rad * 4);
+    for (int i = 0; i < steps; ++i) {
+        const double ang = (2.0 * PI_D * i) / steps;
+        const int px = cx + static_cast<int>(std::lround(std::cos(ang) * rad));
+        const int py = cy + static_cast<int>(std::lround(std::sin(ang) * rad));
+        if (thickness <= 1) avn_px(buf, W, H, c, px, py, r, g, b, a);
+        else avn_rect_clip(buf, W, H, c, px - thickness / 2, py - thickness / 2, thickness, thickness, r, g, b, a);
+    }
+}
+
+void avn_line(std::vector<uint8_t> &buf, int W, int H, const AvnClip &c,
+              int x0, int y0, int x1, int y1, int thickness,
+              uint8_t r, uint8_t g, uint8_t b, uint8_t a = 255) {
+    const int dx = x1 - x0;
+    const int dy = y1 - y0;
+    const int steps = std::max(std::abs(dx), std::abs(dy));
+    if (steps == 0) {
+        avn_rect_clip(buf, W, H, c, x0 - thickness / 2, y0 - thickness / 2, thickness, thickness, r, g, b, a);
+        return;
+    }
+    const int half = thickness / 2;
+    for (int i = 0; i <= steps; ++i) {
+        const int px = x0 + (dx * i) / steps;
+        const int py = y0 + (dy * i) / steps;
+        if (thickness <= 1) avn_px(buf, W, H, c, px, py, r, g, b, a);
+        else avn_rect_clip(buf, W, H, c, px - half, py - half, thickness, thickness, r, g, b, a);
+    }
+}
+
+void avn_fill_tri(std::vector<uint8_t> &buf, int W, int H, const AvnClip &c,
+                  int x0, int y0, int x1, int y1, int x2, int y2,
+                  uint8_t r, uint8_t g, uint8_t b) {
+    const int minx = std::max({0, c.x0, std::min({x0, x1, x2})});
+    const int maxx = std::min({W - 1, c.x1 - 1, std::max({x0, x1, x2})});
+    const int miny = std::max({0, c.y0, std::min({y0, y1, y2})});
+    const int maxy = std::min({H - 1, c.y1 - 1, std::max({y0, y1, y2})});
+    const int area = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0);
+    if (area == 0) return;
+    const int sgn = area > 0 ? 1 : -1;
+    for (int py = miny; py <= maxy; ++py) {
+        for (int px = minx; px <= maxx; ++px) {
+            const int w0 = ((x1 - x0) * (py - y0) - (y1 - y0) * (px - x0)) * sgn;
+            const int w1 = ((x2 - x1) * (py - y1) - (y2 - y1) * (px - x1)) * sgn;
+            const int w2 = ((x0 - x2) * (py - y2) - (y0 - y2) * (px - x2)) * sgn;
+            if (w0 >= 0 && w1 >= 0 && w2 >= 0) avn_px(buf, W, H, c, px, py, r, g, b);
+        }
+    }
+}
+
+struct NavVorRef { const char *ident; double freq_mhz; double lat; double lon; };
+static constexpr NavVorRef kSpainVors[10] = {
+    {"ZAR", 113.00, 41.6581, -1.0314},
+    {"HUE", 114.50, 42.0811, -0.3233},
+    {"PPN", 112.30, 42.7344, -1.7022},
+    {"GRA", 115.80, 42.2010,  0.3420},
+    {"LLE", 113.60, 41.7290,  0.5360},
+    {"BLB", 115.90, 43.3040, -2.9360},
+    {"ASN", 112.50, 43.5530, -6.0340},
+    {"STG", 116.40, 42.9270, -8.4250},
+    {"VLL", 117.20, 41.7060, -4.8520},
+    {"TER", 112.70, 40.4090, -1.2190},
+};
+static constexpr double kGpsRangesNm[4] = {5.0, 10.0, 20.0, 40.0};
+static constexpr int kDavX = 1948, kDavY = 231, kDavW = 232, kDavH = 88;
 } // namespace
 
 void AircraftAndHud::init_avionics_display_texture() {
     avionics_tex_ = 0;
+    panel_face_tex_ = 0;
+    steam_dials_tex_ = 0;
     for (const auto &sm : ckpt_mesh_.submeshes) {
-        if (sm.material_name == "AvionicsStack" && sm.albedo_tex != 0) {
-            avionics_tex_ = sm.albedo_tex;
-            break;
+        if (sm.material_name == "AvionicsStack" && sm.albedo_tex != 0) avionics_tex_ = sm.albedo_tex;
+        else if (sm.material_name == "PanelFace2K" && sm.albedo_tex != 0) panel_face_tex_ = sm.albedo_tex;
+        else if (sm.material_name == "SteamDials" && sm.albedo_tex != 0) steam_dials_tex_ = sm.albedo_tex;
+    }
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    if (avionics_tex_) {
+        glGetTextureLevelParameteriv(avionics_tex_, 0, GL_TEXTURE_WIDTH, &avionics_tex_w_);
+        glGetTextureLevelParameteriv(avionics_tex_, 0, GL_TEXTURE_HEIGHT, &avionics_tex_h_);
+        if (avionics_tex_w_ == 1024 && avionics_tex_h_ == 1536) {
+            avionics_base_rgba_.resize(1024u * 1536u * 4u);
+            glGetTextureImage(avionics_tex_, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                              static_cast<GLsizei>(avionics_base_rgba_.size()), avionics_base_rgba_.data());
+            avionics_work_rgba_ = avionics_base_rgba_;
+            avionics_last_key_.clear();
+            avionics_last_upd_s_ = -1.0f;
+        } else {
+            avionics_tex_ = 0;
         }
     }
-    if (!avionics_tex_) return;
-    glGetTextureLevelParameteriv(avionics_tex_, 0, GL_TEXTURE_WIDTH, &avionics_tex_w_);
-    glGetTextureLevelParameteriv(avionics_tex_, 0, GL_TEXTURE_HEIGHT, &avionics_tex_h_);
-    if (avionics_tex_w_ != 1024 || avionics_tex_h_ != 1536) {
-        avionics_tex_ = 0;
-        return;
+    if (panel_face_tex_) {
+        glGetTextureLevelParameteriv(panel_face_tex_, 0, GL_TEXTURE_WIDTH, &panel_face_w_);
+        glGetTextureLevelParameteriv(panel_face_tex_, 0, GL_TEXTURE_HEIGHT, &panel_face_h_);
+        if (panel_face_w_ == 2560 && panel_face_h_ == 768) {
+            std::vector<uint8_t> full_pf(2560u * 768u * 4u);
+            glGetTextureImage(panel_face_tex_, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                              static_cast<GLsizei>(full_pf.size()), full_pf.data());
+            davtron_base_rgba_.resize(static_cast<size_t>(kDavW * kDavH) * 4u);
+            for (int y = 0; y < kDavH; ++y) {
+                std::memcpy(davtron_base_rgba_.data() + static_cast<size_t>(y * kDavW) * 4u,
+                            full_pf.data() + static_cast<size_t>((kDavY + y) * 2560 + kDavX) * 4u,
+                            static_cast<size_t>(kDavW) * 4u);
+            }
+            davtron_work_rgba_ = davtron_base_rgba_;
+            davtron_last_key_.clear();
+            davtron_last_upd_s_ = -1.0f;
+        } else {
+            panel_face_tex_ = 0;
+        }
     }
-    avionics_base_rgba_.resize(1024u * 1536u * 4u);
-    glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    glGetTextureImage(avionics_tex_, 0, GL_RGBA, GL_UNSIGNED_BYTE,
-                      static_cast<GLsizei>(avionics_base_rgba_.size()), avionics_base_rgba_.data());
-    avionics_work_rgba_ = avionics_base_rgba_;
-    avionics_last_key_.clear();
-    avionics_last_upd_s_ = -1.0f;
+    if (steam_dials_tex_) {
+        glGetTextureLevelParameteriv(steam_dials_tex_, 0, GL_TEXTURE_WIDTH, &steam_dials_w_);
+        glGetTextureLevelParameteriv(steam_dials_tex_, 0, GL_TEXTURE_HEIGHT, &steam_dials_h_);
+        if (steam_dials_w_ == 1536 && steam_dials_h_ == 1536) {
+            steam_base_rgba_.resize(1536u * 1536u * 4u);
+            glGetTextureImage(steam_dials_tex_, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                              static_cast<GLsizei>(steam_base_rgba_.size()), steam_base_rgba_.data());
+            steam_cell_rgba_.resize(512u * 512u * 4u);
+            steam_vor_key_.clear();
+            steam_eng_key_.clear();
+            steam_kol_key_.clear();
+            steam_tc_key_.clear();
+            steam_hobbs_key_.clear();
+            steam_last_upd_s_ = -1.0f;
+        } else {
+            steam_dials_tex_ = 0;
+        }
+    }
 }
 
-void AircraftAndHud::update_avionics_display_texture(float sim_time_sec) {
+void AircraftAndHud::update_avionics_display_texture(float sim_time_sec, const AtmosphereState &atmo) {
+    (void)atmo;
     if (!avionics_tex_ || avionics_base_rgba_.size() != 1024u * 1536u * 4u) return;
-    if (avionics_last_upd_s_ >= 0.0f && (sim_time_sec - avionics_last_upd_s_) < 0.20f) return;
+    if (avionics_last_upd_s_ >= 0.0f && sim_time_sec >= avionics_last_upd_s_ &&
+        (sim_time_sec - avionics_last_upd_s_) < 0.33f) return;
 
     const bool avn1 = systems_.is_avionics_bus_powered(1);
     const bool avn2 = systems_.is_avionics_bus_powered(2);
@@ -1556,10 +1753,15 @@ void AircraftAndHud::update_avionics_display_texture(float sim_time_sec) {
     const int baro_i = int(std::round(systems_.get_baro_hpa()));
     const int cdi_q = int(std::round(systems_.get_nav_cdi(1) * 20.0));
     const int dme_q = int(std::round(systems_.get_nav_dme_nm(1) * 10.0));
+    const int lat_q = int(std::llround(st_.lat_deg * 1000.0));
+    const int lon_q = int(std::llround(st_.lon_deg * 1000.0));
+    const int alt_q = int(std::round(st_.alt_msl_m / 15.0));
+    const int gs_kt = int(std::round(std::hypot(st_.vel_east_mps, st_.vel_north_mps) * 1.94384));
+    const int xpdr_r = (avn1 && systems_.get_xpdr_mode() >= 2 && std::fmod(sim_time_sec, 2.4f) < 0.35f) ? 1 : 0;
 
-    char key[256];
+    char key[384];
     std::snprintf(key, sizeof(key),
-                  "%d:%d:%d:%d%d%d%d:%d:%d%d%d%d%d:%d:%03d:%05d:%+05d:%d:%d:%05d:%05d:%05d:%05d:%03d:%s:%d:%d:%05d:%05d:%05d:%05d:%d:%04d:%d:%03d:%03d",
+                  "%d:%d:%d:%d%d%d%d:%d:%d%d%d%d%d:%d:%03d:%05d:%+05d:%d:%d:%05d:%05d:%05d:%05d:%03d:%s:%d:%d:%05d:%05d:%05d:%05d:%d:%04d:%d:%d:%03d:%03d:%d:%d:%d:%d:%d:%d:%d:%d:%zu:%s",
                   avn1 ? 1 : 0, avn2 ? 1 : 0, ap_ok ? 1 : 0,
                   volts_w ? 1 : 0, oil_w ? 1 : 0, fuel_w ? 1 : 0, vac_w ? 1 : 0,
                   disc_blink ? 1 : 0,
@@ -1577,7 +1779,11 @@ void AircraftAndHud::update_avionics_display_texture(float sim_time_sec) {
                   int(std::round(systems_.get_nav_active(2) * 1000.0)),
                   int(std::round(systems_.get_nav_standby(2) * 1000.0)),
                   systems_.get_xpdr_mode(), systems_.get_xpdr_squawk(),
-                  systems_.is_xpdr_ident_active() ? 1 : 0, hdg_disp, ind_fl);
+                  systems_.is_xpdr_ident_active() ? 1 : 0, xpdr_r,
+                  hdg_disp, ind_fl, lat_q, lon_q, alt_q, gs_kt,
+                  st_.gps_page, st_.gps_range_idx, st_.gps_north_up ? 1 : 0,
+                  int(st_.audio_sel_mask) + (st_.gps_nrst_cursor << 8) + (st_.gps_direct_active ? 4096 : 0),
+                  st_.gps_route.size(), st_.gps_direct_label.c_str());
     if (key == avionics_last_key_) return;
     avionics_last_key_ = key;
     avionics_last_upd_s_ = sim_time_sec;
@@ -1601,60 +1807,399 @@ void AircraftAndHud::update_avionics_display_texture(float sim_time_sec) {
         avn_rect(avionics_work_rgba_, W, H, x0, 34, 168, 60, 10, 12, 16);
         uint8_t r = 64, g = 68, b = 74;
         if (bus_ok) {
-            if (ann[i].warn) { r = ann[i].amber ? 250 : 250; g = ann[i].amber ? 178 : 68; b = ann[i].amber ? 48 : 68; }
+            if (ann[i].warn) { r = 250; g = ann[i].amber ? 178 : 68; b = ann[i].amber ? 48 : 68; }
             else if (ann[i].ok_green) { r = 68; g = 242; b = 128; }
         }
         avn_text(avionics_work_rgba_, W, H, x0 + 84, 64, 3, ann[i].lbl, r, g, b);
     }
 
-    // 2. Audio Panel LEDs
+    // 2. GMA 340 Audio Panel LEDs (coupled to live audio_sel_mask & Avionics Bus 1/2 power)
     for (int i = 0; i < 6; ++i) {
         const int bx = 264 + i * 120;
-        const bool lit = (i == 0 && avn1) || (i == 1 && avn2) || (i == 2 && avn1) || (i == 5 && avn1);
+        const bool pwr = (i == 1) ? avn2 : avn1;
+        const bool lit = pwr && ((st_.audio_sel_mask & (1u << i)) != 0);
         avn_rect(avionics_work_rgba_, W, H, bx + 16, 162, 68, 16,
                  lit ? 56 : 18, lit ? 242 : 22, lit ? 122 : 26);
     }
 
-    // 3. NAV / GPS 1 Screen (356..748)
+    // 3. GNS 430 NAV / GPS 1 Glass Display (Left Radio Column 62..306 + Right Multi-Page MFD 328..812)
     avn_rect(avionics_work_rgba_, W, H, 62, 364, 244, 376, 8, 18, 28);
+    constexpr int MX0 = 328, MY0 = 362, MW = 484, MH = 382;
+    const AvnClip mclip{MX0, MY0, MX0 + MW, MY0 + MH};
+    avn_rect(avionics_work_rgba_, W, H, MX0, MY0, MW, MH, 6, 14, 20);
+
     if (avn1) {
-        avn_text(avionics_work_rgba_, W, H, 184, 390, 3, "COM 1", 122, 206, 252);
+        // Left COM1 / VLOC1 radio column
+        avn_text(avionics_work_rgba_, W, H, 184, 388, 3, "COM 1", 122, 206, 252);
         std::snprintf(txt, sizeof(txt), "%.2f", systems_.get_com_active(1));
-        avn_text(avionics_work_rgba_, W, H, 184, 444, 5, txt, 80, 250, 150);
+        avn_text(avionics_work_rgba_, W, H, 184, 438, 5, txt, 80, 250, 150);
         std::snprintf(txt, sizeof(txt), "%.2f", systems_.get_com_standby(1));
-        avn_text(avionics_work_rgba_, W, H, 184, 498, 4, txt, 184, 216, 236);
-        avn_rect(avionics_work_rgba_, W, H, 68, 538, 232, 3, 52, 86, 116);
-        avn_text(avionics_work_rgba_, W, H, 184, 574, 3, st_.ap_nav_source ? "VOR1 LOC" : "GPS NAV", 122, 206, 252);
+        avn_text(avionics_work_rgba_, W, H, 184, 490, 4, txt, 184, 216, 236);
+        avn_rect(avionics_work_rgba_, W, H, 68, 530, 232, 3, 52, 86, 116);
+        avn_text(avionics_work_rgba_, W, H, 184, 560, 3, st_.ap_nav_source ? "VLOC 1" : "GPS 1", 122, 206, 252);
         std::snprintf(txt, sizeof(txt), "%.2f", systems_.get_nav_active(1));
-        avn_text(avionics_work_rgba_, W, H, 184, 626, 5, txt, 80, 250, 150);
+        avn_text(avionics_work_rgba_, W, H, 184, 610, 5, txt, 80, 250, 150);
         const std::string id1 = systems_.get_nav_ident(1);
         if (id1 != "---") {
-            std::snprintf(txt, sizeof(txt), "%s %dN", id1.c_str(), int(std::round(systems_.get_nav_dme_nm(1))));
-            avn_text(avionics_work_rgba_, W, H, 184, 678, 3, txt, 252, 212, 82);
+            const char *tf = systems_.get_nav_to_from(1) > 0 ? "TO" : (systems_.get_nav_to_from(1) < 0 ? "FR" : "--");
+            std::snprintf(txt, sizeof(txt), "%s %s %dN", id1.c_str(), tf, int(std::round(systems_.get_nav_dme_nm(1))));
+            avn_text(avionics_work_rgba_, W, H, 184, 658, 3, txt, 252, 212, 82);
         } else {
             std::snprintf(txt, sizeof(txt), "%.2f", systems_.get_nav_standby(1));
-            avn_text(avionics_work_rgba_, W, H, 184, 678, 3, txt, 170, 200, 224);
+            avn_text(avionics_work_rgba_, W, H, 184, 658, 3, txt, 170, 200, 224);
         }
         std::snprintf(txt, sizeof(txt), "OBS %03d", systems_.get_nav_obs_deg(1));
-        avn_text(avionics_work_rgba_, W, H, 184, 718, 3, txt, 190, 224, 240);
+        avn_text(avionics_work_rgba_, W, H, 184, 694, 3, txt, 190, 224, 240);
+        avn_rect(avionics_work_rgba_, W, H, 76, 712, 216, 24,
+                 st_.ap_nav_source ? 26 : 36, st_.ap_nav_source ? 62 : 24, st_.ap_nav_source ? 36 : 58);
+        avn_text(avionics_work_rgba_, W, H, 184, 724, 2, st_.ap_nav_source ? "CDI: VLOC" : "CDI: GPS",
+                 st_.ap_nav_source ? 92 : 250, st_.ap_nav_source ? 248 : 112, st_.ap_nav_source ? 148 : 242);
 
-        // Overlay live heading, mode & CDI needle on Moving Map (328..812, 362..744)
-        avn_rect(avionics_work_rgba_, W, H, 336, 366, 240, 44, 14, 32, 24);
-        std::snprintf(txt, sizeof(txt), "HDG %03d", hdg_disp);
-        avn_text(avionics_work_rgba_, W, H, 344, 376, 4, txt, 96, 242, 250, false);
-        avn_rect(avionics_work_rgba_, W, H, 344, 694, 456, 48, 12, 26, 20);
-        // Live lateral CDI scale & needle
-        avn_rect(avionics_work_rgba_, W, H, 420, 680, 304, 4, 110, 140, 120);
-        avn_rect(avionics_work_rgba_, W, H, 570, 672, 4, 20, 220, 240, 230);
+        // Compute active GPS waypoint (Direct-To overrides planned route leg)
+        const double cos_lat = std::max(0.2, std::cos(st_.lat_deg * DEG2RAD_D));
+        const double m_per_lat = 111132.0;
+        const double m_per_lon = 111320.0 * cos_lat;
+        const double trk_deg = (gs_kt > 4)
+            ? std::fmod(std::atan2(st_.vel_east_mps, st_.vel_north_mps) * RAD2DEG_D + 360.0, 360.0)
+            : st_.heading_deg;
+        const int trk_i = ((int(std::round(trk_deg)) % 360) + 360) % 360;
+
+        bool has_wp = false;
+        double wp_lat = 0.0, wp_lon = 0.0;
+        std::string wp_lbl = "NONE";
+        if (st_.gps_direct_active) {
+            has_wp = true;
+            wp_lat = st_.gps_direct_lat;
+            wp_lon = st_.gps_direct_lon;
+            wp_lbl = st_.gps_direct_label.empty() ? "DIR" : st_.gps_direct_label;
+        } else if (st_.gps_active_leg < st_.gps_route.size()) {
+            has_wp = true;
+            wp_lat = st_.gps_route[st_.gps_active_leg].lat;
+            wp_lon = st_.gps_route[st_.gps_active_leg].lon;
+            wp_lbl = st_.gps_route[st_.gps_active_leg].label;
+        }
+        double wp_brg_deg = st_.ap_nav_brg_deg;
+        double wp_dis_nm = 0.0;
+        if (has_wp) {
+            const double dn = (wp_lat - st_.lat_deg) * m_per_lat;
+            const double de = (wp_lon - st_.lon_deg) * m_per_lon;
+            wp_dis_nm = std::hypot(de, dn) / 1852.0;
+            wp_brg_deg = std::fmod(std::atan2(de, dn) * RAD2DEG_D + 360.0, 360.0);
+        }
+
+        // Gather sorted nearest airfields (used by NRST page & map labels)
+        struct NrstEntry { const AirportInfo *ap; double dis_nm; double brg_deg; };
+        std::vector<NrstEntry> nearest;
+        if (pack_) {
+            nearest.reserve(pack_->airports().size());
+            for (const auto &ap : pack_->airports()) {
+                const double dn = (ap.lat - st_.lat_deg) * m_per_lat;
+                const double de = (ap.lon - st_.lon_deg) * m_per_lon;
+                const double dis = std::hypot(de, dn) / 1852.0;
+                const double brg = std::fmod(std::atan2(de, dn) * RAD2DEG_D + 360.0, 360.0);
+                nearest.push_back({&ap, dis, brg});
+            }
+            std::sort(nearest.begin(), nearest.end(),
+                      [](const NrstEntry &a, const NrstEntry &b) { return a.dis_nm < b.dis_nm; });
+        }
+
+        const int page = std::clamp(st_.gps_page, 0, 3);
+        const double range_nm = kGpsRangesNm[std::clamp(st_.gps_range_idx, 0, 3)];
         const double cdi = st_.ap_nav_source
             ? systems_.get_nav_cdi(1)
-            : std::clamp(std::remainder(st_.ap_nav_brg_deg - st_.heading_deg, 360.0) / 30.0, -1.0, 1.0);
-        const int nx = 572 + int(std::round(cdi * 140.0));
-        avn_rect(avionics_work_rgba_, W, H, nx - 4, 668, 8, 28, 250, 88, 238);
-        std::snprintf(txt, sizeof(txt), "%s  IND %05dFT", st_.ap_nav_source ? "VLOC" : "GPS", int(std::round(st_.ind_alt_ft)));
-        avn_text(avionics_work_rgba_, W, H, 572, 720, 3, txt, 92, 238, 252);
-    } else {
-        avn_rect(avionics_work_rgba_, W, H, 328, 362, 484, 382, 8, 14, 18);
+            : (has_wp ? std::clamp(std::remainder(wp_brg_deg - trk_deg, 360.0) / 30.0, -1.0, 1.0) : 0.0);
+
+        if (page == 0 || page == 1) {
+            // === PAGE 0: REAL TOPOGRAPHIC MOVING MAP  /  PAGE 1: TAWS TERRAIN CLEARANCE ===
+            const int mcx = MX0 + MW / 2;
+            const int mcy = MY0 + MH / 2 + 12;
+            const double map_rad_px = 148.0;
+            const double range_m = range_nm * 1852.0;
+            const double px_per_m = map_rad_px / range_m;
+            const double m_per_px = range_m / map_rad_px;
+            const double rot_deg = st_.gps_north_up ? 0.0 : trk_deg;
+            const double rot_rad = rot_deg * DEG2RAD_D;
+            const double sr = std::sin(rot_rad), cr = std::cos(rot_rad);
+
+            // 1. Live terrain elevation / TAWS relief rasterized directly from PackReader's resident WorldFrame DEM
+            if (pack_) {
+                const auto wf = pack_->world_frame();
+                const int dw = pack_->corridor_dem_w();
+                const int dh = pack_->corridor_dem_h();
+                if (wf && dw > 1 && dh > 1 && wf->dem.size() == static_cast<size_t>(dw * dh)) {
+                    const double ac_e = (st_.lon_deg - wf->anchor_lon) * wf->metres_lon;
+                    const double ac_n = (st_.lat_deg - wf->anchor_lat) * wf->metres_lat;
+                    const double inv_se = (dw - 1.0) / std::max(1.0, wf->span_e);
+                    const double inv_sn = (dh - 1.0) / std::max(1.0, wf->span_n);
+                    const float ac_alt_m = static_cast<float>(st_.alt_msl_m);
+                    constexpr int STEP = 4;
+                    for (int py = MY0 + 36; py < MY0 + MH - 52; py += STEP) {
+                        const double up_m = (mcy - (py + 2)) * m_per_px;
+                        for (int px = MX0; px < MX0 + MW; px += STEP) {
+                            const double rt_m = ((px + 2) - mcx) * m_per_px;
+                            const double de_m = rt_m * cr + up_m * sr;
+                            const double dn_m = -rt_m * sr + up_m * cr;
+                            const double fx = (ac_e + de_m - wf->min_e) * inv_se;
+                            const double fy = (ac_n + dn_m - wf->min_n) * inv_sn;
+                            uint8_t r = 10, g = 20, b = 26;
+                            if (fx >= 0.0 && fx <= dw - 1.0 && fy >= 0.0 && fy <= dh - 1.0) {
+                                const int ix = std::clamp(int(fx), 0, dw - 2);
+                                const int iy = std::clamp(int(fy), 0, dh - 2);
+                                const float tx = static_cast<float>(fx - ix);
+                                const float ty = static_cast<float>(fy - iy);
+                                const float h00 = wf->dem[static_cast<size_t>(iy * dw + ix)];
+                                const float h10 = wf->dem[static_cast<size_t>(iy * dw + ix + 1)];
+                                const float h01 = wf->dem[static_cast<size_t>((iy + 1) * dw + ix)];
+                                const float h11 = wf->dem[static_cast<size_t>((iy + 1) * dw + ix + 1)];
+                                const float h_m = std::lerp(std::lerp(h00, h10, tx), std::lerp(h01, h11, tx), ty);
+                                const float gx = (h10 - h00);
+                                const float gy = (h01 - h00);
+                                const float shade = std::clamp(0.92f + (gx - gy) * 0.0045f, 0.68f, 1.24f);
+                                if (page == 1) {
+                                    // TAWS terrain clearance relative to aircraft MSL
+                                    const float clr_ft = (ac_alt_m - h_m) * 3.28084f;
+                                    if (h_m <= 1.5f) { r = 10; g = 24; b = 46; }
+                                    else if (clr_ft <= 100.0f) { r = 198; g = 34; b = 30; }
+                                    else if (clr_ft <= 1000.0f) { r = 186; g = 142; b = 24; }
+                                    else if (clr_ft <= 2000.0f) { r = 24; g = 74; b = 34; }
+                                    else { r = 10; g = 16; b = 18; }
+                                } else {
+                                    // Aviation VFR hypsometric topographic chart
+                                    if (h_m <= 1.5f) {
+                                        r = 14; g = 42; b = 78;
+                                    } else if (h_m < 450.0f) {
+                                        const float t = h_m / 450.0f;
+                                        r = static_cast<uint8_t>(std::clamp((18.0f + 16.0f * t) * shade, 0.0f, 255.0f));
+                                        g = static_cast<uint8_t>(std::clamp((48.0f + 22.0f * t) * shade, 0.0f, 255.0f));
+                                        b = static_cast<uint8_t>(std::clamp((26.0f + 10.0f * t) * shade, 0.0f, 255.0f));
+                                    } else if (h_m < 1100.0f) {
+                                        const float t = (h_m - 450.0f) / 650.0f;
+                                        r = static_cast<uint8_t>(std::clamp((34.0f + 56.0f * t) * shade, 0.0f, 255.0f));
+                                        g = static_cast<uint8_t>(std::clamp((70.0f + 12.0f * t) * shade, 0.0f, 255.0f));
+                                        b = static_cast<uint8_t>(std::clamp((36.0f - 4.0f * t) * shade, 0.0f, 255.0f));
+                                    } else if (h_m < 2100.0f) {
+                                        const float t = (h_m - 1100.0f) / 1000.0f;
+                                        r = static_cast<uint8_t>(std::clamp((90.0f + 46.0f * t) * shade, 0.0f, 255.0f));
+                                        g = static_cast<uint8_t>(std::clamp((82.0f + 18.0f * t) * shade, 0.0f, 255.0f));
+                                        b = static_cast<uint8_t>(std::clamp((32.0f + 24.0f * t) * shade, 0.0f, 255.0f));
+                                    } else {
+                                        const float t = std::clamp((h_m - 2100.0f) / 1200.0f, 0.0f, 1.0f);
+                                        r = static_cast<uint8_t>(std::clamp((136.0f + 54.0f * t) * shade, 0.0f, 255.0f));
+                                        g = static_cast<uint8_t>(std::clamp((100.0f + 86.0f * t) * shade, 0.0f, 255.0f));
+                                        b = static_cast<uint8_t>(std::clamp((56.0f + 130.0f * t) * shade, 0.0f, 255.0f));
+                                    }
+                                }
+                            }
+                            avn_rect_clip(avionics_work_rgba_, W, H, mclip, px, py, STEP, STEP, r, g, b);
+                        }
+                    }
+                }
+            }
+
+            auto geo_to_map = [&](double lat, double lon, int &ox, int &oy) -> bool {
+                const double de = (lon - st_.lon_deg) * m_per_lon;
+                const double dn = (lat - st_.lat_deg) * m_per_lat;
+                const double up = de * sr + dn * cr;
+                const double rt = de * cr - dn * sr;
+                ox = mcx + static_cast<int>(std::lround(rt * px_per_m));
+                oy = mcy - static_cast<int>(std::lround(up * px_per_m));
+                return (ox >= MX0 - 40 && ox <= MX0 + MW + 40 && oy >= MY0 - 40 && oy <= MY0 + MH + 40);
+            };
+
+            // 2. Range rings & compass tick marks
+            avn_circle(avionics_work_rgba_, W, H, mclip, mcx, mcy, 138, 2, 72, 132, 128, 170);
+            avn_circle(avionics_work_rgba_, W, H, mclip, mcx, mcy, 69, 1, 64, 114, 110, 130);
+            for (int d = 0; d < 360; d += 30) {
+                const double a = (double(d) - rot_deg) * DEG2RAD_D;
+                const double sa = std::sin(a), ca = std::cos(a);
+                const int r0 = (d % 90 == 0) ? 128 : 132;
+                avn_line(avionics_work_rgba_, W, H, mclip,
+                         mcx + int(std::lround(sa * r0)), mcy - int(std::lround(ca * r0)),
+                         mcx + int(std::lround(sa * 140)), mcy - int(std::lround(ca * 140)),
+                         2, 130, 210, 210, 200);
+            }
+            {
+                const double na = -rot_rad;
+                const int nx = mcx + int(std::lround(std::sin(na) * 120.0));
+                const int ny = mcy - int(std::lround(std::cos(na) * 120.0));
+                avn_text_clip(avionics_work_rgba_, W, H, mclip, nx, ny, 2, "N", 252, 214, 86);
+            }
+
+            // 3. Real Northern Spain VOR-DME stations
+            for (const auto &v : kSpainVors) {
+                int vx = 0, vy = 0;
+                if (!geo_to_map(v.lat, v.lon, vx, vy)) continue;
+                if (vx < MX0 + 8 || vx > MX0 + MW - 8 || vy < MY0 + 40 || vy > MY0 + MH - 56) continue;
+                const bool tuned = (systems_.get_nav_ident(1) == v.ident);
+                const uint8_t cr_v = tuned ? 96 : 64, cg_v = tuned ? 250 : 210, cb_v = tuned ? 255 : 244;
+                avn_circle(avionics_work_rgba_, W, H, mclip, vx, vy, 7, 2, cr_v, cg_v, cb_v);
+                avn_fill_circle(avionics_work_rgba_, W, H, mclip, vx, vy, 2, cr_v, cg_v, cb_v);
+                avn_text_clip(avionics_work_rgba_, W, H, mclip, vx + 26, vy - 2, 2, v.ident, cr_v, cg_v, cb_v);
+            }
+
+            // 4. Real Region Airfields + Oriented Runway Strips from PackReader
+            int drawn_ap_labels = 0;
+            for (const auto &ne : nearest) {
+                if (ne.dis_nm > range_nm * 1.45) break;
+                const auto &ap = *ne.ap;
+                int ax = 0, ay = 0;
+                if (!geo_to_map(ap.lat, ap.lon, ax, ay)) continue;
+                if (ax < MX0 + 6 || ax > MX0 + MW - 6 || ay < MY0 + 40 || ay > MY0 + MH - 56) continue;
+                const bool is_target = (has_wp && wp_lbl == ap.id);
+                const uint8_t ar = is_target ? 255 : 196, ag = is_target ? 110 : 226, ab = is_target ? 245 : 255;
+                avn_fill_circle(avionics_work_rgba_, W, H, mclip, ax, ay, 5, ar, ag, ab);
+                int rx0 = 0, ry0 = 0, rx1 = 0, ry1 = 0;
+                geo_to_map(ap.rwy_lat_a, ap.rwy_lon_a, rx0, ry0);
+                geo_to_map(ap.rwy_lat_b, ap.rwy_lon_b, rx1, ry1);
+                if (std::hypot(rx1 - rx0, ry1 - ry0) < 10.0) {
+                    const double rdn = (ap.rwy_lat_b - ap.rwy_lat_a) * m_per_lat;
+                    const double rde = (ap.rwy_lon_b - ap.rwy_lon_a) * m_per_lon;
+                    const double rh = std::atan2(rde, rdn) - rot_rad;
+                    const int dxr = int(std::lround(std::sin(rh) * 8.0));
+                    const int dyr = int(std::lround(std::cos(rh) * 8.0));
+                    avn_line(avionics_work_rgba_, W, H, mclip, ax - dxr, ay + dyr, ax + dxr, ay - dyr, 3, 240, 245, 250);
+                } else {
+                    avn_line(avionics_work_rgba_, W, H, mclip, rx0, ry0, rx1, ry1, 3, 240, 245, 250);
+                }
+                if (drawn_ap_labels < 9 || is_target) {
+                    avn_rect_clip(avionics_work_rgba_, W, H, mclip, ax + 8, ay - 14, static_cast<int>(ap.id.size()) * 12 + 6, 18, 8, 16, 22, 195);
+                    avn_text_clip(avionics_work_rgba_, W, H, mclip, ax + 11, ay - 11, 2, ap.id.c_str(),
+                                  is_target ? 255 : 248, is_target ? 120 : 226, is_target ? 250 : 96, false);
+                    ++drawn_ap_labels;
+                }
+            }
+
+            // 5. Planned VFR Route Legs (White) + Active Leg / Direct-To Magenta Course Line
+            if (!st_.gps_route.empty()) {
+                for (size_t i = 0; i + 1 < st_.gps_route.size(); ++i) {
+                    int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+                    geo_to_map(st_.gps_route[i].lat, st_.gps_route[i].lon, x0, y0);
+                    geo_to_map(st_.gps_route[i + 1].lat, st_.gps_route[i + 1].lon, x1, y1);
+                    const bool active_seg = (!st_.gps_direct_active && i + 1 == st_.gps_active_leg);
+                    avn_line(avionics_work_rgba_, W, H, mclip, x0, y0, x1, y1,
+                             active_seg ? 4 : 2, active_seg ? 250 : 210, active_seg ? 76 : 220, active_seg ? 242 : 230);
+                }
+            }
+            if (has_wp) {
+                int wx = 0, wy = 0;
+                geo_to_map(wp_lat, wp_lon, wx, wy);
+                avn_line(avionics_work_rgba_, W, H, mclip, mcx, mcy, wx, wy, 4, 252, 82, 244);
+                avn_fill_circle(avionics_work_rgba_, W, H, mclip, wx, wy, 5, 255, 110, 250);
+            }
+
+            // 6. Ownship Airplane Silhouette
+            {
+                const double ac_rel = (st_.heading_deg - rot_deg) * DEG2RAD_D;
+                const double s = std::sin(ac_rel), c = std::cos(ac_rel);
+                auto rot_pt = [&](double rx, double ry, int &ox, int &oy) {
+                    ox = mcx + int(std::lround(rx * c + ry * s));
+                    oy = mcy - int(std::lround(-rx * s + ry * c));
+                };
+                int nx, ny, tx, ty, wl_x, wl_y, wr_x, wr_y, tl_x, tl_y, tr_x, tr_y;
+                rot_pt(0, 15, nx, ny); rot_pt(0, -13, tx, ty);
+                rot_pt(-14, 1, wl_x, wl_y); rot_pt(14, 1, wr_x, wr_y);
+                rot_pt(-6, -11, tl_x, tl_y); rot_pt(6, -11, tr_x, tr_y);
+                avn_line(avionics_work_rgba_, W, H, mclip, nx, ny, tx, ty, 4, 252, 252, 255);
+                avn_line(avionics_work_rgba_, W, H, mclip, wl_x, wl_y, wr_x, wr_y, 4, 252, 252, 255);
+                avn_line(avionics_work_rgba_, W, H, mclip, tl_x, tl_y, tr_x, tr_y, 3, 252, 252, 255);
+            }
+
+            // 7. Crisp GNS 430 Top & Bottom Telemetry Bars
+            avn_rect(avionics_work_rgba_, W, H, MX0, MY0, MW, 36, 10, 20, 28);
+            avn_rect(avionics_work_rgba_, W, H, MX0, MY0 + 35, MW, 2, 48, 86, 112);
+            std::snprintf(txt, sizeof(txt), "%s %03d  GS %03d", st_.gps_north_up ? "N-UP" : "TRK", trk_i, gs_kt);
+            avn_text(avionics_work_rgba_, W, H, MX0 + 8, MY0 + 10, 2, txt, 96, 242, 252, false);
+            if (has_wp) {
+                std::snprintf(txt, sizeof(txt), "%s %.1fN", wp_lbl.substr(0, 7).c_str(), wp_dis_nm);
+                avn_text(avionics_work_rgba_, W, H, MX0 + MW - 8 - int(std::strlen(txt)) * 12, MY0 + 10, 2, txt, 255, 112, 248, false);
+            } else {
+                const char *mode_tag = (page == 1) ? "TAWS TERR" : "MAP VFR";
+                avn_text(avionics_work_rgba_, W, H, MX0 + MW - 8 - int(std::strlen(mode_tag)) * 12, MY0 + 10, 2, mode_tag, 252, 214, 86, false);
+            }
+
+            avn_rect(avionics_work_rgba_, W, H, MX0, MY0 + MH - 52, MW, 52, 10, 20, 26);
+            avn_rect(avionics_work_rgba_, W, H, MX0, MY0 + MH - 52, MW, 2, 48, 86, 112);
+            for (int k = -4; k <= 4; ++k) {
+                const int dx = MX0 + MW / 2 + k * 28;
+                if (k == 0) avn_rect(avionics_work_rgba_, W, H, dx - 2, MY0 + MH - 46, 4, 16, 220, 236, 242);
+                else avn_fill_circle(avionics_work_rgba_, W, H, mclip, dx, MY0 + MH - 38, 3, 150, 180, 195);
+            }
+            const int cdi_x = MX0 + MW / 2 + int(std::round(cdi * 112.0));
+            avn_rect(avionics_work_rgba_, W, H, cdi_x - 3, MY0 + MH - 48, 6, 20,
+                     st_.ap_nav_source ? 92 : 252, st_.ap_nav_source ? 248 : 92, st_.ap_nav_source ? 148 : 244);
+            std::snprintf(txt, sizeof(txt), "%s RNG %dNM %s %05dFT",
+                          (page == 1) ? "TERR" : "MAP", int(range_nm),
+                          st_.ap_nav_source ? "VLOC" : "GPS", int(std::round(st_.ind_alt_ft)));
+            avn_text(avionics_work_rgba_, W, H, MX0 + MW / 2, MY0 + MH - 14, 2, txt, 96, 240, 252);
+        } else if (page == 2) {
+            // === PAGE 2: NEAREST AIRPORTS (NRST) ===
+            avn_rect(avionics_work_rgba_, W, H, MX0, MY0, MW, 40, 12, 28, 42);
+            avn_text(avionics_work_rgba_, W, H, MX0 + MW / 2, MY0 + 20, 3, "NRST AIRPORTS (D->)", 96, 242, 252);
+            avn_rect(avionics_work_rgba_, W, H, MX0, MY0 + 40, MW, 2, 56, 110, 146);
+            avn_text(avionics_work_rgba_, W, H, MX0 + 16, MY0 + 54, 2, "ICAO     BRG   DIS   FREQ   ELEV", 156, 198, 220, false);
+            const int n_show = std::min<int>(5, static_cast<int>(nearest.size()));
+            const int sel = (n_show > 0) ? (st_.gps_nrst_cursor % n_show + n_show) % n_show : 0;
+            for (int i = 0; i < n_show; ++i) {
+                const auto &ne = nearest[static_cast<size_t>(i)];
+                const int ry = MY0 + 82 + i * 50;
+                const bool hi = (i == sel);
+                if (hi) avn_rect(avionics_work_rgba_, W, H, MX0 + 8, ry - 6, MW - 16, 42, 26, 62, 88);
+                std::snprintf(txt, sizeof(txt), "%-7s %03d %5.1fN %6.2f %4d",
+                              ne.ap->id.substr(0, 7).c_str(),
+                              int(std::lround(ne.brg_deg)) % 360,
+                              ne.dis_nm, ne.ap->freq_mhz,
+                              int(std::lround(ne.ap->elev_m * 3.28084)));
+                avn_text(avionics_work_rgba_, W, H, MX0 + 14, ry + 8, 2, txt,
+                         hi ? 255 : 226, hi ? 236 : 242, hi ? 96 : 248, false);
+            }
+            avn_rect(avionics_work_rgba_, W, H, MX0, MY0 + MH - 44, MW, 44, 10, 20, 28);
+            avn_text(avionics_work_rgba_, W, H, MX0 + MW / 2, MY0 + MH - 22, 2, "RNG:NEXT  ENT:TUNE  D->:DIRECT", 120, 224, 240);
+        } else {
+            // === PAGE 3: DIGITAL GLASS HSI / DEFAULT NAV PAGE ===
+            avn_rect(avionics_work_rgba_, W, H, MX0, MY0, MW, 38, 12, 28, 42);
+            std::snprintf(txt, sizeof(txt), "NAV HSI  %s  %s", st_.ap_nav_source ? "VLOC1" : "GPS", wp_lbl.substr(0, 8).c_str());
+            avn_text(avionics_work_rgba_, W, H, MX0 + MW / 2, MY0 + 19, 3, txt, 96, 242, 252);
+            const int hcx = MX0 + 150, hcy = MY0 + 206, hrad = 104;
+            avn_circle(avionics_work_rgba_, W, H, mclip, hcx, hcy, hrad, 3, 120, 178, 204);
+            for (int d = 0; d < 360; d += 30) {
+                const double a = (double(d) - st_.heading_deg) * DEG2RAD_D;
+                const double sa = std::sin(a), ca = std::cos(a);
+                avn_line(avionics_work_rgba_, W, H, mclip,
+                         hcx + int(std::lround(sa * (hrad - 12))), hcy - int(std::lround(ca * (hrad - 12))),
+                         hcx + int(std::lround(sa * hrad)), hcy - int(std::lround(ca * hrad)),
+                         2, 210, 232, 242);
+            }
+            avn_fill_tri(avionics_work_rgba_, W, H, mclip, hcx, hcy - hrad - 2, hcx - 8, hcy - hrad - 14, hcx + 8, hcy - hrad - 14, 252, 178, 48);
+            const double crs_deg = st_.ap_nav_source ? double(systems_.get_nav_obs_deg(1)) : wp_brg_deg;
+            const double ca_r = (crs_deg - st_.heading_deg) * DEG2RAD_D;
+            const double sc = std::sin(ca_r), cc = std::cos(ca_r);
+            const uint8_t cr_c = st_.ap_nav_source ? 88 : 252, cg_c = st_.ap_nav_source ? 248 : 92, cb_c = st_.ap_nav_source ? 148 : 244;
+            avn_line(avionics_work_rgba_, W, H, mclip,
+                     hcx + int(std::lround(sc * 44)), hcy - int(std::lround(cc * 44)),
+                     hcx + int(std::lround(sc * (hrad - 8))), hcy - int(std::lround(cc * (hrad - 8))), 4, cr_c, cg_c, cb_c);
+            avn_line(avionics_work_rgba_, W, H, mclip,
+                     hcx - int(std::lround(sc * 44)), hcy + int(std::lround(cc * 44)),
+                     hcx - int(std::lround(sc * (hrad - 12))), hcy + int(std::lround(cc * (hrad - 12))), 4, cr_c, cg_c, cb_c);
+            const double dev_px = cdi * 48.0;
+            const double rx = cc * dev_px, ry = -sc * dev_px;
+            avn_line(avionics_work_rgba_, W, H, mclip,
+                     hcx + int(std::lround(rx + sc * 42)), hcy - int(std::lround(ry + cc * 42)),
+                     hcx + int(std::lround(rx - sc * 42)), hcy - int(std::lround(ry - cc * 42)), 5, cr_c, cg_c, cb_c);
+            const int dx0 = MX0 + 286;
+            std::snprintf(txt, sizeof(txt), "TRK %03d", trk_i);
+            avn_text(avionics_work_rgba_, W, H, dx0, MY0 + 78, 3, txt, 240, 248, 255, false);
+            std::snprintf(txt, sizeof(txt), "DTK %03d", int(std::lround(crs_deg)) % 360);
+            avn_text(avionics_work_rgba_, W, H, dx0, MY0 + 124, 3, txt, cr_c, cg_c, cb_c, false);
+            std::snprintf(txt, sizeof(txt), "GS %3dKT", gs_kt);
+            avn_text(avionics_work_rgba_, W, H, dx0, MY0 + 170, 3, txt, 96, 242, 252, false);
+            std::snprintf(txt, sizeof(txt), "DIS %4.1f", has_wp ? wp_dis_nm : systems_.get_nav_dme_nm(1));
+            avn_text(avionics_work_rgba_, W, H, dx0, MY0 + 216, 3, txt, 252, 214, 86, false);
+            const int ete_min = (gs_kt > 10 && has_wp) ? std::min(599, int(std::lround((wp_dis_nm / double(gs_kt)) * 60.0))) : 0;
+            std::snprintf(txt, sizeof(txt), "ETE %02d:%02d", ete_min / 60, ete_min % 60);
+            avn_text(avionics_work_rgba_, W, H, dx0, MY0 + 262, 3, txt, 190, 232, 240, false);
+            std::snprintf(txt, sizeof(txt), "ALT %05d", int(std::round(st_.ind_alt_ft)));
+            avn_text(avionics_work_rgba_, W, H, dx0, MY0 + 308, 3, txt, 236, 244, 248, false);
+        }
     }
 
     // 4. COM 2 / NAV 2 Screen (148..876, 880..996)
@@ -1709,6 +2254,7 @@ void AircraftAndHud::update_avionics_display_texture(float sim_time_sec) {
             std::snprintf(txt, sizeof(txt), "FL%03d", ind_fl);
             avn_text(avionics_work_rgba_, W, H, 232, 1396, 3, txt, 210, 190, 110);
         }
+        if (xpdr_r) avn_text(avionics_work_rgba_, W, H, 336, 1362, 3, "R", 92, 248, 146);
         std::snprintf(txt, sizeof(txt), "%04d", systems_.get_xpdr_squawk());
         avn_text(avionics_work_rgba_, W, H, 504, 1376, 7, txt, 255, 224, 78);
     }
@@ -1716,6 +2262,215 @@ void AircraftAndHud::update_avionics_display_texture(float sim_time_sec) {
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glTextureSubImage2D(avionics_tex_, 0, 0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, avionics_work_rgba_.data());
     glGenerateTextureMipmap(avionics_tex_);
+}
+
+void AircraftAndHud::update_davtron_and_steam_textures(float sim_time_sec, const AtmosphereState &atmo) {
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+
+    // 1. Live Davtron M803 Amber OAT / Bus Volts / UTC / QNH Digital Glass Display on PanelFace2K
+    if (panel_face_tex_ && davtron_base_rgba_.size() == static_cast<size_t>(kDavW * kDavH) * 4u) {
+        if (davtron_last_upd_s_ < 0.0f || sim_time_sec < davtron_last_upd_s_ ||
+            (sim_time_sec - davtron_last_upd_s_) >= 0.45f) {
+            const bool pwr = systems_.get_master_battery() && systems_.get_bus_volts() >= 14.0;
+            const int oat_c = int(std::lround(last_air_.oat_c));
+            const int v10 = int(std::lround(systems_.get_bus_volts() * 10.0));
+            const int baro_i = int(std::lround(systems_.get_baro_hpa()));
+            int utc_min = ((int(std::lround(atmo.day_cycle_phase * 1440.0)) % 1440) + 1440) % 1440;
+            if (auto pos = atmo.hud_wx_line.find(':'); pos != std::string::npos && pos >= 2 && pos + 2 < atmo.hud_wx_line.size()) {
+                const char h0 = atmo.hud_wx_line[pos - 2], h1 = atmo.hud_wx_line[pos - 1];
+                const char m0 = atmo.hud_wx_line[pos + 1], m1 = atmo.hud_wx_line[pos + 2];
+                if (h0 >= '0' && h0 <= '9' && h1 >= '0' && h1 <= '9' && m0 >= '0' && m0 <= '9' && m1 >= '0' && m1 <= '9') {
+                    utc_min = ((h0 - '0') * 10 + (h1 - '0')) * 60 + ((m0 - '0') * 10 + (m1 - '0'));
+                }
+            }
+            char dkey[64];
+            std::snprintf(dkey, sizeof(dkey), "%d|%d|%d|%d|%d", pwr ? 1 : 0, oat_c, v10, utc_min, baro_i);
+            if (dkey != davtron_last_key_) {
+                davtron_last_key_ = dkey;
+                davtron_last_upd_s_ = sim_time_sec;
+                std::memcpy(davtron_work_rgba_.data(), davtron_base_rgba_.data(), davtron_base_rgba_.size());
+                avn_rect(davtron_work_rgba_, kDavW, kDavH, 8, 7, kDavW - 16, kDavH - 14, 10, 14, 18);
+                if (pwr) {
+                    char l1[32], l2[32];
+                    std::snprintf(l1, sizeof(l1), "OAT %+3dC %4.1fV", oat_c, v10 * 0.1);
+                    std::snprintf(l2, sizeof(l2), "UTC %02d:%02d %4d", (utc_min / 60) % 24, utc_min % 60, baro_i);
+                    const bool lv = systems_.get_low_volts_annunciator();
+                    avn_text(davtron_work_rgba_, kDavW, kDavH, kDavW / 2, 28, 2, l1, 255, lv ? 86 : 196, lv ? 72 : 64);
+                    avn_text(davtron_work_rgba_, kDavW, kDavH, kDavW / 2, 60, 2, l2, 255, 196, 64);
+                }
+                glTextureSubImage2D(panel_face_tex_, 0, kDavX, kDavY, kDavW, kDavH,
+                                    GL_RGBA, GL_UNSIGNED_BYTE, davtron_work_rgba_.data());
+                glGenerateTextureMipmap(panel_face_tex_);
+            }
+        }
+    }
+
+    // 2. Live Sub-Cell Instrument Displays inside SteamDials (Kollsman, Slip Ball, Hobbs, VOR1 CDI/OBS, Fuel/Oil)
+    if (!steam_dials_tex_ || steam_base_rgba_.size() != 1536u * 1536u * 4u) return;
+    if (steam_last_upd_s_ >= 0.0f && sim_time_sec >= steam_last_upd_s_ &&
+        (sim_time_sec - steam_last_upd_s_) < 0.16f) return;
+    steam_last_upd_s_ = sim_time_sec;
+
+    bool any_steam_dirty = false;
+    auto copy_base_sub = [&](int sx, int sy, int sw, int sh) {
+        steam_cell_rgba_.resize(static_cast<size_t>(sw * sh) * 4u);
+        for (int y = 0; y < sh; ++y) {
+            std::memcpy(steam_cell_rgba_.data() + static_cast<size_t>(y * sw) * 4u,
+                        steam_base_rgba_.data() + static_cast<size_t>((sy + y) * 1536 + sx) * 4u,
+                        static_cast<size_t>(sw) * 4u);
+        }
+    };
+    char skey[96], txt[48];
+
+    // 2a. Altimeter Kollsman Baro Window (cell 2,0 -> 1352, 235, 100x42)
+    const int baro_i = int(std::lround(systems_.get_baro_hpa()));
+    std::snprintf(skey, sizeof(skey), "%d", baro_i);
+    if (skey != steam_kol_key_) {
+        steam_kol_key_ = skey;
+        constexpr int KX = 1352, KY = 235, KW = 100, KH = 42;
+        copy_base_sub(KX, KY, KW, KH);
+        avn_rect(steam_cell_rgba_, KW, KH, 4, 4, KW - 8, KH - 8, 22, 26, 32);
+        std::snprintf(txt, sizeof(txt), "%04d", baro_i);
+        avn_text(steam_cell_rgba_, KW, KH, KW / 2, KH / 2, 3, txt, 248, 250, 242);
+        glTextureSubImage2D(steam_dials_tex_, 0, KX, KY, KW, KH, GL_RGBA, GL_UNSIGNED_BYTE, steam_cell_rgba_.data());
+        any_steam_dirty = true;
+    }
+
+    // 2b. Turn Coordinator Inclinometer Slip/Skid Ball (cell 0,1 -> 156, 848, 200x50)
+    const double slip_norm = std::clamp(-fdm_.state().beta_deg / 12.0, -1.0, 1.0);
+    const int ball_q = int(std::lround(slip_norm * 24.0));
+    std::snprintf(skey, sizeof(skey), "%d", ball_q);
+    if (skey != steam_tc_key_) {
+        steam_tc_key_ = skey;
+        constexpr int TX = 156, TY = 848, TW = 200, TH = 50;
+        copy_base_sub(TX, TY, TW, TH);
+        const AvnClip tc_clip{6, 6, TW - 6, TH - 6};
+        avn_rect(steam_cell_rgba_, TW, TH, 8, 8, TW - 16, TH - 16, 224, 228, 214);
+        const int bx = TW / 2 + int(std::lround((ball_q / 24.0) * 66.0));
+        avn_fill_circle(steam_cell_rgba_, TW, TH, tc_clip, bx, TH / 2, 15, 22, 24, 28);
+        avn_fill_circle(steam_cell_rgba_, TW, TH, tc_clip, bx - 4, TH / 2 - 4, 4, 90, 96, 104);
+        avn_rect(steam_cell_rgba_, TW, TH, TW / 2 - 22, 6, 4, TH - 12, 24, 28, 32);
+        avn_rect(steam_cell_rgba_, TW, TH, TW / 2 + 18, 6, 4, TH - 12, 24, 28, 32);
+        glTextureSubImage2D(steam_dials_tex_, 0, TX, TY, TW, TH, GL_RGBA, GL_UNSIGNED_BYTE, steam_cell_rgba_.data());
+        any_steam_dirty = true;
+    }
+
+    // 2c. Tachometer Mechanical Hobbs Hourmeter (cell 0,2 -> 184, 1355, 144x36)
+    const int hobbs10 = std::max(0, int(std::floor(st_.hobbs_hours * 10.0)));
+    std::snprintf(skey, sizeof(skey), "%d", hobbs10);
+    if (skey != steam_hobbs_key_) {
+        steam_hobbs_key_ = skey;
+        constexpr int HX = 184, HY = 1355, HW = 144, HH = 36;
+        copy_base_sub(HX, HY, HW, HH);
+        avn_rect(steam_cell_rgba_, HW, HH, 3, 3, HW - 6, HH - 6, 10, 12, 15);
+        std::snprintf(txt, sizeof(txt), "%05d.%d", hobbs10 / 10, hobbs10 % 10);
+        avn_text(steam_cell_rgba_, HW, HH, HW / 2, HH / 2, 3, txt, 244, 246, 238);
+        glTextureSubImage2D(steam_dials_tex_, 0, HX, HY, HW, HH, GL_RGBA, GL_UNSIGNED_BYTE, steam_cell_rgba_.data());
+        any_steam_dirty = true;
+    }
+
+    // 2d. VOR1 / GPS CDI Indicator (cell 1,2 -> 512, 1024, 512x512)
+    const bool avn1 = systems_.is_avionics_bus_powered(1);
+    const int obs_deg = systems_.get_nav_obs_deg(1);
+    const int tf_val = st_.ap_nav_source ? systems_.get_nav_to_from(1) : (st_.ap_nav_valid ? 1 : 0);
+    const double cdi_val = st_.ap_nav_source
+        ? systems_.get_nav_cdi(1)
+        : (st_.ap_nav_valid ? std::clamp(std::remainder(st_.ap_nav_brg_deg - st_.heading_deg, 360.0) / 30.0, -1.0, 1.0) : 0.0);
+    const int cdi_q = int(std::lround(cdi_val * 24.0));
+    std::snprintf(skey, sizeof(skey), "%d|%d|%d|%d|%d", avn1 ? 1 : 0, st_.ap_nav_source, obs_deg, tf_val, cdi_q);
+    if (skey != steam_vor_key_) {
+        steam_vor_key_ = skey;
+        constexpr int VX = 512, VY = 1024, VS = 512;
+        copy_base_sub(VX, VY, VS, VS);
+        const AvnClip vc{0, 0, VS, VS};
+        constexpr int CX = 256, CY = 256;
+        avn_fill_circle(steam_cell_rgba_, VS, VS, vc, CX, CY, 224, 16, 18, 22);
+        for (int d = 0; d < 360; d += 10) {
+            const double a = (double(d - obs_deg) - 90.0) * DEG2RAD_D;
+            const double ca = std::cos(a), sa = std::sin(a);
+            const int r0 = (d % 30 == 0) ? 186 : 202;
+            avn_line(steam_cell_rgba_, VS, VS, vc,
+                     CX + int(std::lround(ca * r0)), CY + int(std::lround(sa * r0)),
+                     CX + int(std::lround(ca * 218)), CY + int(std::lround(sa * 218)),
+                     (d % 30 == 0) ? 4 : 2, 236, 240, 234);
+            if (d % 30 == 0) {
+                const char *lbl = (d == 0) ? "N" : (d == 90) ? "E" : (d == 180) ? "S" : (d == 270) ? "W" : nullptr;
+                char nb[8];
+                if (!lbl) { std::snprintf(nb, sizeof(nb), "%d", d / 10); lbl = nb; }
+                const uint8_t cr = (d % 90 == 0) ? 252 : 238, cg = (d % 90 == 0) ? 204 : 242, cb = (d % 90 == 0) ? 74 : 236;
+                avn_text_clip(steam_cell_rgba_, VS, VS, vc,
+                              CX + int(std::lround(ca * 158)), CY + int(std::lround(sa * 158)), 3, lbl, cr, cg, cb);
+            }
+        }
+        avn_fill_tri(steam_cell_rgba_, VS, VS, vc, CX, CY - 188, CX - 12, CY - 216, CX + 12, CY - 216, 252, 132, 28);
+        for (int k = -4; k <= 4; ++k) {
+            avn_fill_circle(steam_cell_rgba_, VS, VS, vc, CX + k * 27, CY, 5, 236, 240, 234);
+        }
+        if (!avn1 || tf_val == 0) {
+            avn_rect_clip(steam_cell_rgba_, VS, VS, vc, CX + 34, CY - 46, 66, 30, 198, 42, 38);
+            avn_text_clip(steam_cell_rgba_, VS, VS, vc, CX + 67, CY - 31, 2, "NAV", 252, 248, 244);
+        } else if (tf_val > 0) {
+            avn_fill_tri(steam_cell_rgba_, VS, VS, vc, CX + 56, CY - 50, CX + 38, CY - 22, CX + 74, CY - 22, 246, 246, 234);
+            avn_text_clip(steam_cell_rgba_, VS, VS, vc, CX + 56, CY + 36, 2, "TO", 210, 224, 234);
+        } else {
+            avn_fill_tri(steam_cell_rgba_, VS, VS, vc, CX + 56, CY + 50, CX + 38, CY + 22, CX + 74, CY + 22, 246, 246, 234);
+            avn_text_clip(steam_cell_rgba_, VS, VS, vc, CX + 56, CY - 36, 2, "FR", 210, 224, 234);
+        }
+        avn_text_clip(steam_cell_rgba_, VS, VS, vc, CX - 64, CY - 34, 2, st_.ap_nav_source ? "VOR" : "GPS",
+                      st_.ap_nav_source ? 96 : 250, st_.ap_nav_source ? 236 : 112, st_.ap_nav_source ? 160 : 242);
+        const int nx = CX + (avn1 ? int(std::lround((cdi_q / 24.0) * 108.0)) : 0);
+        avn_rect_clip(steam_cell_rgba_, VS, VS, vc, nx - 4, CY - 116, 8, 232,
+                      st_.ap_nav_source ? 248 : 252, st_.ap_nav_source ? 248 : 112, st_.ap_nav_source ? 242 : 244);
+        glTextureSubImage2D(steam_dials_tex_, 0, VX, VY, VS, VS, GL_RGBA, GL_UNSIGNED_BYTE, steam_cell_rgba_.data());
+        any_steam_dirty = true;
+    }
+
+    // 2e. Dual Engine Cluster FUEL L/R & OIL T/P (cell 2,2 -> 1024, 1024, 512x512)
+    const bool bus_ok = systems_.get_master_battery() && systems_.get_bus_volts() >= 14.0;
+    const double cap_l = std::max(1.0, systems_.configuration().left_tank_capacity_gal);
+    const double cap_r = std::max(1.0, systems_.configuration().right_tank_capacity_gal);
+    const int fl_q = bus_ok ? int(std::lround(std::clamp(systems_.get_left_tank_gal() / cap_l, 0.0, 1.0) * 100.0)) : 0;
+    const int fr_q = bus_ok ? int(std::lround(std::clamp(systems_.get_right_tank_gal() / cap_r, 0.0, 1.0) * 100.0)) : 0;
+    const int ot_q = bus_ok ? int(std::lround(std::clamp((systems_.get_oil_temp_f() - 60.0) / 190.0, 0.0, 1.0) * 100.0)) : 0;
+    const int op_q = bus_ok ? int(std::lround(std::clamp(systems_.get_oil_press_psi() / 115.0, 0.0, 1.0) * 100.0)) : 0;
+    std::snprintf(skey, sizeof(skey), "%d|%d|%d|%d|%d", bus_ok ? 1 : 0, fl_q, fr_q, ot_q, op_q);
+    if (skey != steam_eng_key_) {
+        steam_eng_key_ = skey;
+        constexpr int EX = 1024, EY = 1024, ES = 512;
+        copy_base_sub(EX, EY, ES, ES);
+        constexpr int CX = 256, CY = 256;
+        auto draw_dual_bar = [&](int center_x, int q0, bool warn0, bool crit0, int q1, bool warn1, bool crit1) {
+            constexpr int BY0 = CY - 68, BH = 152, BW = 20;
+            avn_rect(steam_cell_rgba_, ES, ES, center_x - 32, BY0 - 4, 64, BH + 8, 16, 18, 22);
+            auto one_bar = [&](int bx, int q, bool warn, bool crit) {
+                avn_rect(steam_cell_rgba_, ES, ES, bx, BY0, BW, BH, 28, 32, 38);
+                avn_rect(steam_cell_rgba_, ES, ES, bx + 2, BY0 + 2, BW - 4, BH - 4, 18, 20, 24);
+                const int fill_h = (std::clamp(q, 0, 100) * (BH - 8)) / 100;
+                if (fill_h > 0) {
+                    const uint8_t r = crit ? 242 : (warn ? 246 : 42);
+                    const uint8_t g = crit ? 54 : (warn ? 186 : 204);
+                    const uint8_t b = crit ? 48 : (warn ? 42 : 94);
+                    avn_rect(steam_cell_rgba_, ES, ES, bx + 4, BY0 + BH - 4 - fill_h, BW - 8, fill_h, r, g, b);
+                }
+            };
+            one_bar(center_x - 24, q0, warn0, crit0);
+            one_bar(center_x + 4,  q1, warn1, crit1);
+        };
+        draw_dual_bar(CX - 96,
+                      fl_q, systems_.get_left_tank_gal() < 5.0, systems_.get_left_tank_gal() < 2.0,
+                      fr_q, systems_.get_right_tank_gal() < 5.0, systems_.get_right_tank_gal() < 2.0);
+        draw_dual_bar(CX + 96,
+                      ot_q, systems_.get_oil_temp_f() > 220.0 || (systems_.is_engine_running() && systems_.get_oil_temp_f() < 100.0),
+                      systems_.get_oil_temp_f() > 240.0,
+                      op_q, systems_.is_engine_running() && (systems_.get_oil_press_psi() < 40.0 || systems_.get_oil_press_psi() > 95.0),
+                      systems_.is_engine_running() && systems_.get_oil_press_psi() < 25.0);
+        glTextureSubImage2D(steam_dials_tex_, 0, EX, EY, ES, ES, GL_RGBA, GL_UNSIGNED_BYTE, steam_cell_rgba_.data());
+        any_steam_dirty = true;
+    }
+
+    if (any_steam_dirty) {
+        glGenerateTextureMipmap(steam_dials_tex_);
+    }
 }
 
 void AircraftAndHud::draw_glb(
@@ -2000,7 +2755,8 @@ void AircraftAndHud::render_aircraft_3d(const Mat4 &vp, const Vec3 &cam_off, con
     };
 
     if (st_.view_mode == 0) {
-        update_avionics_display_texture(sim_time_sec);
+        update_avionics_display_texture(sim_time_sec, atmo);
+        update_davtron_and_steam_textures(sim_time_sec, atmo);
         // Pilot seated eye framing: crisp unobstructed 3D 6-pack + Nav/GPS/AP stack + cowling + spinning prop veil
         // The cockpit model is framed around the pilot's eye; place both it
         // and the camera at the eye height above JSBSim's centre of gravity.
@@ -2545,11 +3301,13 @@ void AircraftAndHud::render_cockpit_interaction(
     float sim_time_sec, bool allow_pointer, bool ui_blocks_pointer) {
     if (st_.view_mode != 0 || !last_ckpt_valid_ || last_ckpt_world_m_.empty()) {
         mouse_starter_cranking_ = false;
+        cockpit_hotspot_hovered_ = false;
         return;
     }
     auto pi = ckpt_mesh_.node_index.find("PanelGroup");
     if (pi == ckpt_mesh_.node_index.end() || static_cast<size_t>(pi->second) >= last_ckpt_world_m_.size()) {
         mouse_starter_cranking_ = false;
+        cockpit_hotspot_hovered_ = false;
         return;
     }
 
@@ -2594,46 +3352,10 @@ void AircraftAndHud::render_cockpit_interaction(
     const bool running = systems_.is_engine_running();
     const bool shift = win.key_down(KEY_SHIFT);
     const auto &fs = fdm_.state();
+    (void)sim_time_sec;
     static constexpr const char *kMagStr[5] = {"OFF", "R", "L", "BOTH", "START"};
     static constexpr const char *kFuelStr[4] = {"OFF", "LEFT", "BOTH", "RIGHT"};
     static constexpr const char *kXpdrStr[4] = {"OFF", "STBY", "ON", "ALT"};
-
-    // Determine active Cold-and-Dark guided startup step (auto-highlights the exact next 3D switch!)
-    const char *guide_id = nullptr;
-    std::string guide_text;
-    if (!running && fs.on_ground && !st_.slew_fast) {
-        if (systems_.get_fuel_shutoff_pulled()) {
-            guide_id = "fuel_shutoff";
-            guide_text = "START 1/8: CLICK FUEL SHUTOFF VALVE -> OPEN";
-        } else if (systems_.get_fuel_selector() != nspain::FUEL_SEL_BOTH) {
-            guide_id = "fuel_sel";
-            guide_text = "START 1/8: CLICK FUEL SELECTOR -> BOTH";
-        } else if (!systems_.get_master_battery()) {
-            guide_id = "bat";
-            guide_text = "START 2/8: CLICK BAT MASTER -> ON";
-        } else if (!systems_.get_master_alternator()) {
-            guide_id = "alt";
-            guide_text = "START 3/8: CLICK ALT MASTER -> ON";
-        } else if (!systems_.get_light_switch(0)) {
-            guide_id = "bcn";
-            guide_text = "START 4/8: CLICK BEACON LIGHT -> ON";
-        } else if (st_.mixture < 0.80) {
-            guide_id = "mixture";
-            guide_text = "START 5/8: CLICK RED MIXTURE -> FULL RICH";
-        } else if (systems_.get_oil_temp_f() < 95.0 && systems_.get_primer_strokes() < 2) {
-            guide_id = "pitot_prime";
-            guide_text = "START 6/8: CLICK PRIME (2x COLD ENGINE)";
-        } else if (st_.throttle < 0.04) {
-            guide_id = "throttle";
-            guide_text = "START 7/8: CLICK THROTTLE -> CRACK OPEN 10%";
-        } else {
-            guide_id = "mags";
-            guide_text = "START 8/8: CLICK & HOLD IGNITION KEY -> START";
-        }
-    } else if (running && fs.on_ground && !systems_.get_avionics_master()) {
-        guide_id = "avn";
-        guide_text = "AFTER START: CLICK AVN MASTER -> ON";
-    }
 
     char buf[128];
     std::vector<Hotspot> spots;
@@ -2641,8 +3363,8 @@ void AircraftAndHud::render_cockpit_interaction(
     auto add_p = [&](const char *id, Vec3 p, float r, const char *tip, bool hold = false) {
         spots.push_back({id, SpotKind::Panel, nullptr, p, r * ui, tip, hold});
     };
-    auto add_n = [&](const char *id, const char *node, float r, const char *tip) {
-        spots.push_back({id, SpotKind::Node, node, {0.0f, 0.0f, 0.0f}, r * ui, tip, false});
+    auto add_n = [&](const char *id, const char *node, float r, const char *tip, Vec3 off = {0.0f, 0.0f, 0.0f}) {
+        spots.push_back({id, SpotKind::Node, node, off, r * ui, tip, false});
     };
 
     // 1. Lower Switch Bar: MAGS, ALT, BAT + 8 Toggles (AVN, PUMP, BCN, LDG, TAXI/INST, NAV, STRB, PITOT/PRIME)
@@ -2680,38 +3402,59 @@ void AircraftAndHud::render_cockpit_interaction(
         add_p(kCbIds[i], {bx, by, 0.016f}, 14.0f, buf);
     }
 
-    // 3. Movable 3D Engine & Flight Controls (node-tracked!)
-    add_n("carb_heat", "CarbHeatKnob", 24.0f, systems_.get_carb_heat() > 0.5 ? "CARB HEAT / ALT AIR: ON" : "CARB HEAT / ALT AIR: OFF");
+    // 3. Movable 3D Engine & Flight Controls (node-tracked at each physical handle/knob!)
+    add_n("carb_heat", "CarbHeatKnob", 24.0f, systems_.get_carb_heat() > 0.5 ? "CARB HEAT / ALT AIR: ON" : "CARB HEAT / ALT AIR: OFF", {0.0f, 0.0f, 0.022f});
     std::snprintf(buf, sizeof(buf), "THROTTLE %.0f%% (Click +10%% / Shift -10%%)", st_.throttle * 100.0);
-    add_n("throttle", "ThrottleKnob", 28.0f, buf);
+    add_n("throttle", "ThrottleKnob", 28.0f, buf, {0.0f, 0.0f, 0.022f});
     std::snprintf(buf, sizeof(buf), "MIXTURE %.0f%% (Click Rich / Shift Lean)", st_.mixture * 100.0);
-    add_n("mixture", "MixtureKnob", 28.0f, buf);
+    add_n("mixture", "MixtureKnob", 28.0f, buf, {0.0f, 0.0f, 0.022f});
     std::snprintf(buf, sizeof(buf), "FLAPS %.0f deg (Click +10 / Shift -10)", systems_.get_flaps_target_deg());
-    add_n("flaps", "FlapLever", 26.0f, buf);
+    add_n("flaps", "FlapLever", 26.0f, buf, {0.0f, 0.0f, 0.052f});
     std::snprintf(buf, sizeof(buf), "ELEVATOR TRIM %+.2f (Click UP / Shift DN)", st_.trim);
-    add_n("trim", "TrimWheel", 26.0f, buf);
-    add_n("park_brk", "ParkingBrake", 24.0f, st_.parking_brake ? "PARKING BRAKE: SET (Click release)" : "PARKING BRAKE: OFF (Click set)");
+    add_n("trim", "TrimWheel", 26.0f, buf, {0.0f, 0.0f, 0.020f});
+    add_n("park_brk", "ParkingBrake", 24.0f, st_.parking_brake ? "PARKING BRAKE: SET (Click release)" : "PARKING BRAKE: OFF (Click set)", {0.0f, 0.0f, 0.008f});
     std::snprintf(buf, sizeof(buf), "FUEL SELECTOR: %s (Click cycle)", kFuelStr[std::clamp(systems_.get_fuel_selector(), 0, 3)]);
-    add_n("fuel_sel", "FuelSelector", 28.0f, buf);
-    add_n("fuel_shutoff", "FuelShutoff", 24.0f, systems_.get_fuel_shutoff_pulled() ? "FUEL SHUTOFF: PULLED (Click open)" : "FUEL SHUTOFF: OPEN");
+    add_n("fuel_sel", "FuelSelector", 28.0f, buf, {0.0f, 0.012f, -0.012f});
+    add_n("fuel_shutoff", "FuelShutoff", 24.0f, systems_.get_fuel_shutoff_pulled() ? "FUEL SHUTOFF: PULLED (Click open)" : "FUEL SHUTOFF: OPEN", {0.0f, 0.0f, 0.010f});
 
-    // 4. 3D Gauge Corner Knobs (Baro Kollsman, HDG Bug, VOR1 OBS)
+    // 4. 3D Gauge Corner Knobs & Davtron M803 QNH sync
     std::snprintf(buf, sizeof(buf), "KOLLSMAN BARO %.0f hPa (Click +1 / Shift -1)", systems_.get_baro_hpa());
-    add_p("baro_knob", {-0.043f, 0.025f, 0.022f}, 18.0f, buf);
+    add_p("baro_knob", {-0.043f, 0.025f, 0.022f}, 20.0f, buf);
     std::snprintf(buf, sizeof(buf), "VOR1 OBS %03d deg (Click +10 / Shift -10)", systems_.get_nav_obs_deg(1));
-    add_p("obs_knob", {0.071f, 0.025f, 0.022f}, 18.0f, buf);
+    add_p("obs_knob", {0.071f, 0.025f, 0.022f}, 20.0f, buf);
     std::snprintf(buf, sizeof(buf), "HDG BUG %03d deg (Click +10 / Shift -10)", ((int(std::round(st_.ap_hdg_deg)) % 360) + 360) % 360);
-    add_p("hdg_knob", {-0.157f, -0.085f, 0.022f}, 18.0f, buf);
+    add_p("hdg_knob", {-0.157f, -0.085f, 0.022f}, 20.0f, buf);
+    std::snprintf(buf, sizeof(buf), "DAVTRON M803 (Click match QNH %.0f / Shift STD 1013)", last_air_.qnh_hpa);
+    add_p("davtron_qnh", {0.652f, 0.082f, 0.012f}, 24.0f, buf);
 
     // 5. Center AvionicsStack Live Interactive Displays & Buttons (zero fake buttons!)
+    static constexpr const char *kAudIds[6] = {"aud0","aud1","aud2","aud3","aud4","aud5"};
+    static constexpr const char *kAudNames[6] = {"COM1","COM2","NAV1","MKR","SPKR","ICS"};
+    for (int i = 0; i < 6; ++i) {
+        const float u = (314.0f + i * 120.0f) / 1024.0f;
+        std::snprintf(buf, sizeof(buf), "AUDIO %s: %s (Click toggle)", kAudNames[i],
+                      (st_.audio_sel_mask & (1u << i)) ? "ON" : "OFF");
+        add_p(kAudIds[i], avn_pt(u, 195.0f / 1536.0f), 15.0f, buf);
+    }
     std::snprintf(buf, sizeof(buf), "COM 1 %.2f/%.2f (Click swap / Shift +25k)", systems_.get_com_active(1), systems_.get_com_standby(1));
     add_p("com1", avn_pt(0.18f, 0.29f), 26.0f, buf);
     std::snprintf(buf, sizeof(buf), "NAV 1 %.2f [%s] (Click swap / Shift next VOR)", systems_.get_nav_active(1), systems_.get_nav_ident(1).c_str());
     add_p("nav1", avn_pt(0.18f, 0.42f), 26.0f, buf);
-    add_p("gps_src", avn_pt(0.89f, 0.35f), 24.0f, st_.ap_nav_source ? "NAV SOURCE: VOR1 (Click -> GPS)" : "NAV SOURCE: GPS (Click -> VOR1)");
-    std::snprintf(buf, sizeof(buf), "COM 2 %.2f/%.2f (Click swap)", systems_.get_com_active(2), systems_.get_com_standby(2));
+    static constexpr const char *kGpsPages[4] = {"MAP", "TAWS TERR", "NRST", "NAV HSI"};
+    std::snprintf(buf, sizeof(buf), st_.gps_page == 2 ? "GNS430 RNG: NEXT NRST ROW" : "GNS430 RNG: %d NM (Click out / Shift in)",
+                  int(kGpsRangesNm[std::clamp(st_.gps_range_idx, 0, 3)]));
+    add_p("gps_rng",  avn_pt(916.0f / 1024.0f, 378.0f / 1536.0f), 16.0f, buf);
+    add_p("gps_dto",  avn_pt(916.0f / 1024.0f, 446.0f / 1536.0f), 16.0f,
+          st_.gps_direct_active ? "GNS430 D-> DIRECT-TO (Click next / CLR cancel)" : "GNS430 D-> DIRECT-TO NEAREST AIRFIELD");
+    std::snprintf(buf, sizeof(buf), "GNS430 MENU: %s (Click next page)", kGpsPages[std::clamp(st_.gps_page, 0, 3)]);
+    add_p("gps_menu", avn_pt(916.0f / 1024.0f, 514.0f / 1536.0f), 16.0f, buf);
+    add_p("gps_clr",  avn_pt(916.0f / 1024.0f, 582.0f / 1536.0f), 16.0f,
+          "GNS430 CLR (Click clear D-> / Shift North-Up/Track-Up)");
+    add_p("gps_ent",  avn_pt(916.0f / 1024.0f, 650.0f / 1536.0f), 16.0f,
+          st_.ap_nav_source ? "GNS430 ENT / CDI: VLOC (Click -> GPS)" : "GNS430 ENT / CDI: GPS (Click -> VLOC)");
+    std::snprintf(buf, sizeof(buf), "COM 2 %.2f/%.2f (Click swap / Shift +50k)", systems_.get_com_active(2), systems_.get_com_standby(2));
     add_p("com2", avn_pt(0.32f, 0.61f), 24.0f, buf);
-    std::snprintf(buf, sizeof(buf), "NAV 2 %.2f/%.2f (Click swap)", systems_.get_nav_active(2), systems_.get_nav_standby(2));
+    std::snprintf(buf, sizeof(buf), "NAV 2 %.2f/%.2f (Click swap / Shift +50k)", systems_.get_nav_active(2), systems_.get_nav_standby(2));
     add_p("nav2", avn_pt(0.69f, 0.61f), 24.0f, buf);
 
     // 2-Axis Autopilot Softkeys & Knobs directly on the 3D radio stack!
@@ -2730,31 +3473,28 @@ void AircraftAndHud::render_cockpit_interaction(
     std::snprintf(buf, sizeof(buf), "XPDR %04d (Click 7000 VFR)", systems_.get_xpdr_squawk());
     add_p("xpdr_c", avn_pt(0.49f, 0.895f), 22.0f, buf);
     add_p("xpdr_i", avn_pt(0.918f, 0.942f), 18.0f, "XPDR IDENT KNOB (Click transmit IDENT)");
+    static constexpr const char *kXpIds[8] = {"xp0","xp1","xp2","xp3","xp4","xp5","xp6","xp7"};
+    for (int d = 0; d < 8; ++d) {
+        std::snprintf(buf, sizeof(buf), "XPDR DIGIT %d (Enter squawk)", d);
+        add_p(kXpIds[d], avn_pt((98.0f + d * 100.0f) / 1024.0f, 1469.0f / 1536.0f), 13.0f, buf);
+    }
 
     const PixelRect pr = win.presentation_rect(win_w, win_h);
     const float mx = (static_cast<float>(win.mouse_x() - pr.x)) * (wf / std::max(1.0f, static_cast<float>(pr.w)));
     const float my = (static_cast<float>(win.mouse_y() - pr.y)) * (hf / std::max(1.0f, static_cast<float>(pr.h)));
-    const bool pointer_active = allow_pointer && !ui_blocks_pointer && !st_.menu_open &&
-                                !st_.mouse_yoke_enabled && !win.mouse_right_down();
+    const bool pointer_active = allow_pointer && !ui_blocks_pointer && !st_.menu_open && !win.mouse_right_down();
 
     int hover_idx = -1;
     float hover_d2 = 1e9f;
     float hover_sx = 0.0f, hover_sy = 0.0f;
-    int guide_idx = -1;
-    float guide_sx = 0.0f, guide_sy = 0.0f;
 
-    for (size_t i = 0; i < spots.size(); ++i) {
-        float sx = 0.0f, sy = 0.0f;
-        const bool ok = (spots[i].kind == SpotKind::Panel)
-            ? project_mvp(panel_mvp, spots[i].p, sx, sy)
-            : project_node(spots[i].node, spots[i].p, sx, sy);
-        if (!ok) continue;
-        if (guide_id && std::strcmp(spots[i].id, guide_id) == 0) {
-            guide_idx = static_cast<int>(i);
-            guide_sx = sx;
-            guide_sy = sy;
-        }
-        if (pointer_active) {
+    if (pointer_active) {
+        for (size_t i = 0; i < spots.size(); ++i) {
+            float sx = 0.0f, sy = 0.0f;
+            const bool ok = (spots[i].kind == SpotKind::Panel)
+                ? project_mvp(panel_mvp, spots[i].p, sx, sy)
+                : project_node(spots[i].node, spots[i].p, sx, sy);
+            if (!ok) continue;
             const float dx = mx - sx, dy = my - sy;
             const float d2 = dx * dx + dy * dy;
             if (d2 <= spots[i].r_px * spots[i].r_px && d2 < hover_d2) {
@@ -2765,6 +3505,8 @@ void AircraftAndHud::render_cockpit_interaction(
             }
         }
     }
+
+    cockpit_hotspot_hovered_ = (pointer_active && hover_idx >= 0);
 
     // Handle continuous starter crank while holding LMB on 3D MAGS key
     if (pointer_active && hover_idx >= 0 && std::strcmp(spots[hover_idx].id, "mags") == 0 &&
@@ -2812,15 +3554,64 @@ void AircraftAndHud::render_cockpit_interaction(
         else if (id == "fuel_sel") systems_.cycle_fuel_selector();
         else if (id == "fuel_shutoff") systems_.set_fuel_shutoff_pulled(!systems_.get_fuel_shutoff_pulled());
         else if (id == "baro_knob") systems_.set_baro_hpa(systems_.get_baro_hpa() + (shift ? -1.0 : 1.0));
+        else if (id == "davtron_qnh") systems_.set_baro_hpa(shift ? 1013.25 : last_air_.qnh_hpa);
         else if (id == "obs_knob") systems_.set_nav_obs_deg(1, systems_.get_nav_obs_deg(1) + (shift ? -10 : 10));
         else if (id == "hdg_knob" || id == "ap_hdgk") st_.ap_hdg_deg = std::fmod(st_.ap_hdg_deg + (shift ? 350.0 : 10.0), 360.0);
-        else if (id == "com1") { if (shift) systems_.step_com_standby(1, 0.025); else systems_.swap_com(1); }
+        else if (id.size() == 4 && id.compare(0, 3, "aud") == 0) {
+            const int bit = id[3] - '0';
+            if (bit >= 0 && bit < 6) st_.audio_sel_mask ^= static_cast<uint8_t>(1u << bit);
+        } else if (id == "com1") { if (shift) systems_.step_com_standby(1, 0.025); else systems_.swap_com(1); }
         else if (id == "nav1") {
             if (shift) { vor_cycle_idx_ = (vor_cycle_idx_ + 1) % 10; systems_.tune_nav_standby(1, kVorFreqs[vor_cycle_idx_]); }
             else systems_.swap_nav(1);
-        } else if (id == "gps_src") st_.ap_nav_source = (st_.ap_nav_source + 1) % 2;
-        else if (id == "com2") systems_.swap_com(2);
-        else if (id == "nav2") systems_.swap_nav(2);
+        } else if (id == "gps_rng") {
+            if (st_.gps_page == 2) st_.gps_nrst_cursor = (st_.gps_nrst_cursor + (shift ? 4 : 1)) % 5;
+            else st_.gps_range_idx = (st_.gps_range_idx + (shift ? 3 : 1)) % 4;
+        } else if (id == "gps_dto") {
+            if (pack_ && !pack_->airports().empty()) {
+                std::vector<std::pair<double, const AirportInfo *>> aps;
+                aps.reserve(pack_->airports().size());
+                for (const auto &ap : pack_->airports()) {
+                    aps.push_back({nspain::haversine_m(st_.lat_deg, st_.lon_deg, ap.lat, ap.lon), &ap});
+                }
+                std::sort(aps.begin(), aps.end(), [](const auto &a, const auto &b) { return a.first < b.first; });
+                const int n_cand = std::min<int>(5, static_cast<int>(aps.size()));
+                const int idx = (st_.gps_page == 2)
+                    ? ((st_.gps_nrst_cursor % n_cand + n_cand) % n_cand)
+                    : (st_.gps_direct_active ? ((st_.gps_nrst_cursor + 1) % n_cand) : 0);
+                st_.gps_nrst_cursor = idx;
+                const AirportInfo *ap = aps[static_cast<size_t>(idx)].second;
+                st_.gps_direct_active = true;
+                st_.gps_direct_lat = ap->lat;
+                st_.gps_direct_lon = ap->lon;
+                st_.gps_direct_label = ap->id;
+                st_.ap_nav_source = 0;
+                st_.ap_nav_valid = true;
+                if (st_.gps_page == 2) st_.gps_page = 0;
+            }
+        } else if (id == "gps_menu") {
+            st_.gps_page = (st_.gps_page + 1) % 4;
+        } else if (id == "gps_clr") {
+            if (shift) st_.gps_north_up = !st_.gps_north_up;
+            else if (st_.gps_direct_active) { st_.gps_direct_active = false; st_.gps_direct_label.clear(); }
+            else st_.gps_page = 0;
+        } else if (id == "gps_ent") {
+            if (st_.gps_page == 2 && pack_ && !pack_->airports().empty()) {
+                std::vector<std::pair<double, const AirportInfo *>> aps;
+                aps.reserve(pack_->airports().size());
+                for (const auto &ap : pack_->airports()) {
+                    aps.push_back({nspain::haversine_m(st_.lat_deg, st_.lon_deg, ap.lat, ap.lon), &ap});
+                }
+                std::sort(aps.begin(), aps.end(), [](const auto &a, const auto &b) { return a.first < b.first; });
+                const int n_cand = std::min<int>(5, static_cast<int>(aps.size()));
+                const int idx = (st_.gps_nrst_cursor % n_cand + n_cand) % n_cand;
+                systems_.tune_com_standby(1, aps[static_cast<size_t>(idx)].second->freq_mhz);
+                systems_.swap_com(1);
+            } else {
+                st_.ap_nav_source = (st_.ap_nav_source + 1) % 2;
+            }
+        } else if (id == "com2") { if (shift) systems_.step_com_standby(2, 0.05); else systems_.swap_com(2); }
+        else if (id == "nav2") { if (shift) systems_.step_nav_standby(2, 0.05); else systems_.swap_nav(2); }
         else if (id == "ap_btn" && !fs.on_ground) {
             st_.ap_master = !st_.ap_master;
             st_.ap_disconnect_warn_s = 0.0f;
@@ -2844,43 +3635,36 @@ void AircraftAndHud::render_cockpit_interaction(
             else st_.ap_alt_ft = std::min(14500.0, st_.ap_alt_ft + 100.0);
         } else if (id == "ap_altk") st_.ap_alt_ft = std::clamp(st_.ap_alt_ft + (shift ? -500.0 : 500.0), 1000.0, 14500.0);
         else if (id == "xpdr_m") systems_.cycle_xpdr_mode();
-        else if (id == "xpdr_c") systems_.set_xpdr_vfr_7000();
+        else if (id == "xpdr_c") { systems_.set_xpdr_vfr_7000(); xpdr_edit_pos_ = 0; }
         else if (id == "xpdr_i") systems_.trigger_xpdr_ident();
+        else if (id.size() == 3 && id[0] == 'x' && id[1] == 'p' && id[2] >= '0' && id[2] <= '7') {
+            if (systems_.is_avionics_bus_powered(1)) {
+                static constexpr int kMul[4] = {1000, 100, 10, 1};
+                const int d = id[2] - '0';
+                const int sq = systems_.get_xpdr_squawk();
+                const int m = kMul[xpdr_edit_pos_ & 3];
+                const int cur_d = (sq / m) % 10;
+                systems_.set_xpdr_squawk(sq + (d - cur_d) * m);
+                xpdr_edit_pos_ = (xpdr_edit_pos_ + 1) & 3;
+            }
+        }
     }
 
-    // Draw 3D-tracked Pulsing Startup Guide Highlight & Hover Tooltip!
-    if (guide_idx < 0 && hover_idx < 0) return;
+    // Draw clean 3D-tracked hover highlight & tooltip only when pointing at a 3D cockpit control.
+    if (hover_idx < 0) return;
     hud_verts_.clear();
 
-    if (guide_idx >= 0) {
-        const float pulse = 0.5f + 0.5f * std::sin(sim_time_sec * 6.5f);
-        const float r = spots[guide_idx].r_px * (1.05f + 0.22f * pulse);
-        hud_rect(guide_sx - r, guide_sy - r, 2.0f * r, 2.0f * r, 1.0f, 0.78f, 0.14f, 0.18f + 0.16f * pulse);
-        hud_border(guide_sx - r, guide_sy - r, 2.0f * r, 2.0f * r, 2.6f * ui, 1.0f, 0.84f, 0.22f, 0.85f + 0.15f * pulse);
-        const float tw = std::max(290.0f * ui, static_cast<float>(guide_text.size()) * 11.2f * ui + 28.0f * ui);
-        const float th = 38.0f * ui;
-        const float tx = std::clamp(guide_sx - tw * 0.5f, 14.0f * ui, wf - tw - 14.0f * ui);
-        const float ty = std::clamp(guide_sy - r - th - 12.0f * ui, 14.0f * ui, hf - th - 14.0f * ui);
-        hud_rect(tx, ty, tw, th, 0.04f, 0.07f, 0.11f, 0.93f);
-        hud_border(tx, ty, tw, th, 2.2f * ui, 1.0f, 0.84f, 0.20f, 0.98f);
-        hud_text(tx + 14.0f * ui, ty + 9.0f * ui, 19.0f * ui, guide_text.c_str(), 1.0f, 0.94f, 0.54f, 1.0f);
-    }
-
-    if (hover_idx >= 0) {
-        const float r = spots[hover_idx].r_px;
-        hud_rect(hover_sx - r, hover_sy - r, 2.0f * r, 2.0f * r, 0.30f, 0.88f, 0.96f, 0.18f);
-        hud_border(hover_sx - r, hover_sy - r, 2.0f * r, 2.0f * r, 2.0f * ui, 0.42f, 0.94f, 1.0f, 0.95f);
-        const std::string &tip = spots[hover_idx].tip;
-        const float tw = std::max(180.0f * ui, static_cast<float>(tip.size()) * 9.2f * ui + 22.0f * ui);
-        const float th = 30.0f * ui;
-        const float tx = std::clamp(hover_sx - tw * 0.5f, 14.0f * ui, wf - tw - 14.0f * ui);
-        float ty = hover_sy - r - th - 8.0f * ui;
-        if (guide_idx == hover_idx) ty -= 38.0f * ui;
-        ty = std::clamp(ty, 14.0f * ui, hf - th - 14.0f * ui);
-        hud_rect(tx, ty, tw, th, 0.04f, 0.07f, 0.10f, 0.90f);
-        hud_border(tx, ty, tw, th, 1.5f * ui, 0.35f, 0.88f, 0.95f, 0.92f);
-        hud_text(tx + 10.0f * ui, ty + 6.0f * ui, 15.0f * ui, tip.c_str(), 0.90f, 0.97f, 1.0f, 1.0f);
-    }
+    const float r = spots[hover_idx].r_px;
+    hud_rect(hover_sx - r, hover_sy - r, 2.0f * r, 2.0f * r, 0.30f, 0.88f, 0.96f, 0.18f);
+    hud_border(hover_sx - r, hover_sy - r, 2.0f * r, 2.0f * r, 2.0f * ui, 0.42f, 0.94f, 1.0f, 0.95f);
+    const std::string &tip = spots[hover_idx].tip;
+    const float tw = std::max(180.0f * ui, static_cast<float>(tip.size()) * 9.2f * ui + 22.0f * ui);
+    const float th = 30.0f * ui;
+    const float tx = std::clamp(hover_sx - tw * 0.5f, 14.0f * ui, wf - tw - 14.0f * ui);
+    const float ty = std::clamp(hover_sy - r - th - 8.0f * ui, 14.0f * ui, hf - th - 14.0f * ui);
+    hud_rect(tx, ty, tw, th, 0.04f, 0.07f, 0.10f, 0.90f);
+    hud_border(tx, ty, tw, th, 1.5f * ui, 0.35f, 0.88f, 0.95f, 0.92f);
+    hud_text(tx + 10.0f * ui, ty + 6.0f * ui, 15.0f * ui, tip.c_str(), 0.90f, 0.97f, 1.0f, 1.0f);
 
     glViewport(0, 0, win_w, win_h);
     flush_hud(wf, hf);

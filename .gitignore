@@ -9,7 +9,11 @@
 *.so
 *.dll
 *.dylib
+*.exe
 sim_engine/nspain_sim
+sim_engine/nspain_sim.exe
+sim_engine/OpenSky
+sim_engine/OpenSky.exe
 sim_engine/.build/
 game/bin/*.so
 game/bin/*.so.*

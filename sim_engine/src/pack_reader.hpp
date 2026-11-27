@@ -3,6 +3,7 @@
 #include "../../engine/src/geo_math.hpp"
 #include "../../protocol/pack_format.h"
 #include "math3d.hpp"
+#include "platform_io.hpp"
 
 #include <array>
 #include <atomic>
@@ -148,10 +149,10 @@ public:
         std::string scenery_path;
         std::string weather_path;
         nspain::PackHeader hdr{};
-        int pack_fd = -1;
+        FileHandle pack_fd = kInvalidFileHandle;
         double anchor_lat = 42.10, anchor_lon = -0.30;
         double m_lat = 111132.0, m_lon = 82600.0;
-        int sh_fd = -1;
+        FileHandle sh_fd = kInvalidFileHandle;
         int sh_res = 128;
         float sh_chunk_m = 500.0f;
         std::unordered_map<int64_t, CityShEntry> sh_idx;

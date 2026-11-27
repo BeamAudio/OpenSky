@@ -111,7 +111,7 @@ Prebuilt `.deb` installers are published on [GitHub Releases](https://github.com
    make -C sim_engine -j"$(nproc)"
    ```
 
-   Use `CMAKE=/path/to/cmake` if CMake is outside `PATH`. Building compiles the bundled JSBSim library (`game/bin/libJSBSim.so.1`) and `sim_engine/nspain_sim`.
+   Use `CMAKE=/path/to/cmake` if CMake is outside `PATH`. Building compiles the bundled JSBSim library (`game/bin/libJSBSim.so.1`) and `sim_engine/OpenSky`.
 
 3. **Install regional scenery packs:**
 

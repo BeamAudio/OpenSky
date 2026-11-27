@@ -1,4 +1,5 @@
 #include "regional_atmosphere.hpp"
+#include "platform_io.hpp"
 
 #include <algorithm>
 #include <array>
@@ -342,35 +343,24 @@ void RegionalAtmosphere::live_weather_worker() {
             "https://api.open-meteo.com/v1/forecast?latitude=%.5f&longitude=%.5f"
             "&current=temperature_2m,relative_humidity_2m,dew_point_2m,precipitation,rain,showers,weather_code,cloud_cover,pressure_msl,wind_speed_10m,wind_direction_10m,wind_gusts_10m"
             "&wind_speed_unit=ms&timezone=UTC", lat, lon);
-        char cmd[1600];
-        std::snprintf(cmd, sizeof(cmd), "curl -sS -f -L --connect-timeout 3 --max-time 8 -A \"OpenSky-VFR/0.3 (+https://github.com/BeamAudio/OpenSky)\" '%s' 2>/dev/null", url);
-        FILE *pipe = popen(cmd, "r");
-        std::array<char, 8192> response{};
-        size_t used = 0;
-        bool success = false;
-        if (pipe) {
-            while (used + 1 < response.size()) {
-                size_t got = std::fread(response.data() + used, 1, response.size() - used - 1, pipe);
-                used += got;
-                if (!got) break;
-            }
-            int status = pclose(pipe);
-            success = status == 0 && used > 32 && std::strstr(response.data(), "\"current\"");
-            if (success) {
-                const int64_t refreshed = static_cast<int64_t>(std::time(nullptr));
-                WeatherSnapshot fresh = parse_live_weather(response.data(), elevation_m);
-                {
-                    std::lock_guard<std::mutex> lk(live_mtx_);
-                    if (request_id == live_request_id_) {
-                        live_target_ = std::move(fresh);
-                        live_last_success_utc_.store(refreshed, std::memory_order_release);
-                        live_available_.store(true, std::memory_order_release);
-                        std::printf("[WX] Open-Meteo current conditions refreshed for %.3f, %.3f\n", lat, lon);
-                    }
+        std::string response;
+        const bool success = http_get_to_string(
+            url, "OpenSky-VFR/0.3 (+https://github.com/BeamAudio/OpenSky)", 3000, 8000, response) &&
+            response.size() > 32 && response.find("\"current\"") != std::string::npos;
+        if (success) {
+            const int64_t refreshed = static_cast<int64_t>(std::time(nullptr));
+            WeatherSnapshot fresh = parse_live_weather(response.c_str(), elevation_m);
+            {
+                std::lock_guard<std::mutex> lk(live_mtx_);
+                if (request_id == live_request_id_) {
+                    live_target_ = std::move(fresh);
+                    live_last_success_utc_.store(refreshed, std::memory_order_release);
+                    live_available_.store(true, std::memory_order_release);
+                    std::printf("[WX] Open-Meteo current conditions refreshed for %.3f, %.3f\n", lat, lon);
                 }
-            } else {
-                std::fprintf(stderr, "[WX] Open-Meteo fetch failed; retaining the last available weather.\n");
             }
+        } else {
+            std::fprintf(stderr, "[WX] Open-Meteo fetch failed; retaining the last available weather.\n");
         }
         std::unique_lock<std::mutex> lk(live_mtx_);
         live_cv_.wait_for(lk, std::chrono::minutes(success ? 10 : 3), [&]() {
@@ -1029,8 +1019,6 @@ void RegionalAtmosphere::weather_worker_loop() {
             weather_solve_us_.fetch_add(std::chrono::duration_cast<std::chrono::microseconds>(solved - start).count(), std::memory_order_relaxed);
             weather_publish_us_.fetch_add(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - solved).count(), std::memory_order_relaxed);
             weather_steps_.fetch_add(live_steps, std::memory_order_relaxed);
-            const int tms = thermal_sleep_ms_.load(std::memory_order_relaxed);
-            if (tms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(tms));
             continue;
         }
         if (start_projection) {

@@ -268,8 +268,31 @@ void main() {
     // all translucent submeshes render in Pass 1 with GL_BLEND + glDepthMask(GL_FALSE).
     if (alpha < 0.015) { frag_color = vec4(0.0); return; }
 
-    // Fast subtle propeller blur veil in cockpit (skips heavy GGX + IBL over center of windshield!)
+    // Optical instrument cover glass (GaugeGlass: alpha ~0.09) vs cockpit propeller blur veil (alpha ~0.88).
     if (u_is_interior > 0.5 && u_cabin_glass == 0 && u_unlit == 0 && u_base_tint.a < 0.94) {
+        if (u_base_tint.a < 0.25) {
+            // Physically simulated dielectric instrument glass (zero texture fetch fast path for Renoir 60 FPS):
+            // Fresnel sky-horizon reflection, anti-reflective MgF2 sheen, and directional sun specular catchlight.
+            vec3 N = normalize(v_nrm);
+            vec3 V = normalize(-v_world_pos);
+            if (dot(N, V) < 0.0) N = -N;
+            vec3 L = normalize(u_sun_dir);
+            float ndv = max(0.0, dot(N, V));
+            float omv = 1.0 - ndv;
+            float omv2 = omv * omv;
+            float daylight = smoothstep(-0.10, 0.16, L.y);
+            vec3 R = reflect(-V, N);
+            float sky_t = clamp(R.y * 0.5 + 0.5, 0.0, 1.0);
+            vec3 env_refl = mix(u_haze_warm * 0.52, u_haze_cool * 1.25, smoothstep(0.30, 0.85, sky_t));
+            float fresnel = 0.032 + 0.32 * (omv2 * omv2);
+            vec3 H = normalize(V + L);
+            float sun_glint = pow(max(0.0, dot(N, H)), 128.0) * daylight * smoothstep(0.0, 0.25, dot(N, L));
+            vec3 ar_tint = vec3(0.46, 0.62, 0.78) * (0.04 + 0.06 * daylight);
+            vec3 glass_c = env_refl * (0.34 + 0.56 * daylight) + ar_tint + vec3(1.15, 1.12, 1.05) * (sun_glint * 0.90);
+            float out_a = clamp(fresnel * (0.28 + 0.44 * daylight) + sun_glint * 0.28, 0.016, 0.30);
+            frag_color = vec4(u_native_output != 0 ? sqrt(max(glass_c, vec3(0.0))) : glass_c, out_a);
+            return;
+        }
         float daylight = smoothstep(-0.10, 0.14, u_sun_dir.y);
         vec3 prop_c = base * mix(vec3(0.12, 0.14, 0.18), vec3(0.90, 0.92, 0.95), daylight);
         frag_color = vec4(native_display_color(prop_c), alpha);
@@ -337,14 +360,25 @@ void main() {
         float flash     = clamp(u_plane_wx.y, 0.0, 1.0);
         float crack_raw = clamp(u_dmg_extra.y, 0.0, 1.0);
 
-        // Dry, clean, ice-free, uncracked fast path: skip full AgX/LUT for faint <=5.5% glass sky reflection.
+        // Dry, clean, ice-free, uncracked optical acrylic glass fast path (zero texture fetches / zero AgX-LUT
+        // across 1080p windshield pixels, keeping >=60 FPS on Renoir while rendering Fresnel sky + sun + dash bounce).
         if (wet < 0.005 && frost_raw < 0.005 && mist_raw < 0.005 && grime_raw < 0.025 && crack_raw < 0.02) {
-            float omv = 1.0 - max(0.0, dot(N, V));
+            float ndv = max(0.0, dot(N, V));
+            float omv = 1.0 - ndv;
             float omv2 = omv * omv;
-            float fresnel = omv2 * omv2;
-            float glass_alpha = fresnel * 0.055;
-            if (glass_alpha < 0.010) { frag_color = vec4(0.0); return; }
-            vec3 dry_col = mix(vec3(0.45, 0.56, 0.68), u_haze_cool, 0.65);
+            float fresnel = 0.022 + 0.24 * (omv2 * omv2);
+            vec3 L = normalize(u_sun_dir);
+            float daylight = smoothstep(-0.12, 0.16, L.y);
+            vec3 R = reflect(-V, N);
+            float sky_t = clamp(R.y * 0.5 + 0.5, 0.0, 1.0);
+            vec3 sky_env = mix(u_haze_warm * 0.45, u_haze_cool * 1.15, smoothstep(0.35, 0.85, sky_t));
+            float sun_fwd = pow(max(0.0, dot(-V, L)), 12.0) * daylight;
+            float dash_bounce = (u_cabin_glass == 2) ? (smoothstep(0.45, 0.04, v_uv.y) * 0.022 * daylight) : 0.0;
+            vec3 dry_col = sky_env * (0.25 + 0.75 * daylight)
+                         + vec3(1.05, 0.96, 0.84) * (sun_fwd * 0.24)
+                         + vec3(0.16, 0.18, 0.22) * (dash_bounce * 7.5);
+            float glass_alpha = clamp(fresnel * (0.12 + 0.14 * daylight) + sun_fwd * 0.04 + dash_bounce, 0.0, 0.18);
+            if (glass_alpha < 0.012) { frag_color = vec4(0.0); return; }
             frag_color = vec4(u_native_output != 0 ? sqrt(max(dry_col, vec3(0.0))) : dry_col, glass_alpha);
             return;
         }
@@ -450,11 +484,12 @@ void main() {
             vec3 spec_col = mix(vec3(0.55, 0.65, 0.78), vec3(1.45, 1.48, 1.52), daylight);
             vec3 water_hdr;
             float out_drop_a;
-            if (front_glass) {
-                // Front windshield: true optical HDR convex-lens refraction + subtle cleared wet-film softening.
+            if (front_glass || u_native_output != 0) {
+                // True optical HDR convex-lens refraction across both front windshield & side cabin glazing!
                 vec2 screen_uv = gl_FragCoord.xy / vec2(textureSize(u_backdrop_tex, 0));
                 float edge_guard = smoothstep(0.0, 0.035, min(min(screen_uv.x, 1.0 - screen_uv.x), min(screen_uv.y, 1.0 - screen_uv.y)));
-                vec2 refr_uv = clamp(screen_uv - drop_nrm * vec2(0.030, 0.046) * (0.55 + 0.65 * drop_relief) * edge_guard,
+                vec2 refr_scale = front_glass ? vec2(0.030, 0.046) : vec2(0.022, 0.034);
+                vec2 refr_uv = clamp(screen_uv - drop_nrm * refr_scale * (0.55 + 0.65 * drop_relief) * edge_guard,
                                      vec2(0.002), vec2(0.998));
                 vec3 refr_hdr = textureLod(u_backdrop_tex, refr_uv, 0.0).rgb;
                 if (film_alpha > 0.02 && drop_alpha < 0.85) {

@@ -12,6 +12,7 @@
 #include "fleet_profile.hpp"
 #include "living_traffic.hpp"
 #include "pack_reader.hpp"
+#include "platform_io.hpp"
 #include "platform_window.hpp"
 #include "regional_atmosphere.hpp"
 #include "runtime_checks.hpp"
@@ -374,6 +375,7 @@ int run_selftest(const PackReader &pack) {
 } // namespace
 
 int main(int argc, char **argv) {
+    resolve_windows_working_root();
     bool selftest_only = false;
     bool runtime_check = false, runtime_check_gpu = false, outlook_check = false;
     bool only_region = false;
@@ -532,7 +534,21 @@ int main(int argc, char **argv) {
         return 1;
     }
     PackReader pack;
-    if (!pack.load_packs_dirs(packs_dirs, only_region ? req_region : "", req_region)) return 1;
+    if (!pack.load_packs_dirs(packs_dirs, only_region ? req_region : "", req_region)) {
+        if (interactive_run) {
+            std::string dirs_s;
+            for (size_t i = 0; i < packs_dirs.size(); ++i) {
+                if (i) dirs_s += "\n  - ";
+                else dirs_s += "  - ";
+                dirs_s += packs_dirs[i];
+            }
+            nsim::show_fatal_error(
+                "OpenSky VFR - Scenery Pack Missing",
+                "No installed .nspack scenery pack was found in:\n" + dirs_s +
+                "\n\nPlace at least one region pack (for example es_aragon_pyrenees.nspack) in the packs folder next to OpenSky and restart.");
+        }
+        return 1;
+    }
     profiler.startup_stage("pack_load_and_corridor_bake");
     if (!req_region.empty() && !pack.find_region_by_id(req_region)) {
         std::fprintf(stderr, "[OPENSKY] Region '%s' is not installed. Open the World Editor to build or install it.\n", req_region.c_str());
@@ -575,8 +591,10 @@ int main(int argc, char **argv) {
     const auto selected_aircraft = std::find_if(aircraft_catalog.packages.begin(), aircraft_catalog.packages.end(),
         [&](const AircraftPackage &item) { return item.id == selected_aircraft_id; });
     if (selected_aircraft == aircraft_catalog.packages.end()) {
-        std::fprintf(stderr, "[AIRCRAFT] Package '%s' is not installed. Use --list-aircraft or install it under game/aircraft or %s/aircraft.\n",
-                     selected_aircraft_id.c_str(), graphics_settings_path().parent_path().c_str());
+        std::string msg = "Aircraft package '" + selected_aircraft_id + "' is not installed. Expected under game/aircraft or " +
+                          graphics_settings_path().parent_path().string() + "/aircraft.";
+        std::fprintf(stderr, "[AIRCRAFT] %s\n", msg.c_str());
+        if (interactive_run) nsim::show_fatal_error("OpenSky VFR - Aircraft Package Missing", msg);
         return 1;
     }
     const AircraftPackage aircraft_package = *selected_aircraft;
@@ -629,6 +647,12 @@ int main(int argc, char **argv) {
     const int output_h = !topdown_dir.empty() ? 1024 : (portrait_promo && !landscape_ui_promo ? 1920 : GAME_OUTPUT_H);
     if (!win.create("OpenSky VFR Simulator", output_w, output_h,
                     static_cast<DisplayMode>(graphics_settings.display_mode), !(promo_only || offscreen))) {
+        if (interactive_run) {
+            nsim::show_fatal_error(
+                "OpenSky VFR - Graphics Initialization Failed",
+                "Could not create an OpenGL 4.5+ graphics context/window.\n"
+                "Update your GPU drivers and ensure OpenSky is running on a GPU that supports OpenGL 4.5 or 4.6.");
+        }
         return 1;
     }
     bool active_vsync = interactive_run && graphics_settings.vsync;
@@ -908,9 +932,6 @@ int main(int argc, char **argv) {
         profiler.cpu_end(FlightProfiler::InputPhysics, start);
     };
     bool first_presented = false;
-    int thermal_pixel_cap = 72;
-    double thermal_fps_cap = 60.0;
-    double last_thermal_check_t = -10.0;
     struct RoutePlaybackUiState {
         bool active = false;
         bool playing = true;
@@ -955,49 +976,7 @@ int main(int argc, char **argv) {
         double prepare_start = profiler.cpu_start();
         const FlightSimState &st = ac_hud.state();
         const GraphicsSettings &render_settings = ac_hud.graphics_settings();
-        // Proactive closed-loop thermal + 60 FPS frame-time guard (<80 C ceiling on laptop APUs):
-        // smoothly reduces internal resolution, worker burst, cloud rays, and frame ceiling under heat.
-        double wall_now = PlatformWindow::now_sec();
-        if (!promo_only && topdown_dir.empty() && airport_qa_dir.empty() && (wall_now - last_thermal_check_t) >= 0.5) {
-            last_thermal_check_t = wall_now;
-            const double temp_c = FlightProfiler::peak_package_temp_c();
-            const double avg_ms = profiler.enabled() ? profiler.frame_avg_ms() : cur_avg_ms;
-            if (temp_c >= 77.5) {
-                thermal_pixel_cap = 40;
-                streamer.set_thermal_sleep_ms(26);
-                reg_atmo.set_thermal_sleep_ms(60);
-                sky_clouds.set_thermal_sparse_clouds(true);
-                thermal_fps_cap = 24.0;
-            } else if (temp_c >= 74.5) {
-                thermal_pixel_cap = 42;
-                streamer.set_thermal_sleep_ms(18);
-                reg_atmo.set_thermal_sleep_ms(32);
-                sky_clouds.set_thermal_sparse_clouds(true);
-                thermal_fps_cap = 30.0;
-            } else if (temp_c >= 72.0) {
-                thermal_pixel_cap = std::max(46, thermal_pixel_cap - 6);
-                streamer.set_thermal_sleep_ms(8);
-                reg_atmo.set_thermal_sleep_ms(12);
-                sky_clouds.set_thermal_sparse_clouds(true);
-                thermal_fps_cap = 40.0;
-            } else if (temp_c >= 69.0 || (avg_ms > 0.1 && avg_ms >= 17.5)) {
-                thermal_pixel_cap = std::max(50, thermal_pixel_cap - 4);
-                streamer.set_thermal_sleep_ms(0);
-                reg_atmo.set_thermal_sleep_ms(0);
-                sky_clouds.set_thermal_sparse_clouds(temp_c >= 70.5);
-                thermal_fps_cap = (temp_c >= 70.5) ? 48.0 : 60.0;
-            } else if ((temp_c <= 0.0 || temp_c <= 64.0) && (avg_ms <= 0.1 || avg_ms <= 14.5)) {
-                thermal_pixel_cap = std::min(85, thermal_pixel_cap + 3);
-                streamer.set_thermal_sleep_ms(0);
-                reg_atmo.set_thermal_sleep_ms(0);
-                sky_clouds.set_thermal_sparse_clouds(false);
-                thermal_fps_cap = 60.0;
-            }
-        }
-        const int eff_pixel_pct = promo_only ? render_settings.pixel_percent
-            : ((topdown_dir.empty() && airport_qa_dir.empty())
-                ? std::min(render_settings.pixel_percent, thermal_pixel_cap)
-                : render_settings.pixel_percent);
+        const int eff_pixel_pct = render_settings.pixel_percent;
         const bool walking = frontend.walking() && !route_play.active;
         const auto &walker = frontend.walker();
         const double lat = walking ? walker.lat : st.lat_deg;
@@ -1015,7 +994,7 @@ int main(int argc, char **argv) {
         const LocalAirSample &air_now = ac_hud.last_air();
         const Vec2 local_wind_en{static_cast<float>(air_now.wind_east_mps), static_cast<float>(air_now.wind_north_mps)};
         streamer.begin_frame(frame_idx);
-        streamer.refine_online_pages(wall_now);
+        streamer.refine_online_pages(PlatformWindow::now_sec());
         // Frame-time-budgeted upload cap; drains PBO staging bursts quickly without long frame stalls.
         const int max_up = streamer.has_async_transition() ? 10 : ((quality <= 1) ? 5 : 6);
         const double up_budget_ms = streamer.has_async_transition() ? 3.0 : ((quality == 0) ? 1.4 : (quality == 1 ? 1.8 : 2.2));
@@ -1254,10 +1233,9 @@ int main(int argc, char **argv) {
             const PixelRect pr = win.presentation_rect(GAME_OUTPUT_W, GAME_OUTPUT_H);
             const float ux = (static_cast<float>(win.mouse_x() - pr.x)) * (static_cast<float>(GAME_OUTPUT_W) / std::max(1, pr.w));
             const float uy = (static_cast<float>(win.mouse_y() - pr.y)) * (static_cast<float>(GAME_OUTPUT_H) / std::max(1, pr.h));
-            const bool ui_blk = (frontend.kneeboard_open() && ux >= 24 && ux <= 670 && uy >= 168 && uy <= 900) ||
-                                (frontend.tutorial_open() && ux >= 1340 && ux <= 1900 && uy >= 24 && uy <= 400) ||
-                                (uy >= 940 && ux >= 1030);
-            ac_hud.render_cockpit_interaction(output_w, output_h, win, static_cast<float>(sim_time), draw_hud, ui_blk);
+            const bool ui_blk = draw_hud && frontend.tutorial_open() &&
+                                ux >= 1340 && ux <= 1900 && uy >= 24 && uy <= 400;
+            ac_hud.render_cockpit_interaction(output_w, output_h, win, static_cast<float>(sim_time), true, ui_blk);
         } else if (replay_hud && route_play.active) {
             route_play.last_action = frontend.draw_replay_bar(
                 ac_hud, win, route_play.active_rec.title,
@@ -1657,8 +1635,7 @@ int main(int argc, char **argv) {
                 (sim_time < 20.0) || (flight.lon_deg >= 0.610 && flight.lon_deg <= 0.720) ||
                 (trace.route.empty() ? false
                     : nspain::haversine_m(flight.lat_deg, flight.lon_deg, trace.route.back().lat, trace.route.back().lon) < 3500.0);
-            const uint64_t step_mask = (thermal_fps_cap <= 35.0) ? 15ULL : ((thermal_fps_cap <= 50.0) ? 3ULL : 1ULL);
-            const bool render_step = pace_realtime || (i & step_mask) == 0 || did_commit || async_cross.active;
+            const bool render_step = pace_realtime || (i & 1ULL) == 0 || did_commit || async_cross.active;
 
             double rend_ms = 0.0;
             double wall_ms = 0.0;
@@ -1709,9 +1686,7 @@ int main(int argc, char **argv) {
                           << (static_cast<double>(ss.gpu_page_bytes) / (1024.0 * 1024.0)) << '\n';
             }
 
-            const double pace_budget = pace_realtime
-                ? std::max(target_frame_s, 1.0 / thermal_fps_cap)
-                : ((render_step && thermal_fps_cap < 55.0) ? (1.0 / thermal_fps_cap) : 0.0);
+            const double pace_budget = pace_realtime ? target_frame_s : 0.0;
             const double spare = pace_budget - (PlatformWindow::now_sec() - loop_t0);
             if (spare > 0.0005) std::this_thread::sleep_for(std::chrono::duration<double>(spare));
         }
@@ -2134,7 +2109,7 @@ int main(int argc, char **argv) {
                     step_flight(1.0 / static_cast<double>(kVideoFps));
                     char frame_path[512];
                     std::snprintf(frame_path, sizeof(frame_path), "%s/frame_%05d.png",
-                                  frames_dir.c_str(), f);
+                                  frames_dir.string().c_str(), f);
                     capture_frame(1.0 / static_cast<double>(kVideoFps), false, 128,
                                   frame_path, 50.0f, true);
 
@@ -2259,7 +2234,7 @@ int main(int argc, char **argv) {
 
                 auto save_sim_frame = [&](bool draw_hud_flag = false) {
                     char fp[512];
-                    std::snprintf(fp, sizeof(fp), "%s/frame_%05d.ppm", frames_dir.c_str(), video_frame++);
+                    std::snprintf(fp, sizeof(fp), "%s/frame_%05d.ppm", frames_dir.string().c_str(), video_frame++);
                     const float fov = (ac_hud.state().view_mode == 0 && portrait_promo) ? 62.0f
                                     : (ac_hud.state().view_mode == 0 ? 54.0f : 50.0f);
                     capture_frame(kFrameDt, draw_hud_flag, 96, fp, fov, false);
@@ -2627,7 +2602,7 @@ int main(int argc, char **argv) {
                         }
                         frontend.draw_menu(ac_hud, sky_clouds, win, false, tod_slot, &reg_atmo, sim_time);
                         char fp[512];
-                        std::snprintf(fp, sizeof(fp), "%s/frame_%05d.ppm", frames_dir.c_str(), video_frame++);
+                        std::snprintf(fp, sizeof(fp), "%s/frame_%05d.ppm", frames_dir.string().c_str(), video_frame++);
                         PlatformWindow::save_framebuffer_png(fp, output_w, output_h);
                         glFlush();
                     }
@@ -2719,7 +2694,7 @@ int main(int argc, char **argv) {
                         step_flight(1.0 / static_cast<double>(kVideoFps));
                         char frame_path[512];
                         std::snprintf(frame_path, sizeof(frame_path), "%s/frame_%05d.png",
-                                      frames_dir.c_str(), video_frame++);
+                                      frames_dir.string().c_str(), video_frame++);
                         capture_frame(1.0 / static_cast<double>(kVideoFps), false, 128,
                                       frame_path, 50.0f, debug_model);
 
@@ -3129,7 +3104,7 @@ int main(int argc, char **argv) {
                 }
                 break;
             case GameFrontend::Request::Editor:
-                std::system("bash ./run_builder.sh >/dev/null 2>&1 &");
+                launch_world_editor();
                 break;
             case GameFrontend::Request::WatchReplay: {
                 RouteVideoRecording loaded;
@@ -3237,9 +3212,7 @@ int main(int argc, char **argv) {
             render_one_frame(false, 1, "", 50.0f, true);
             push_audio_state(dt, true);
             const int lim = ac_hud.graphics_settings().fps_limit;
-            const double user_p = lim > 0 ? (1.0 / static_cast<double>(lim)) : 0.0;
-            const double thermal_p = (thermal_fps_cap < 59.5) ? (1.0 / thermal_fps_cap) : 0.0;
-            const double eff_period = std::max(user_p, thermal_p);
+            const double eff_period = lim > 0 ? (1.0 / static_cast<double>(lim)) : 0.0;
             const double spare = eff_period - (PlatformWindow::now_sec() - now);
             if (spare > 0.0005) std::this_thread::sleep_for(std::chrono::duration<double>(spare));
             continue;
@@ -3289,8 +3262,7 @@ int main(int argc, char **argv) {
             }
             const int lim = ac_hud.graphics_settings().fps_limit;
             const double user_p = lim > 0 ? (1.0 / static_cast<double>(lim)) : 0.0;
-            const double thermal_p = (thermal_fps_cap < 59.5) ? (1.0 / thermal_fps_cap) : 0.0;
-            const double menu_period = std::max({user_p, thermal_p, 1.0 / 60.0});
+            const double menu_period = std::max(user_p, 1.0 / 60.0);
             const double spare = menu_period - (PlatformWindow::now_sec() - now);
             push_audio_state(dt, true);
             if (spare > 0.0005) std::this_thread::sleep_for(std::chrono::duration<double>(spare));
@@ -3303,17 +3275,13 @@ int main(int argc, char **argv) {
             render_one_frame(true);
             push_audio_state(dt, false);
             const int lim = ac_hud.graphics_settings().fps_limit;
-            const double user_p = lim > 0 ? (1.0 / static_cast<double>(lim)) : 0.0;
-            const double thermal_p = (thermal_fps_cap < 59.5) ? (1.0 / thermal_fps_cap) : 0.0;
-            const double walk_period = std::max(user_p, thermal_p);
+            const double walk_period = lim > 0 ? (1.0 / static_cast<double>(lim)) : 0.0;
             const double spare = walk_period - (PlatformWindow::now_sec() - now);
             if (spare > 0.0005) std::this_thread::sleep_for(std::chrono::duration<double>(spare));
             continue;
         }
 
         if (win.key_pressed(KEY_T)) frontend.toggle_tutorial();
-        if (frontend.active_flight() && !ac_hud.state().menu_open && win.key_pressed(KEY_TAB))
-            frontend.toggle_kneeboard();
         auto set_quality_preset = [&](int q) {
             quality = std::clamp(q, 0, 3);
             auto s = ac_hud.graphics_settings();
@@ -3405,11 +3373,9 @@ int main(int argc, char **argv) {
             ac_hud.graphics_settings().show_flight_hud || frontend.tutorial_open();
         render_one_frame(show_flight_overlays);
         push_audio_state(dt, ac_hud.state().paused || ac_hud.state().menu_open);
-        // Closed-loop frame pacing respects user FPS limit and thermal guard (<80 C).
+        // Frame pacing respects the user FPS limit.
         const int lim = ac_hud.graphics_settings().fps_limit;
-        const double user_p = lim > 0 ? (1.0 / static_cast<double>(lim)) : 0.0;
-        const double thermal_p = (thermal_fps_cap < 59.5) ? (1.0 / thermal_fps_cap) : 0.0;
-        const double eff_period = std::max(user_p, thermal_p);
+        const double eff_period = lim > 0 ? (1.0 / static_cast<double>(lim)) : 0.0;
         const double spare = eff_period - (PlatformWindow::now_sec() - now);
         if (spare > 0.0005) std::this_thread::sleep_for(std::chrono::duration<double>(spare));
     }

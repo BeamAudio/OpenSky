@@ -84,7 +84,7 @@
       </location>
       <static_friction>1</static_friction>
       <dynamic_friction>0.75</dynamic_friction>
-      <rolling_friction>0.018</rolling_friction>
+      <rolling_friction>0.015</rolling_friction>
       <spring_coeff unit="LBS/FT">900</spring_coeff>
       <damping_coeff unit="LBS/FT/SEC">59</damping_coeff>
       <max_steer unit="DEG">30</max_steer>
@@ -99,7 +99,7 @@
       </location>
       <static_friction>1</static_friction>
       <dynamic_friction>0.75</dynamic_friction>
-      <rolling_friction>0.018</rolling_friction>
+      <rolling_friction>0.015</rolling_friction>
       <spring_coeff unit="LBS/FT">1350</spring_coeff>
       <damping_coeff unit="LBS/FT/SEC">75</damping_coeff>
       <max_steer unit="DEG">0</max_steer>
@@ -114,7 +114,7 @@
       </location>
       <static_friction>1</static_friction>
       <dynamic_friction>0.75</dynamic_friction>
-      <rolling_friction>0.018</rolling_friction>
+      <rolling_friction>0.015</rolling_friction>
       <spring_coeff unit="LBS/FT">1350</spring_coeff>
       <damping_coeff unit="LBS/FT/SEC">75</damping_coeff>
       <max_steer unit="DEG">0</max_steer>
@@ -366,10 +366,15 @@
         </difference>
         <sum>
           <property>opensky/aero/wing-lift</property>
-          <product>
-            <value>0.26</value>
-            <property>fcs/flap-cmd-norm</property>
-          </product>
+          <table>
+            <independentVar lookup="row">fcs/flap-cmd-norm</independentVar>
+            <tableData>
+              0.0000    0.0000
+              0.3333    0.2200
+              0.6667    0.3800
+              1.0000    0.4800
+            </tableData>
+          </table>
           <product>
             <value>0.42</value>
             <property>fcs/elevator-pos-rad</property>
@@ -399,10 +404,15 @@
           <value>0.008</value>
           <property>opensky/weather/rain-drag</property>
         </product>
-        <product>
-          <value>0.058</value>
-          <property>fcs/flap-cmd-norm</property>
-            </product>
+        <table>
+          <independentVar lookup="row">fcs/flap-cmd-norm</independentVar>
+          <tableData>
+            0.0000    0.0000
+            0.3333    0.0090
+            0.6667    0.0260
+            1.0000    0.0580
+          </tableData>
+        </table>
         <product>
           <value>0.14</value>
           <property>aero/beta-rad</property>

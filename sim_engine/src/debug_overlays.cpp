@@ -440,8 +440,8 @@ void AircraftAndHud::render_debug_overlays(float w, float h, float top, const Re
         const auto &host = prof->host();
         const auto &gpu = prof->latest_gpu_ms();
         const auto &phase = prof->latest_phases_ms();
-        const float pw = 550.0f * scale, x = w - pw - pad, y = h - 247.0f * scale;
-        panel(x, y, pw, row * 8.8f, yellow);
+        const float pw = 550.0f * scale, x = w - pw - pad, y = h - 268.0f * scale;
+        panel(x, y, pw, row * 9.8f, yellow);
         auto row_text = [&](int i, const char *msg, Vec3 c) { text_at(x + pad, y + row * (0.45f + i), msg, c); };
         row_text(0, "F5  PERFORMANCE", yellow);
         std::snprintf(line, sizeof(line), "%.1f FPS  |  frame %.1f ms  p95 %.1f  p99 %.1f",
@@ -476,6 +476,23 @@ void AircraftAndHud::render_debug_overlays(float w, float h, float top, const Re
         std::snprintf(line, sizeof(line), "Terrain worker per page  build %.0f ms  BC7 %.0f ms",
                       prof->build_ms_per_page(), prof->encode_ms_per_page());
         row_text(7, line, white);
+        if (host.cpu_temp_millic > 0 || host.gpu_temp_millic > 0) {
+            const double cpu_c = host.cpu_temp_millic > 0 ? host.cpu_temp_millic * 0.001 : -1.0;
+            const double gpu_c = host.gpu_temp_millic > 0 ? host.gpu_temp_millic * 0.001 : -1.0;
+            const double peak_c = std::max(cpu_c, gpu_c);
+            const Vec3 tcol = (peak_c >= 80.0) ? red : ((peak_c >= 72.0) ? yellow : green);
+            if (host.gpu_power_microwatts > 0 && cpu_c > 0.0 && gpu_c > 0.0) {
+                std::snprintf(line, sizeof(line), "Thermal  CPU %.1f C  GPU %.1f C  |  %.1f W",
+                              cpu_c, gpu_c, host.gpu_power_microwatts * 1.0e-6);
+            } else if (cpu_c > 0.0 && gpu_c > 0.0 && std::abs(cpu_c - gpu_c) > 0.05) {
+                std::snprintf(line, sizeof(line), "Thermal  CPU %.1f C  GPU %.1f C", cpu_c, gpu_c);
+            } else {
+                std::snprintf(line, sizeof(line), "Thermal  Pkg %.1f C (monitor only)", peak_c);
+            }
+            row_text(8, line, tcol);
+        } else {
+            row_text(8, "Thermal  sensor unavailable", white);
+        }
     }
 }
 

@@ -5,11 +5,123 @@
 #include <cmath>
 #include <cstdio>
 #include <numeric>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <psapi.h>
+#else
 #include <sys/resource.h>
+#endif
 
 namespace nsim {
 namespace {
 
+#ifdef _WIN32
+double filetime_seconds(const FILETIME &ft) {
+    ULARGE_INTEGER ui{};
+    ui.LowPart = ft.dwLowDateTime;
+    ui.HighPart = ft.dwHighDateTime;
+    return static_cast<double>(ui.QuadPart) * 1.0e-7;
+}
+
+double process_cpu_seconds() {
+    FILETIME c{}, e{}, k{}, u{};
+    if (!GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u)) return -1.0;
+    return filetime_seconds(k) + filetime_seconds(u);
+}
+
+double thread_cpu_seconds() {
+    FILETIME c{}, e{}, k{}, u{};
+    if (!GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u)) return -1.0;
+    return filetime_seconds(k) + filetime_seconds(u);
+}
+
+void sample_thermals(int64_t &cpu_temp_millic, int64_t &gpu_temp_millic, int64_t &) {
+    // Dynamically query Windows Performance Data Helper (pdh.dll) ACPI Thermal Zone temperature
+    // without requiring admin privileges or external libraries for live thermal monitoring.
+    using PdhHandle = void *;
+    struct PdhFmtVal { DWORD status; union { LONG lval; double dval; LONGLONG llval; }; };
+    struct PdhFmtItem { const wchar_t *name; PdhFmtVal val; };
+    using FnOpenQueryW = LONG(WINAPI *)(const wchar_t *, DWORD_PTR, PdhHandle *);
+    using FnAddCounterW = LONG(WINAPI *)(PdhHandle, const wchar_t *, DWORD_PTR, PdhHandle *);
+    using FnCollect = LONG(WINAPI *)(PdhHandle);
+    using FnGetArrayW = LONG(WINAPI *)(PdhHandle, DWORD, DWORD *, DWORD *, PdhFmtItem *);
+
+    struct WinThermalPdh {
+        bool init_done = false;
+        bool ready = false;
+        PdhHandle query = nullptr;
+        PdhHandle counter = nullptr;
+        FnCollect collect = nullptr;
+        FnGetArrayW get_array = nullptr;
+        double last_sample_s = -10.0;
+        int64_t cached_mc = -1;
+    };
+    static WinThermalPdh s;
+
+    const double now_s = PlatformWindow::now_sec();
+    if (s.init_done && (now_s - s.last_sample_s) < 0.45) {
+        if (s.cached_mc > 0) {
+            cpu_temp_millic = std::max(cpu_temp_millic, s.cached_mc);
+            gpu_temp_millic = std::max(gpu_temp_millic, s.cached_mc);
+        }
+        return;
+    }
+    s.last_sample_s = now_s;
+
+    if (!s.init_done) {
+        s.init_done = true;
+        HMODULE mod = LoadLibraryW(L"pdh.dll");
+        if (mod) {
+            auto open_q = reinterpret_cast<FnOpenQueryW>(reinterpret_cast<void *>(GetProcAddress(mod, "PdhOpenQueryW")));
+            auto add_c = reinterpret_cast<FnAddCounterW>(reinterpret_cast<void *>(GetProcAddress(mod, "PdhAddEnglishCounterW")));
+            if (!add_c) add_c = reinterpret_cast<FnAddCounterW>(reinterpret_cast<void *>(GetProcAddress(mod, "PdhAddCounterW")));
+            s.collect = reinterpret_cast<FnCollect>(reinterpret_cast<void *>(GetProcAddress(mod, "PdhCollectQueryData")));
+            s.get_array = reinterpret_cast<FnGetArrayW>(reinterpret_cast<void *>(GetProcAddress(mod, "PdhGetFormattedCounterArrayW")));
+            if (open_q && add_c && s.collect && s.get_array &&
+                open_q(nullptr, 0, &s.query) == 0 &&
+                add_c(s.query, L"\\Thermal Zone Information(*)\\Temperature", 0, &s.counter) == 0) {
+                s.ready = true;
+            }
+        }
+    }
+    if (!s.ready) return;
+
+    if (s.collect(s.query) != 0) return;
+    constexpr DWORD kPdhFmtDouble = 0x00000200;
+    DWORD buf_sz = 0, item_cnt = 0;
+    s.get_array(s.counter, kPdhFmtDouble, &buf_sz, &item_cnt, nullptr);
+    if (buf_sz == 0 || buf_sz > 65536) return;
+    std::vector<uint8_t> buf(buf_sz);
+    if (s.get_array(s.counter, kPdhFmtDouble, &buf_sz, &item_cnt,
+                    reinterpret_cast<PdhFmtItem *>(buf.data())) != 0) return;
+
+    const auto *items = reinterpret_cast<const PdhFmtItem *>(buf.data());
+    int64_t peak_mc = -1;
+    for (DWORD i = 0; i < item_cnt; ++i) {
+        if (items[i].val.status != 0) continue;
+        const double raw = items[i].val.dval;
+        // ACPI thermal zone counters report Kelvin (~270..410 K) or tenths of Kelvin (~2700..4100).
+        double c = -1.0;
+        if (raw >= 270.0 && raw <= 410.0) c = raw - 273.15;
+        else if (raw >= 2700.0 && raw <= 4100.0) c = raw * 0.1 - 273.15;
+        if (c > 15.0 && c < 125.0) {
+            peak_mc = std::max(peak_mc, static_cast<int64_t>(std::llround(c * 1000.0)));
+        }
+    }
+    s.cached_mc = peak_mc;
+    if (peak_mc > 0) {
+        cpu_temp_millic = std::max(cpu_temp_millic, peak_mc);
+        gpu_temp_millic = std::max(gpu_temp_millic, peak_mc);
+    }
+}
+std::filesystem::path render_device() { return {}; }
+#else
 int64_t read_number(const std::filesystem::path &path) {
     std::ifstream in(path);
     int64_t value;
@@ -72,6 +184,7 @@ double cpu_seconds(int who) {
     if (getrusage(who, &ru) != 0) return -1.0;
     return ru.ru_utime.tv_sec + ru.ru_stime.tv_sec + (ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) * 1.0e-6;
 }
+#endif
 
 } // namespace
 
@@ -225,13 +338,30 @@ void FlightProfiler::finish() {
 
 void FlightProfiler::sample_host(double now) {
     if (now - last_host_sec_ < 1.0) return;
+#ifdef _WIN32
+    const double proc = process_cpu_seconds(), thread = thread_cpu_seconds();
+#else
     const double proc = cpu_seconds(RUSAGE_SELF), thread = cpu_seconds(RUSAGE_THREAD);
+#endif
     const double dt = now - last_host_sec_;
     if (last_host_sec_ > 0.0 && std::min(proc, proc_cpu_sec_) >= 0.0) host_.cpu_cores = (proc - proc_cpu_sec_) / dt;
     if (last_host_sec_ > 0.0 && std::min(thread, thread_cpu_sec_) >= 0.0) host_.main_cpu_percent = (thread - thread_cpu_sec_) / dt * 100.0;
     proc_cpu_sec_ = proc;
     thread_cpu_sec_ = thread;
     last_host_sec_ = now;
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS pmc{};
+    if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
+        host_.rss_kib = static_cast<int64_t>(pmc.WorkingSetSize / 1024u);
+        host_.peak_rss_kib = static_cast<int64_t>(pmc.PeakWorkingSetSize / 1024u);
+    }
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof(ms);
+    if (GlobalMemoryStatusEx(&ms)) {
+        host_.available_kib = static_cast<int64_t>(ms.ullAvailPhys / 1024u);
+        host_.total_kib = static_cast<int64_t>(ms.ullTotalPhys / 1024u);
+    }
+#else
     sample_memory_file("/proc/self/status", "VmRSS:", host_.rss_kib, "VmHWM:", host_.peak_rss_kib);
     sample_memory_file("/proc/meminfo", "MemAvailable:", host_.available_kib, "MemTotal:", host_.total_kib);
     if (!drm_device_.empty()) {
@@ -240,6 +370,7 @@ void FlightProfiler::sample_host(double now) {
         host_.vram_total_bytes = read_number(drm_device_ / "mem_info_vram_total");
         host_.gtt_used_bytes = read_number(drm_device_ / "mem_info_gtt_used");
     }
+#endif
     sample_thermals(host_.cpu_temp_millic, host_.gpu_temp_millic, host_.gpu_power_microwatts);
     if (resources_.is_open()) {
         resources_ << (now - start_sec_) * 1000 << ',' << host_.cpu_cores << ',' << host_.main_cpu_percent

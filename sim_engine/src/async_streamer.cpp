@@ -302,7 +302,6 @@ void AsyncTerrainStreamer::worker_loop() {
         uint64_t best_key = UINT64_MAX;
         float best_prio = 0.0f;
         uint64_t job_gen = 0;
-        bool is_next_job = false;
         std::shared_ptr<const PackReader::WorldFrame> frame;
         int free_slot = -1;
 
@@ -339,7 +338,6 @@ void AsyncTerrainStreamer::worker_loop() {
             }
             if (!have_next) pending_req_frame_.erase(best_key);
 
-            is_next_job = have_next;
             if (have_next) {
                 job_gen = cur_pending;
                 inflight_next_.insert(best_key);
@@ -377,12 +375,6 @@ void AsyncTerrainStreamer::worker_loop() {
             continue;
         }
         staging_[free_slot].state.store(StageState::READY, std::memory_order_release);
-        // Never stall visible terrain unless package nears 80C; always pace far background work when warm.
-        int tms = thermal_sleep_ms_.load(std::memory_order_relaxed);
-        if (tms > 0 && !sync_flushing_.load(std::memory_order_relaxed)) {
-            if (!is_next_job && best_prio < 1400.0f) std::this_thread::sleep_for(std::chrono::milliseconds(tms));
-            else if (tms >= 24) std::this_thread::sleep_for(std::chrono::milliseconds(4));
-        }
     }
 }
 

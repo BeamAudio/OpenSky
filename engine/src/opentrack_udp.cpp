@@ -4,7 +4,16 @@
 #include <cmath>
 #include <cstring>
 
-#if defined(__linux__) || defined(__APPLE__)
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#elif defined(__linux__) || defined(__APPLE__)
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -13,6 +22,17 @@
 #endif
 
 namespace nspain {
+namespace {
+#ifdef _WIN32
+bool ensure_winsock() {
+    static const bool ok = []() {
+        WSADATA wsa{};
+        return WSAStartup(MAKEWORD(2, 2), &wsa) == 0;
+    }();
+    return ok;
+}
+#endif
+} // namespace
 
 OpenTrackUDP::OpenTrackUDP() = default;
 
@@ -23,27 +43,46 @@ OpenTrackUDP::~OpenTrackUDP() {
 bool OpenTrackUDP::start_listening(int port) {
     stop_listening();
     port_ = port;
-#if defined(__linux__) || defined(__APPLE__)
-    sock_fd_ = ::socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock_fd_ < 0) {
+#ifdef _WIN32
+    if (!ensure_winsock()) return false;
+    SOCKET s = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == INVALID_SOCKET) return false;
+    u_long nonblock = 1;
+    ::ioctlsocket(s, FIONBIO, &nonblock);
+    BOOL reuse = TRUE;
+    ::setsockopt(s, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char *>(&reuse), sizeof(reuse));
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(static_cast<uint16_t>(port));
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (::bind(s, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == SOCKET_ERROR) {
+        ::closesocket(s);
         return false;
     }
-    int flags = ::fcntl(sock_fd_, F_GETFL, 0);
+    sock_fd_ = static_cast<intptr_t>(s);
+    return true;
+#elif defined(__linux__) || defined(__APPLE__)
+    int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        return false;
+    }
+    int flags = ::fcntl(fd, F_GETFL, 0);
     if (flags >= 0) {
-        ::fcntl(sock_fd_, F_SETFL, flags | O_NONBLOCK);
+        ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
     }
     int reuse = 1;
-    ::setsockopt(sock_fd_, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(static_cast<uint16_t>(port));
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); // 127.0.0.1
-    if (::bind(sock_fd_, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0) {
-        ::close(sock_fd_);
-        sock_fd_ = -1;
+    if (::bind(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0) {
+        ::close(fd);
         return false;
     }
+    sock_fd_ = static_cast<intptr_t>(fd);
     return true;
 #else
     return false;
@@ -51,9 +90,14 @@ bool OpenTrackUDP::start_listening(int port) {
 }
 
 void OpenTrackUDP::stop_listening() {
-#if defined(__linux__) || defined(__APPLE__)
+#ifdef _WIN32
     if (sock_fd_ >= 0) {
-        ::close(sock_fd_);
+        ::closesocket(static_cast<SOCKET>(sock_fd_));
+        sock_fd_ = -1;
+    }
+#elif defined(__linux__) || defined(__APPLE__)
+    if (sock_fd_ >= 0) {
+        ::close(static_cast<int>(sock_fd_));
         sock_fd_ = -1;
     }
 #endif
@@ -98,11 +142,22 @@ bool OpenTrackUDP::ingest_packet_48(const uint8_t *bytes, size_t len) {
 }
 
 void OpenTrackUDP::poll(double dt) {
-#if defined(__linux__) || defined(__APPLE__)
+#ifdef _WIN32
     if (sock_fd_ >= 0) {
         uint8_t buf[128];
         for (int iter = 0; iter < 16; ++iter) {
-            ssize_t n = ::recv(sock_fd_, buf, sizeof(buf), 0);
+            int n = ::recv(static_cast<SOCKET>(sock_fd_), reinterpret_cast<char *>(buf), static_cast<int>(sizeof(buf)), 0);
+            if (n < 48) {
+                break;
+            }
+            ingest_packet_48(buf, static_cast<size_t>(n));
+        }
+    }
+#elif defined(__linux__) || defined(__APPLE__)
+    if (sock_fd_ >= 0) {
+        uint8_t buf[128];
+        for (int iter = 0; iter < 16; ++iter) {
+            ssize_t n = ::recv(static_cast<int>(sock_fd_), buf, sizeof(buf), 0);
             if (n < 48) {
                 break;
             }

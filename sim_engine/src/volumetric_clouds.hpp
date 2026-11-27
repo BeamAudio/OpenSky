@@ -51,7 +51,6 @@ public:
         double day_cycle_elapsed_sec = -1.0
     );
     void reset_temporal_history() { history_valid_ = false; post_history_valid_ = false; prev_camera_valid_ = false; }
-    void set_thermal_sparse_clouds(bool sparse) { thermal_sparse_clouds_ = sparse; }
     void update_reflection_map_if_needed(double sim_time_sec);
 
     // Begin opaque 3D pass into Reverse-Z Main FBO & draw Rayleigh/Mie sky background
@@ -149,7 +148,6 @@ private:
     int cur_win_w_ = 0, cur_win_h_ = 0;
     int cloud_quality_ = 2;
     int cur_pixel_percent_ = 60, cur_aa_mode_ = 2;
-    bool thermal_sparse_clouds_ = false;
 
     AtmosphereState atmo_{};
 };

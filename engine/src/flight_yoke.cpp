@@ -10,7 +10,19 @@
 #include <cstring>
 #include <filesystem>
 
-#ifdef __linux__
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef DIRECTINPUT_VERSION
+#define DIRECTINPUT_VERSION 0x0800
+#endif
+#include <windows.h>
+#include <dinput.h>
+#elif defined(__linux__)
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/input.h>
@@ -20,6 +32,17 @@
 
 namespace nspain {
 namespace {
+
+constexpr int kAbsX = 0;
+constexpr int kAbsY = 1;
+constexpr int kAbsZ = 2;
+constexpr int kAbsRx = 3;
+constexpr int kAbsRy = 4;
+constexpr int kAbsRz = 5;
+constexpr int kAbsThrottle = 6;
+constexpr int kAbsRudder = 7;
+constexpr int kAbsHat0X = 16;
+constexpr int kAbsHat0Y = 17;
 
 enum LogicalBtn : int {
     LBTN_BRAKE = 0,
@@ -41,7 +64,40 @@ bool contains_ci(const std::string &hay, const char *needle) {
     return hay.find(needle) != std::string::npos;
 }
 
-#ifdef __linux__
+#ifdef _WIN32
+std::string wide_to_utf8(const wchar_t *ws) {
+    if (!ws || !*ws) return {};
+    const int n = WideCharToMultiByte(CP_UTF8, 0, ws, -1, nullptr, 0, nullptr, nullptr);
+    if (n <= 1) return {};
+    std::string out(static_cast<size_t>(n - 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, ws, -1, out.data(), n, nullptr, nullptr);
+    return out;
+}
+
+std::string format_guid(const GUID &g) {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf),
+                  "dinput:%08lx-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+                  static_cast<unsigned long>(g.Data1), g.Data2, g.Data3,
+                  g.Data4[0], g.Data4[1], g.Data4[2], g.Data4[3],
+                  g.Data4[4], g.Data4[5], g.Data4[6], g.Data4[7]);
+    return buf;
+}
+
+int map_win_button(int idx) {
+    switch (idx) {
+        case 0: return LBTN_BRAKE;
+        case 1: return LBTN_PARK_BRK;
+        case 2: return LBTN_TRIM_DN;
+        case 3: return LBTN_TRIM_UP;
+        case 4: return LBTN_FLAPS_DN;
+        case 5: return LBTN_FLAPS_UP;
+        case 6: return LBTN_RECENTER;
+        case 7: return LBTN_AP_DISC;
+        default: return -1;
+    }
+}
+#elif defined(__linux__)
 bool test_bit(const uint8_t *bits, int bit) {
     return (bits[bit / 8] & (1u << (bit % 8))) != 0;
 }
@@ -97,15 +153,13 @@ YokeDeviceRole YokeDeviceState::classify_role(const std::string &dev_name,
         !contains_ci(low, "yoke") && !contains_ci(low, "hotas") && !contains_ci(low, "stick")) {
         return YokeDeviceRole::ThrottleQuadrant;
     }
-#ifdef ABS_RZ
     // Buttonless 3-axis rudder pedals often expose uncentered X/Y toe brakes at minimum + RZ rudder.
-    const bool has_yaw = ax[ABS_RZ].present || ax[ABS_RUDDER].present;
-    if (!has_joystick_btns && !has_gamepad_btns && has_yaw && ax[ABS_X].present && ax[ABS_Y].present) {
-        const double nx = normalize_bipolar(ax[ABS_X]);
-        const double ny = normalize_bipolar(ax[ABS_Y]);
+    const bool has_yaw = ax[kAbsRz].present || ax[kAbsRudder].present;
+    if (!has_joystick_btns && !has_gamepad_btns && has_yaw && ax[kAbsX].present && ax[kAbsY].present) {
+        const double nx = normalize_bipolar(ax[kAbsX]);
+        const double ny = normalize_bipolar(ax[kAbsY]);
         if (nx < -0.75 && ny < -0.75) return YokeDeviceRole::RudderPedals;
     }
-#endif
     return YokeDeviceRole::YokeOrStick;
 }
 
@@ -114,60 +168,55 @@ void YokeDeviceState::assign_default_mapping(bool has_joystick_btns, bool has_ga
     brake_left_axis = brake_right_axis = hat_x_axis = hat_y_axis = -1;
     role = classify_role(name, axes, has_joystick_btns, has_gamepad_btns);
 
-#ifdef ABS_X
     auto has = [&](int c) { return c >= 0 && c < kMaxAbs && axes[static_cast<size_t>(c)].present; };
     if (role == YokeDeviceRole::RudderPedals) {
-        if (has(ABS_RZ)) rudder_axis = ABS_RZ;
-        else if (has(ABS_RUDDER)) rudder_axis = ABS_RUDDER;
-        else if (has(ABS_Z)) rudder_axis = ABS_Z;
-        if (has(ABS_X) && has(ABS_Y)) {
+        if (has(kAbsRz)) rudder_axis = kAbsRz;
+        else if (has(kAbsRudder)) rudder_axis = kAbsRudder;
+        else if (has(kAbsZ)) rudder_axis = kAbsZ;
+        if (has(kAbsX) && has(kAbsY)) {
             const std::string low = to_lower_ascii(name);
             // Thrustmaster TFRP swaps right/left compared to Saitek/Logitech pedals.
             if (contains_ci(low, "thrustmaster") || contains_ci(low, "t-rudder") || contains_ci(low, "tfrp")) {
-                brake_right_axis = ABS_X;
-                brake_left_axis = ABS_Y;
+                brake_right_axis = kAbsX;
+                brake_left_axis = kAbsY;
             } else {
-                brake_left_axis = ABS_X;
-                brake_right_axis = ABS_Y;
+                brake_left_axis = kAbsX;
+                brake_right_axis = kAbsY;
             }
         }
         return;
     }
 
     if (role == YokeDeviceRole::ThrottleQuadrant) {
-        if (has(ABS_THROTTLE)) throttle_axis = ABS_THROTTLE;
-        else if (has(ABS_Z)) throttle_axis = ABS_Z;
-        else if (has(ABS_X)) throttle_axis = ABS_X;
-        if (has(ABS_RY)) mixture_axis = ABS_RY;
-        else if (has(ABS_Y) && throttle_axis != ABS_Y) mixture_axis = ABS_Y;
+        if (has(kAbsThrottle)) throttle_axis = kAbsThrottle;
+        else if (has(kAbsZ)) throttle_axis = kAbsZ;
+        else if (has(kAbsX)) throttle_axis = kAbsX;
+        if (has(kAbsRy)) mixture_axis = kAbsRy;
+        else if (has(kAbsY) && throttle_axis != kAbsY) mixture_axis = kAbsY;
         return;
     }
 
-    if (has(ABS_X)) roll_axis = ABS_X;
-    if (has(ABS_Y)) pitch_axis = ABS_Y;
-    if (has(ABS_HAT0X)) hat_x_axis = ABS_HAT0X;
-    if (has(ABS_HAT0Y)) hat_y_axis = ABS_HAT0Y;
+    if (has(kAbsX)) roll_axis = kAbsX;
+    if (has(kAbsY)) pitch_axis = kAbsY;
+    if (has(kAbsHat0X)) hat_x_axis = kAbsHat0X;
+    if (has(kAbsHat0Y)) hat_y_axis = kAbsHat0Y;
 
-    if (has_gamepad_btns && !has_joystick_btns && has(ABS_RX) && has(ABS_RY)) {
+    if (has_gamepad_btns && !has_joystick_btns && has(kAbsRx) && has(kAbsRy)) {
         // Dual-stick gamepad: left stick X/Y = roll/pitch, right stick X = rudder, triggers Z/RZ = brakes.
-        rudder_axis = ABS_RX;
-        if (has(ABS_Z)) brake_left_axis = ABS_Z;
-        if (has(ABS_RZ)) brake_right_axis = ABS_RZ;
+        rudder_axis = kAbsRx;
+        if (has(kAbsZ)) brake_left_axis = kAbsZ;
+        if (has(kAbsRz)) brake_right_axis = kAbsRz;
         return;
     }
 
-    if (has(ABS_RZ)) rudder_axis = ABS_RZ;
-    else if (has(ABS_RUDDER)) rudder_axis = ABS_RUDDER;
+    if (has(kAbsRz)) rudder_axis = kAbsRz;
+    else if (has(kAbsRudder)) rudder_axis = kAbsRudder;
 
-    if (has(ABS_THROTTLE)) throttle_axis = ABS_THROTTLE;
-    else if (has(ABS_Z)) throttle_axis = ABS_Z;
+    if (has(kAbsThrottle)) throttle_axis = kAbsThrottle;
+    else if (has(kAbsZ)) throttle_axis = kAbsZ;
 
     // Desktop flight yokes with levers (CH Flight Sim Yoke, Logitech/Saitek Yoke + Quadrant) expose mixture on ABS_RY.
-    if (has(ABS_RY) && mixture_axis < 0) mixture_axis = ABS_RY;
-#else
-    (void)has_joystick_btns;
-    (void)has_gamepad_btns;
-#endif
+    if (has(kAbsRy) && mixture_axis < 0) mixture_axis = kAbsRy;
 }
 
 double YokeDeviceState::normalize_bipolar(const YokeAxisCalib &a) {
@@ -297,7 +346,14 @@ FlightYokeInput::~FlightYokeInput() {
 }
 
 void FlightYokeInput::close_index(size_t i) {
-#ifdef __linux__
+#ifdef _WIN32
+    if (i < platform_handles_.size() && platform_handles_[i]) {
+        auto *dev = static_cast<IDirectInputDevice8W *>(platform_handles_[i]);
+        dev->Unacquire();
+        dev->Release();
+    }
+    if (i < platform_handles_.size()) platform_handles_.erase(platform_handles_.begin() + static_cast<ptrdiff_t>(i));
+#elif defined(__linux__)
     if (i < fds_.size() && fds_[i] >= 0) close(fds_[i]);
 #endif
     if (i < devs_.size()) {
@@ -308,7 +364,24 @@ void FlightYokeInput::close_index(size_t i) {
 }
 
 void FlightYokeInput::shutdown() {
-#ifdef __linux__
+#ifdef _WIN32
+    for (void *h : platform_handles_) {
+        if (h) {
+            auto *dev = static_cast<IDirectInputDevice8W *>(h);
+            dev->Unacquire();
+            dev->Release();
+        }
+    }
+    platform_handles_.clear();
+    if (di_ctx_) {
+        static_cast<IDirectInput8W *>(di_ctx_)->Release();
+        di_ctx_ = nullptr;
+    }
+    if (di_hwnd_) {
+        DestroyWindow(static_cast<HWND>(di_hwnd_));
+        di_hwnd_ = nullptr;
+    }
+#elif defined(__linux__)
     for (int fd : fds_) if (fd >= 0) close(fd);
 #endif
     fds_.clear();
@@ -325,7 +398,121 @@ void FlightYokeInput::reset_calibration() {
 }
 
 void FlightYokeInput::rescan() {
-#ifdef __linux__
+#ifdef _WIN32
+    if (!di_hwnd_) {
+        di_hwnd_ = CreateWindowExW(0, L"STATIC", L"OpenSkyDI", 0, 0, 0, 0, 0,
+                                   HWND_MESSAGE, nullptr, GetModuleHandleW(nullptr), nullptr);
+    }
+    if (!di_ctx_) {
+        IDirectInput8W *di = nullptr;
+        if (FAILED(DirectInput8Create(GetModuleHandleW(nullptr), DIRECTINPUT_VERSION,
+                                      IID_IDirectInput8W, reinterpret_cast<void **>(&di), nullptr)) || !di) {
+            return;
+        }
+        di_ctx_ = di;
+    }
+    auto *di = static_cast<IDirectInput8W *>(di_ctx_);
+
+    struct EnumCtx {
+        FlightYokeInput *self;
+        IDirectInput8W *di;
+    } ectx{this, di};
+
+    auto enum_cb = [](LPCDIDEVICEINSTANCEW inst, LPVOID ref) -> BOOL {
+        auto *ctx = static_cast<EnumCtx *>(ref);
+        FlightYokeInput *self = ctx->self;
+        if (self->devs_.size() >= 8) return DIENUM_STOP;
+
+        const std::string path = format_guid(inst->guidInstance);
+        for (const auto &d : self->devs_) {
+            if (d.path == path) return DIENUM_CONTINUE;
+        }
+
+        IDirectInputDevice8W *pdev = nullptr;
+        if (FAILED(ctx->di->CreateDevice(inst->guidInstance, &pdev, nullptr)) || !pdev) {
+            return DIENUM_CONTINUE;
+        }
+        if (FAILED(pdev->SetDataFormat(&c_dfDIJoystick2)) ||
+            (self->di_hwnd_ && FAILED(pdev->SetCooperativeLevel(static_cast<HWND>(self->di_hwnd_),
+                                                                DISCL_BACKGROUND | DISCL_NONEXCLUSIVE)))) {
+            pdev->Release();
+            return DIENUM_CONTINUE;
+        }
+
+        YokeDeviceState dev;
+        dev.path = path;
+        dev.name = wide_to_utf8(inst->tszProductName);
+        if (dev.name.empty()) dev.name = "USB Flight Controller";
+
+        struct AxisEnumCtx {
+            IDirectInputDevice8W *pdev;
+            YokeDeviceState *dev;
+            int slider_idx = 0;
+        } actx{pdev, &dev, 0};
+
+        auto obj_cb = [](LPCDIDEVICEOBJECTINSTANCEW obj, LPVOID aref) -> BOOL {
+            auto *a = static_cast<AxisEnumCtx *>(aref);
+            int slot = -1;
+            if (IsEqualGUID(obj->guidType, GUID_XAxis)) slot = kAbsX;
+            else if (IsEqualGUID(obj->guidType, GUID_YAxis)) slot = kAbsY;
+            else if (IsEqualGUID(obj->guidType, GUID_ZAxis)) slot = kAbsZ;
+            else if (IsEqualGUID(obj->guidType, GUID_RxAxis)) slot = kAbsRx;
+            else if (IsEqualGUID(obj->guidType, GUID_RyAxis)) slot = kAbsRy;
+            else if (IsEqualGUID(obj->guidType, GUID_RzAxis)) slot = kAbsRz;
+            else if (IsEqualGUID(obj->guidType, GUID_Slider)) {
+                slot = (a->slider_idx == 0) ? kAbsThrottle : kAbsRudder;
+                ++a->slider_idx;
+            }
+            if (slot < 0 || slot >= YokeDeviceState::kMaxAbs) return DIENUM_CONTINUE;
+
+            DIPROPRANGE rng{};
+            rng.diph.dwSize = sizeof(DIPROPRANGE);
+            rng.diph.dwHeaderSize = sizeof(DIPROPHEADER);
+            rng.diph.dwObj = obj->dwType;
+            rng.diph.dwHow = DIPH_BYID;
+            if (SUCCEEDED(a->pdev->GetProperty(DIPROP_RANGE, &rng.diph)) &&
+                rng.lMax > rng.lMin && rng.lMin > -10000000 && rng.lMax < 10000000) {
+                a->dev->axes[static_cast<size_t>(slot)].present = true;
+                a->dev->axes[static_cast<size_t>(slot)].min_val = static_cast<int32_t>(rng.lMin);
+                a->dev->axes[static_cast<size_t>(slot)].max_val = static_cast<int32_t>(rng.lMax);
+                a->dev->axes[static_cast<size_t>(slot)].value = static_cast<int32_t>((rng.lMin + rng.lMax) / 2);
+            } else {
+                rng.lMin = 0;
+                rng.lMax = 65535;
+                a->pdev->SetProperty(DIPROP_RANGE, &rng.diph);
+                a->dev->axes[static_cast<size_t>(slot)].present = true;
+                a->dev->axes[static_cast<size_t>(slot)].min_val = 0;
+                a->dev->axes[static_cast<size_t>(slot)].max_val = 65535;
+                a->dev->axes[static_cast<size_t>(slot)].value = 32767;
+            }
+            return DIENUM_CONTINUE;
+        };
+
+        pdev->EnumObjects(obj_cb, &actx, DIDFT_AXIS);
+        DIDEVCAPS caps{};
+        caps.dwSize = sizeof(caps);
+        pdev->GetCapabilities(&caps);
+        if (caps.dwPOVs > 0) {
+            dev.axes[kAbsHat0X] = {true, -1000, 1000, 0, 0, false};
+            dev.axes[kAbsHat0Y] = {true, -1000, 1000, 0, 0, false};
+        }
+
+        const std::string low = to_lower_ascii(dev.name);
+        const bool is_gamepad = contains_ci(low, "xbox") || contains_ci(low, "gamepad") || contains_ci(low, "controller");
+        dev.assign_default_mapping(!is_gamepad && caps.dwButtons > 0, is_gamepad);
+
+        pdev->Acquire();
+        std::printf("[YOKE] Connected %s (%s) role=%d roll=%d pitch=%d rud=%d thr=%d mix=%d brk=%d/%d\n",
+                    dev.name.c_str(), dev.path.c_str(), static_cast<int>(dev.role),
+                    dev.roll_axis, dev.pitch_axis, dev.rudder_axis,
+                    dev.throttle_axis, dev.mixture_axis, dev.brake_left_axis, dev.brake_right_axis);
+        self->devs_.push_back(std::move(dev));
+        self->platform_handles_.push_back(pdev);
+        return DIENUM_CONTINUE;
+    };
+
+    di->EnumDevices(DI8DEVCLASS_GAMECTRL, enum_cb, &ectx, DIEDFL_ATTACHEDONLY);
+#elif defined(__linux__)
     std::error_code ec;
     const std::filesystem::path dir("/dev/input");
     if (!std::filesystem::exists(dir, ec)) return;
@@ -436,7 +623,80 @@ void FlightYokeInput::rescan() {
 }
 
 void FlightYokeInput::poll(const YokeConfig &cfg) {
-#ifdef __linux__
+#ifdef _WIN32
+    const auto now_s = std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (next_scan_s_ < 0.0 || now_s >= next_scan_s_) {
+        static UINT last_raw_count = UINT_MAX;
+        UINT raw_count = 0;
+        GetRawInputDeviceList(nullptr, &raw_count, sizeof(RAWINPUTDEVICELIST));
+        if (next_scan_s_ < 0.0 || raw_count != last_raw_count) {
+            last_raw_count = raw_count;
+            rescan();
+        }
+        next_scan_s_ = now_s + 2.5;
+    }
+
+    for (size_t i = 0; i < devs_.size();) {
+        auto *pdev = static_cast<IDirectInputDevice8W *>(platform_handles_[i]);
+        if (!pdev) { close_index(i); continue; }
+        HRESULT hr = pdev->Poll();
+        if (hr == DIERR_INPUTLOST || hr == DIERR_NOTACQUIRED) {
+            pdev->Acquire();
+            hr = pdev->Poll();
+        }
+        DIJOYSTATE2 js{};
+        if (SUCCEEDED(hr) || hr == DI_NOEFFECT) {
+            hr = pdev->GetDeviceState(sizeof(js), &js);
+            if (hr == DIERR_INPUTLOST || hr == DIERR_NOTACQUIRED) {
+                pdev->Acquire();
+                hr = pdev->GetDeviceState(sizeof(js), &js);
+            }
+        }
+        if (hr == static_cast<HRESULT>(DIERR_UNPLUGGED) || hr == static_cast<HRESULT>(DIERR_NOTFOUND)) {
+            close_index(i);
+            continue;
+        }
+        if (SUCCEEDED(hr)) {
+            auto set_ax = [&](int slot, LONG val) {
+                if (devs_[i].axes[static_cast<size_t>(slot)].present) {
+                    devs_[i].axes[static_cast<size_t>(slot)].value = static_cast<int32_t>(val);
+                }
+            };
+            set_ax(kAbsX, js.lX);
+            set_ax(kAbsY, js.lY);
+            set_ax(kAbsZ, js.lZ);
+            set_ax(kAbsRx, js.lRx);
+            set_ax(kAbsRy, js.lRy);
+            set_ax(kAbsRz, js.lRz);
+            set_ax(kAbsThrottle, js.rglSlider[0]);
+            set_ax(kAbsRudder, js.rglSlider[1]);
+
+            if (devs_[i].axes[kAbsHat0X].present && devs_[i].axes[kAbsHat0Y].present) {
+                const DWORD pov = js.rgdwPOV[0];
+                if (LOWORD(pov) == 0xFFFF) {
+                    devs_[i].axes[kAbsHat0X].value = 0;
+                    devs_[i].axes[kAbsHat0Y].value = 0;
+                } else {
+                    const double rad = static_cast<double>(pov) * 0.01 * (3.14159265358979323846 / 180.0);
+                    devs_[i].axes[kAbsHat0X].value = static_cast<int32_t>(std::lround(std::sin(rad) * 1000.0));
+                    devs_[i].axes[kAbsHat0Y].value = static_cast<int32_t>(std::lround(-std::cos(rad) * 1000.0));
+                }
+            }
+
+            devs_[i].buttons.fill(false);
+            for (int b = 0; b < 32; ++b) {
+                if ((js.rgbButtons[b] & 0x80) != 0) {
+                    const int slot = map_win_button(b);
+                    if (slot >= 0 && slot < YokeDeviceState::kMaxBtns) {
+                        devs_[i].buttons[static_cast<size_t>(slot)] = true;
+                    }
+                }
+            }
+        }
+        ++i;
+    }
+#elif defined(__linux__)
     const auto now_s = std::chrono::duration<double>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
     if (next_scan_s_ < 0.0 || now_s >= next_scan_s_) {

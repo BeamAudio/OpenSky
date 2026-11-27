@@ -30,6 +30,7 @@ JSBSIM_INPUTS := $(shell find $(JSBSIM_ROOT)/src -type f) $(JSBSIM_ROOT)/CMakeLi
 SRCS := \
 	src/gl_loader.cpp \
 	src/flight_profiler.cpp \
+	src/platform_io.cpp \
 	src/platform_window.cpp \
 	src/pack_reader.cpp \
 	src/async_streamer.cpp \
@@ -59,7 +60,7 @@ CSRCS := third_party/miniz_tinfl.c
 
 THIRDPARTY_CPP := third_party/bc7enc.cpp
 OBJS := $(SRCS:.cpp=.o) $(THIRDPARTY_CPP:.cpp=.o) $(CSRCS:.c=.o)
-TARGET := nspain_sim
+TARGET := OpenSky
 DEPS := $(OBJS:.o=.d)
 
 .DEFAULT_GOAL := all

@@ -10,7 +10,16 @@
 #include <cstring>
 #include <vector>
 
-#ifndef _WIN32
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <windowsx.h>
+#else
 #include <X11/Xlib.h>
 #include <X11/XKBlib.h>
 #include <X11/Xatom.h>
@@ -21,7 +30,544 @@
 
 namespace nsim {
 
-#ifndef _WIN32
+namespace {
+
+PixelRect fit_rect(PixelRect bounds, int aspect_w, int aspect_h) {
+    int w = std::min(bounds.w, static_cast<int>(1LL * bounds.h * aspect_w / aspect_h));
+    int h = static_cast<int>(1LL * w * aspect_h / aspect_w);
+    return {bounds.x + (bounds.w - w) / 2, bounds.y + (bounds.h - h) / 2, w, h};
+}
+
+} // namespace
+
+#ifdef _WIN32
+namespace {
+
+constexpr int kWGL_DRAW_TO_WINDOW_ARB = 0x2001;
+constexpr int kWGL_SUPPORT_OPENGL_ARB = 0x2010;
+constexpr int kWGL_DOUBLE_BUFFER_ARB = 0x2011;
+constexpr int kWGL_PIXEL_TYPE_ARB = 0x2013;
+constexpr int kWGL_COLOR_BITS_ARB = 0x2014;
+constexpr int kWGL_RED_BITS_ARB = 0x2015;
+constexpr int kWGL_GREEN_BITS_ARB = 0x2017;
+constexpr int kWGL_BLUE_BITS_ARB = 0x2019;
+constexpr int kWGL_ALPHA_BITS_ARB = 0x201B;
+constexpr int kWGL_DEPTH_BITS_ARB = 0x2022;
+constexpr int kWGL_TYPE_RGBA_ARB = 0x202B;
+constexpr int kWGL_CONTEXT_MAJOR_VERSION_ARB = 0x2091;
+constexpr int kWGL_CONTEXT_MINOR_VERSION_ARB = 0x2092;
+constexpr int kWGL_CONTEXT_PROFILE_MASK_ARB = 0x9126;
+constexpr int kWGL_CONTEXT_CORE_PROFILE_BIT_ARB = 0x00000001;
+
+using PFN_wglChoosePixelFormatARB = BOOL (WINAPI *)(HDC, const int *, const FLOAT *, UINT, int *, UINT *);
+using PFN_wglCreateContextAttribsARB = HGLRC (WINAPI *)(HDC, HGLRC, const int *);
+using PFN_wglSwapIntervalEXT = BOOL (WINAPI *)(int);
+
+std::wstring utf8_to_wide_win(const char *s) {
+    if (!s || !*s) return L"OpenSky VFR Simulator";
+    const int len = static_cast<int>(std::strlen(s));
+    const int needed = MultiByteToWideChar(CP_UTF8, 0, s, len, nullptr, 0);
+    if (needed <= 0) return L"OpenSky VFR Simulator";
+    std::wstring out(static_cast<size_t>(needed), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s, len, out.data(), needed);
+    return out;
+}
+
+void enable_per_monitor_dpi() {
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    if (!user32) return;
+    using SetDpiCtxFn = BOOL (WINAPI *)(HANDLE);
+    auto set_ctx = reinterpret_cast<SetDpiCtxFn>(reinterpret_cast<void *>(
+        GetProcAddress(user32, "SetProcessDpiAwarenessContext")));
+    if (set_ctx) {
+        // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 == (HANDLE)-4
+        if (set_ctx(reinterpret_cast<HANDLE>(static_cast<intptr_t>(-4)))) return;
+    }
+    using SetDpiAwareFn = BOOL (WINAPI *)(void);
+    auto set_aware = reinterpret_cast<SetDpiAwareFn>(reinterpret_cast<void *>(
+        GetProcAddress(user32, "SetProcessDPIAware")));
+    if (set_aware) set_aware();
+}
+
+KeyCode map_vk(WPARAM vk) {
+    switch (vk) {
+        case 'W': return KEY_W;
+        case 'A': return KEY_A;
+        case 'S': return KEY_S;
+        case 'D': return KEY_D;
+        case 'Q': return KEY_Q;
+        case 'E': return KEY_E;
+        case 'R': return KEY_R;
+        case 'T': return KEY_T;
+        case 'F': return KEY_F;
+        case 'V': return KEY_V;
+        case 'C': return KEY_C;
+        case 'L': return KEY_L;
+        case 'K': return KEY_K;
+        case 'O': return KEY_O;
+        case 'B': return KEY_B;
+        case 'P': return KEY_P;
+        case 'M': return KEY_M;
+        case 'Y': return KEY_Y;
+        case 'H': return KEY_H;
+        case 'N': return KEY_N;
+        case 'U': return KEY_U;
+        case 'X': return KEY_X;
+        case VK_RETURN: return KEY_ENTER;
+        case VK_HOME: return KEY_HOME;
+        case VK_END: return KEY_END;
+        case VK_PRIOR: return KEY_PAGEUP;
+        case VK_NEXT: return KEY_PAGEDOWN;
+        case VK_BACK: return KEY_BACKSPACE;
+        case VK_UP: return KEY_UP;
+        case VK_DOWN: return KEY_DOWN;
+        case VK_LEFT: return KEY_LEFT;
+        case VK_RIGHT: return KEY_RIGHT;
+        case VK_SPACE: return KEY_SPACE;
+        case VK_TAB: return KEY_TAB;
+        case VK_ESCAPE: return KEY_ESC;
+        case VK_SHIFT: case VK_LSHIFT: case VK_RSHIFT: return KEY_SHIFT;
+        case VK_F1: return KEY_F1;
+        case VK_F2: return KEY_F2;
+        case VK_F3: return KEY_F3;
+        case VK_F4: return KEY_F4;
+        case VK_F5: return KEY_F5;
+        case VK_F6: return KEY_F6;
+        case VK_F7: return KEY_F7;
+        case '1': case VK_NUMPAD1: return KEY_1;
+        case '2': case VK_NUMPAD2: return KEY_2;
+        case '3': case VK_NUMPAD3: return KEY_3;
+        case '4': case VK_NUMPAD4: return KEY_4;
+        case '5': case VK_NUMPAD5: return KEY_5;
+        case '6': case VK_NUMPAD6: return KEY_6;
+        case '7': case VK_NUMPAD7: return KEY_7;
+        case '8': case VK_NUMPAD8: return KEY_8;
+        case '9': case VK_NUMPAD9: return KEY_9;
+        default: return KEY_NONE;
+    }
+}
+
+void detect_monitor_win32(PixelRect &out_monitor, PixelRect &out_work, double &out_hz) {
+    POINT pt{0, 0};
+    GetCursorPos(&pt);
+    HMONITOR mon = MonitorFromPoint(pt, MONITOR_DEFAULTTOPRIMARY);
+    MONITORINFOEXW mi{};
+    mi.cbSize = sizeof(mi);
+    if (GetMonitorInfoW(mon, &mi)) {
+        out_monitor = {
+            mi.rcMonitor.left, mi.rcMonitor.top,
+            mi.rcMonitor.right - mi.rcMonitor.left,
+            mi.rcMonitor.bottom - mi.rcMonitor.top
+        };
+        out_work = {
+            mi.rcWork.left, mi.rcWork.top,
+            mi.rcWork.right - mi.rcWork.left,
+            mi.rcWork.bottom - mi.rcWork.top
+        };
+        DEVMODEW dm{};
+        dm.dmSize = sizeof(dm);
+        if (EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) &&
+            dm.dmDisplayFrequency >= 24 && dm.dmDisplayFrequency <= 360) {
+            out_hz = static_cast<double>(dm.dmDisplayFrequency);
+        }
+    } else {
+        const int sw = std::max(640, GetSystemMetrics(SM_CXSCREEN));
+        const int sh = std::max(480, GetSystemMetrics(SM_CYSCREEN));
+        out_monitor = {0, 0, sw, sh};
+        out_work = out_monitor;
+    }
+}
+
+} // namespace
+
+struct PlatformWindow::Impl {
+    HINSTANCE hinst = nullptr;
+    HWND hwnd = nullptr;
+    HDC hdc = nullptr;
+    HGLRC hglrc = nullptr;
+    PFN_wglSwapIntervalEXT swap_interval_fn = nullptr;
+    PlatformWindow *owner = nullptr;
+
+    static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+        if (msg == WM_NCCREATE) {
+            auto *cs = reinterpret_cast<CREATESTRUCTW *>(lparam);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(cs->lpCreateParams));
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
+        }
+        auto *self = reinterpret_cast<PlatformWindow *>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        if (!self) return DefWindowProcW(hwnd, msg, wparam, lparam);
+        return self->impl_->handle_msg(hwnd, msg, wparam, lparam);
+    }
+
+    LRESULT handle_msg(HWND wnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+        switch (msg) {
+            case WM_CLOSE:
+                owner->should_close_ = true;
+                return 0;
+            case WM_DESTROY:
+                owner->should_close_ = true;
+                return 0;
+            case WM_SETFOCUS:
+                owner->focused_ = true;
+                return 0;
+            case WM_KILLFOCUS:
+                owner->focused_ = false;
+                owner->mouse_left_ = owner->mouse_right_ = false;
+                std::memset(owner->key_down_, 0, sizeof(owner->key_down_));
+                ReleaseCapture();
+                return 0;
+            case WM_SIZE:
+                if (wparam != SIZE_MINIMIZED) {
+                    const int nw = LOWORD(lparam);
+                    const int nh = HIWORD(lparam);
+                    if (nw > 0 && nh > 0) {
+                        owner->width_ = nw;
+                        owner->height_ = nh;
+                    }
+                }
+                return 0;
+            case WM_KEYDOWN:
+            case WM_SYSKEYDOWN: {
+                if (msg == WM_SYSKEYDOWN && (lparam & (1 << 29)) != 0 && wparam == VK_F4) {
+                    return DefWindowProcW(wnd, msg, wparam, lparam);
+                }
+                const KeyCode k = map_vk(wparam);
+                if (k != KEY_NONE) {
+                    if (!owner->key_down_[k]) owner->key_pressed_[k] = true;
+                    owner->key_down_[k] = true;
+                    return 0;
+                }
+                break;
+            }
+            case WM_KEYUP:
+            case WM_SYSKEYUP: {
+                const KeyCode k = map_vk(wparam);
+                if (k == KEY_SHIFT) {
+                    if ((GetKeyState(VK_SHIFT) & 0x8000) == 0) owner->key_down_[KEY_SHIFT] = false;
+                    return 0;
+                }
+                if (k != KEY_NONE) {
+                    owner->key_down_[k] = false;
+                    return 0;
+                }
+                break;
+            }
+            case WM_LBUTTONDOWN:
+                owner->mouse_left_ = true;
+                owner->mouse_left_clicked_ = true;
+                owner->mouse_x_ = GET_X_LPARAM(lparam);
+                owner->mouse_y_ = GET_Y_LPARAM(lparam);
+                SetCapture(wnd);
+                return 0;
+            case WM_LBUTTONUP:
+                owner->mouse_left_ = false;
+                if (!owner->mouse_right_) ReleaseCapture();
+                return 0;
+            case WM_RBUTTONDOWN:
+                owner->mouse_right_ = true;
+                owner->mouse_x_ = GET_X_LPARAM(lparam);
+                owner->mouse_y_ = GET_Y_LPARAM(lparam);
+                SetCapture(wnd);
+                return 0;
+            case WM_RBUTTONUP:
+                owner->mouse_right_ = false;
+                if (!owner->mouse_left_) ReleaseCapture();
+                return 0;
+            case WM_MOUSEMOVE: {
+                const int nx = GET_X_LPARAM(lparam);
+                const int ny = GET_Y_LPARAM(lparam);
+                if (owner->warp_pending_ && nx == owner->width_ / 2 && ny == owner->height_ / 2) {
+                    owner->warp_pending_ = false;
+                    owner->mouse_x_ = nx;
+                    owner->mouse_y_ = ny;
+                    return 0;
+                }
+                if (owner->mouse_left_ || owner->mouse_right_ || (owner->relative_mouse_ && owner->focused_)) {
+                    owner->mouse_dx_ += static_cast<float>(nx - owner->mouse_x_);
+                    owner->mouse_dy_ += static_cast<float>(ny - owner->mouse_y_);
+                }
+                owner->mouse_x_ = nx;
+                owner->mouse_y_ = ny;
+                return 0;
+            }
+            default:
+                break;
+        }
+        return DefWindowProcW(wnd, msg, wparam, lparam);
+    }
+};
+
+PlatformWindow::~PlatformWindow() {
+    destroy();
+}
+
+bool PlatformWindow::create(const char *title, int aspect_w, int aspect_h, DisplayMode mode, bool visible) {
+    destroy();
+    enable_per_monitor_dpi();
+
+    impl_ = new Impl();
+    impl_->owner = this;
+    impl_->hinst = GetModuleHandleW(nullptr);
+
+    constexpr wchar_t kClassName[] = L"OpenSkyVFRWindow";
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.style = CS_OWNDC | CS_HREDRAW | CS_VREDRAW;
+    wc.lpfnWndProc = Impl::wnd_proc;
+    wc.hInstance = impl_->hinst;
+    wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
+    wc.lpszClassName = kClassName;
+    if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        std::fprintf(stderr, "[WIN] RegisterClassExW failed\n");
+        destroy();
+        return false;
+    }
+
+    // Bootstrap WGL extension pointers through a hidden dummy window.
+    HWND dummy_wnd = CreateWindowExW(0, kClassName, L"", WS_OVERLAPPED, 0, 0, 16, 16,
+                                     nullptr, nullptr, impl_->hinst, nullptr);
+    if (!dummy_wnd) {
+        std::fprintf(stderr, "[WIN] Failed to create bootstrap WGL window\n");
+        destroy();
+        return false;
+    }
+    HDC dummy_dc = GetDC(dummy_wnd);
+    PIXELFORMATDESCRIPTOR dummy_pfd{};
+    dummy_pfd.nSize = sizeof(dummy_pfd);
+    dummy_pfd.nVersion = 1;
+    dummy_pfd.dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
+    dummy_pfd.iPixelType = PFD_TYPE_RGBA;
+    dummy_pfd.cColorBits = 32;
+    dummy_pfd.cDepthBits = 24;
+    const int dummy_pf = ChoosePixelFormat(dummy_dc, &dummy_pfd);
+    if (!dummy_pf || !SetPixelFormat(dummy_dc, dummy_pf, &dummy_pfd)) {
+        ReleaseDC(dummy_wnd, dummy_dc);
+        DestroyWindow(dummy_wnd);
+        std::fprintf(stderr, "[WIN] Bootstrap SetPixelFormat failed\n");
+        destroy();
+        return false;
+    }
+    HGLRC dummy_gl = wglCreateContext(dummy_dc);
+    if (!dummy_gl || !wglMakeCurrent(dummy_dc, dummy_gl)) {
+        if (dummy_gl) wglDeleteContext(dummy_gl);
+        ReleaseDC(dummy_wnd, dummy_dc);
+        DestroyWindow(dummy_wnd);
+        std::fprintf(stderr, "[WIN] Bootstrap wglCreateContext failed\n");
+        destroy();
+        return false;
+    }
+
+    auto choose_pf_arb = reinterpret_cast<PFN_wglChoosePixelFormatARB>(reinterpret_cast<void *>(
+        wglGetProcAddress("wglChoosePixelFormatARB")));
+    auto create_ctx_arb = reinterpret_cast<PFN_wglCreateContextAttribsARB>(reinterpret_cast<void *>(
+        wglGetProcAddress("wglCreateContextAttribsARB")));
+    impl_->swap_interval_fn = reinterpret_cast<PFN_wglSwapIntervalEXT>(reinterpret_cast<void *>(
+        wglGetProcAddress("wglSwapIntervalEXT")));
+
+    wglMakeCurrent(nullptr, nullptr);
+    wglDeleteContext(dummy_gl);
+    ReleaseDC(dummy_wnd, dummy_dc);
+    DestroyWindow(dummy_wnd);
+
+    if (!create_ctx_arb) {
+        std::fprintf(stderr, "[WIN] Missing wglCreateContextAttribsARB (OpenGL 4.5+ driver required)\n");
+        destroy();
+        return false;
+    }
+
+    PixelRect monitor{0, 0, 1600, 900}, work{0, 0, 1600, 900};
+    refresh_hz_ = 60.0;
+    detect_monitor_win32(monitor, work, refresh_hz_);
+
+    PixelRect bounds{};
+    if (mode == DisplayMode::Fullscreen || mode == DisplayMode::FullscreenWindowed) {
+        bounds = monitor;
+    } else {
+        const int w = std::min(monitor.w * 9 / 10, work.w);
+        const int h = std::min(monitor.h * 9 / 10, std::max(1, work.h - 48));
+        bounds = fit_rect({work.x + (work.w - w) / 2, work.y + (work.h - h) / 2, w, h}, aspect_w, aspect_h);
+    }
+    width_ = bounds.w;
+    height_ = bounds.h;
+
+    DWORD style = WS_CLIPCHILDREN | WS_CLIPSIBLINGS;
+    DWORD ex_style = WS_EX_APPWINDOW;
+    int win_x = bounds.x;
+    int win_y = bounds.y;
+    int win_w = width_;
+    int win_h = height_;
+    if (mode == DisplayMode::Fullscreen || mode == DisplayMode::FullscreenWindowed) {
+        style |= WS_POPUP;
+    } else {
+        style |= WS_OVERLAPPEDWINDOW;
+        RECT wr{bounds.x, bounds.y, bounds.x + width_, bounds.y + height_};
+        AdjustWindowRectEx(&wr, style, FALSE, ex_style);
+        win_x = std::max(work.x, static_cast<int>(wr.left));
+        win_y = std::max(work.y, static_cast<int>(wr.top));
+        win_w = wr.right - wr.left;
+        win_h = wr.bottom - wr.top;
+    }
+
+    const std::wstring wtitle = utf8_to_wide_win(title);
+    impl_->hwnd = CreateWindowExW(ex_style, kClassName, wtitle.c_str(), style,
+                                  win_x, win_y, win_w, win_h,
+                                  nullptr, nullptr, impl_->hinst, this);
+    if (!impl_->hwnd) {
+        std::fprintf(stderr, "[WIN] CreateWindowExW failed\n");
+        destroy();
+        return false;
+    }
+    impl_->hdc = GetDC(impl_->hwnd);
+    if (!impl_->hdc) {
+        std::fprintf(stderr, "[WIN] GetDC failed\n");
+        destroy();
+        return false;
+    }
+
+    int pixel_format = 0;
+    if (choose_pf_arb) {
+        const int pf_attrs[] = {
+            kWGL_DRAW_TO_WINDOW_ARB, TRUE,
+            kWGL_SUPPORT_OPENGL_ARB, TRUE,
+            kWGL_DOUBLE_BUFFER_ARB, TRUE,
+            kWGL_PIXEL_TYPE_ARB, kWGL_TYPE_RGBA_ARB,
+            kWGL_COLOR_BITS_ARB, 32,
+            kWGL_RED_BITS_ARB, 8,
+            kWGL_GREEN_BITS_ARB, 8,
+            kWGL_BLUE_BITS_ARB, 8,
+            kWGL_ALPHA_BITS_ARB, 8,
+            kWGL_DEPTH_BITS_ARB, 24,
+            0
+        };
+        UINT num_formats = 0;
+        if (!choose_pf_arb(impl_->hdc, pf_attrs, nullptr, 1, &pixel_format, &num_formats) || num_formats == 0) {
+            pixel_format = 0;
+        }
+    }
+    PIXELFORMATDESCRIPTOR pfd{};
+    if (pixel_format == 0) {
+        pfd.nSize = sizeof(pfd);
+        pfd.nVersion = 1;
+        pfd.dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
+        pfd.iPixelType = PFD_TYPE_RGBA;
+        pfd.cColorBits = 32;
+        pfd.cDepthBits = 24;
+        pixel_format = ChoosePixelFormat(impl_->hdc, &pfd);
+    } else {
+        DescribePixelFormat(impl_->hdc, pixel_format, sizeof(pfd), &pfd);
+    }
+    if (!pixel_format || !SetPixelFormat(impl_->hdc, pixel_format, &pfd)) {
+        std::fprintf(stderr, "[WIN] SetPixelFormat failed\n");
+        destroy();
+        return false;
+    }
+
+    const int ctx_46[] = {
+        kWGL_CONTEXT_MAJOR_VERSION_ARB, 4,
+        kWGL_CONTEXT_MINOR_VERSION_ARB, 6,
+        kWGL_CONTEXT_PROFILE_MASK_ARB, kWGL_CONTEXT_CORE_PROFILE_BIT_ARB,
+        0
+    };
+    impl_->hglrc = create_ctx_arb(impl_->hdc, nullptr, ctx_46);
+    if (!impl_->hglrc) {
+        const int ctx_45[] = {
+            kWGL_CONTEXT_MAJOR_VERSION_ARB, 4,
+            kWGL_CONTEXT_MINOR_VERSION_ARB, 5,
+            kWGL_CONTEXT_PROFILE_MASK_ARB, kWGL_CONTEXT_CORE_PROFILE_BIT_ARB,
+            0
+        };
+        impl_->hglrc = create_ctx_arb(impl_->hdc, nullptr, ctx_45);
+    }
+    if (!impl_->hglrc || !wglMakeCurrent(impl_->hdc, impl_->hglrc)) {
+        std::fprintf(stderr, "[WIN] Failed to create OpenGL 4.5/4.6 Core context\n");
+        destroy();
+        return false;
+    }
+
+    if (visible) {
+        ShowWindow(impl_->hwnd, SW_SHOW);
+        UpdateWindow(impl_->hwnd);
+        SetForegroundWindow(impl_->hwnd);
+        focused_ = (GetForegroundWindow() == impl_->hwnd);
+    }
+
+    if (!load_gl_functions()) {
+        destroy();
+        return false;
+    }
+    set_vsync(false);
+    return true;
+}
+
+void PlatformWindow::destroy() {
+    if (!impl_) return;
+    if (impl_->hglrc) {
+        wglMakeCurrent(nullptr, nullptr);
+        wglDeleteContext(impl_->hglrc);
+        impl_->hglrc = nullptr;
+    }
+    if (impl_->hdc && impl_->hwnd) {
+        ReleaseDC(impl_->hwnd, impl_->hdc);
+        impl_->hdc = nullptr;
+    }
+    if (impl_->hwnd) {
+        DestroyWindow(impl_->hwnd);
+        impl_->hwnd = nullptr;
+    }
+    delete impl_;
+    impl_ = nullptr;
+}
+
+void PlatformWindow::set_vsync(bool enabled) {
+    if (impl_ && impl_->swap_interval_fn) {
+        impl_->swap_interval_fn(enabled ? 1 : 0);
+    }
+}
+
+void PlatformWindow::poll_events() {
+    std::memset(key_pressed_, 0, sizeof(key_pressed_));
+    mouse_left_clicked_ = false;
+    mouse_dx_ = 0.0f;
+    mouse_dy_ = 0.0f;
+    if (!impl_ || !impl_->hwnd) return;
+
+    MSG msg{};
+    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    if (relative_mouse_ && focused_ && (mouse_x_ != width_ / 2 || mouse_y_ != height_ / 2)) {
+        mouse_x_ = width_ / 2;
+        mouse_y_ = height_ / 2;
+        warp_pending_ = true;
+        POINT pt{mouse_x_, mouse_y_};
+        ClientToScreen(impl_->hwnd, &pt);
+        SetCursorPos(pt.x, pt.y);
+    }
+}
+
+void PlatformWindow::set_relative_mouse(bool enabled) {
+    if (relative_mouse_ == enabled) return;
+    relative_mouse_ = enabled;
+    mouse_dx_ = mouse_dy_ = 0.0f;
+    if (enabled && focused_ && impl_ && impl_->hwnd) {
+        mouse_x_ = width_ / 2;
+        mouse_y_ = height_ / 2;
+        warp_pending_ = true;
+        POINT pt{mouse_x_, mouse_y_};
+        ClientToScreen(impl_->hwnd, &pt);
+        SetCursorPos(pt.x, pt.y);
+    } else {
+        warp_pending_ = false;
+    }
+}
+
+void PlatformWindow::swap_buffers() {
+    if (impl_ && impl_->hdc) {
+        SwapBuffers(impl_->hdc);
+    }
+}
+#else
 namespace {
 
 using GLXFBConfig = void *;
@@ -115,12 +661,6 @@ KeyCode map_keysym(KeySym ks) {
 } // namespace
 
 namespace {
-
-PixelRect fit_rect(PixelRect bounds, int aspect_w, int aspect_h) {
-    int w = std::min(bounds.w, static_cast<int>(1LL * bounds.h * aspect_w / aspect_h));
-    int h = static_cast<int>(1LL * w * aspect_h / aspect_w);
-    return {bounds.x + (bounds.w - w) / 2, bounds.y + (bounds.h - h) / 2, w, h};
-}
 
 // XRandR 1.5 monitor information. Load the extension at runtime so X11
 // sessions without the extension still work with the default screen bounds.

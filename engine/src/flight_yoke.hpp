@@ -122,6 +122,9 @@ private:
 
     std::vector<YokeDeviceState> devs_;
     std::vector<int> fds_;
+    std::vector<void *> platform_handles_;
+    void *di_ctx_ = nullptr;
+    void *di_hwnd_ = nullptr;
     double next_scan_s_ = -1.0;
     YokeState state_{};
 };

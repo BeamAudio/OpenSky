@@ -260,7 +260,7 @@ def copy_app_base(stage: Path, packs_dir: Path) -> None:
     app = stage / APP_ROOT
     (app / "sim_engine").mkdir(parents=True)
     (app / "game/bin").mkdir(parents=True)
-    shutil.copy2(ROOT / "sim_engine/nspain_sim", app / "sim_engine/nspain_sim")
+    shutil.copy2(ROOT / "sim_engine/OpenSky", app / "sim_engine/OpenSky")
     shutil.copytree(ROOT / "sim_engine/shaders", app / "sim_engine/shaders")
     shutil.copytree(
         ROOT / "game/assets",
@@ -278,7 +278,7 @@ def copy_app_base(stage: Path, packs_dir: Path) -> None:
     launcher.write_text(
         "#!/bin/sh\n"
         "cd /opt/opensky-vfr || exit 1\n"
-        'exec /opt/opensky-vfr/sim_engine/nspain_sim "$@"\n',
+        'exec /opt/opensky-vfr/sim_engine/OpenSky "$@"\n',
         encoding="utf-8",
     )
     launcher.chmod(0o755)
@@ -460,7 +460,7 @@ def main() -> int:
     packs_dir = args.packs_dir.resolve()
     if not packs_dir.is_dir():
         parser.error(f"regional pack directory does not exist: {packs_dir}")
-    missing = [name for name in ALL_BASELINE_FILES if not (packs_dir / name).is_file()]
+    missing = [name for name in ARAGON_FILES if not (packs_dir / name).is_file()]
     if missing:
         parser.error("required baseline region data is missing: " + ", ".join(missing))
 
@@ -468,8 +468,8 @@ def main() -> int:
     cmake_bin = resolve_cmake()
     run(["make", "-C", "sim_engine", "clean"])
     run(["make", "-C", "sim_engine", f"-j{threads}", f"CMAKE={cmake_bin}", "PORTABLE=1", "PLAYER_PACKAGE=1"])
-    if not (ROOT / "sim_engine/nspain_sim").is_file() or not (ROOT / "game/bin/libJSBSim.so.1").is_file():
-        parser.error("missing sim_engine/nspain_sim or game/bin/libJSBSim.so.1")
+    if not (ROOT / "sim_engine/OpenSky").is_file() or not (ROOT / "game/bin/libJSBSim.so.1").is_file():
+        parser.error("missing sim_engine/OpenSky or game/bin/libJSBSim.so.1")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     output_dir = args.output_dir.resolve()
@@ -478,7 +478,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix=".deb-stage-", dir=output_dir) as tmp:
         temp_dir = Path(tmp)
         depends = resolve_runtime_depends(
-            ROOT / "sim_engine/nspain_sim",
+            ROOT / "sim_engine/OpenSky",
             ROOT / "game/bin/libJSBSim.so.1",
             temp_dir,
         )

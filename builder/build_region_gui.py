@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import math
+import os
 import queue
 import subprocess
 import sys
@@ -445,7 +446,10 @@ class PackCompilerGUI:
     def _open_packs(self) -> None:
         p = ROOT / "packs"
         p.mkdir(exist_ok=True)
-        subprocess.Popen(["xdg-open", str(p)])
+        if os.name == "nt":
+            os.startfile(str(p))  # type: ignore[attr-defined]
+        else:
+            subprocess.Popen(["xdg-open", str(p)])
 
     def _refresh_pack_contents(self) -> None:
         packs_dir = ROOT / "packs"

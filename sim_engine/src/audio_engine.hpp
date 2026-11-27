@@ -40,7 +40,7 @@ struct AudioState {
     float touchdown_sink_mps = 0.0f;
 };
 
-// Zero-dependency procedural aviation audio engine (Linux ALSA via dlopen libasound.so.2).
+// Zero-dependency procedural aviation audio engine (Linux ALSA via dlopen libasound.so.2, or Windows WinMM waveOut).
 // Runs synthesis in a dedicated low-CPU thread (<0.3% of 1 core) so rendering/thermals stay cool.
 class AudioEngine {
 public:
@@ -121,6 +121,7 @@ private:
 
     void *alsa_lib_ = nullptr;
     void *pcm_ = nullptr;
+    void *win_event_ = nullptr;
     std::thread thread_;
 };
 

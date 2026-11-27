@@ -129,22 +129,27 @@ def ensure_panel_bake_uv():
 
 
 def curved_windscreen(material):
-    """Build the C172's broad, shallow compound curve as a smoothly shaded pane."""
+    """Build the C172's wraparound compound-curved windshield sealing seamlessly to the front door posts."""
     across, rows = 32, 16
     cx = .14
     points = []
     for j in range(rows + 1):
         t = j / rows
-        # Follow the swept A-pillar from the glareshield up to the header seal.
-        half = .64 - .054 * t
-        y_edge = -.184 + .549 * t
-        z_edge = -.99 + .46 * t
+        # Curve the outer edges aft to Station 1 (z = -0.518) so the front glass meets the side windows with zero gap.
+        half_edge = (1.0 - t) * .686 + t * .592 + .024 * math.sin(math.pi * t)
+        y_edge = -.214 + t * (.368 + .214)
+        z_edge = -.518
+        y_center = -.164 + t * (.405 + .164)
+        z_center = -1.095 + .505 * t
+        p_exp = .36 + .10 * t
         for i in range(across + 1):
             u = 2.0 * i / across - 1.0
-            bow = 1.0 - u*u
-            points.append((cx + half*u,
-                           y_edge + bow*(.018 + .022*t),
-                           z_edge - bow*(.105 - .045*t)))
+            theta = abs(u) * (math.pi * 0.5)
+            sx = math.copysign(math.sin(theta) ** p_exp, u)
+            cz = math.cos(theta) ** p_exp
+            points.append((cx + half_edge * sx,
+                           y_edge + (y_center - y_edge) * cz,
+                           z_edge + (z_center - z_edge) * cz))
     stride = across + 1
     faces = [(j*stride+i, j*stride+i+1, (j+1)*stride+i+1, (j+1)*stride+i)
              for j in range(rows) for i in range(across)]

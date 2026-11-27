@@ -166,7 +166,7 @@ The optional live weather boundary feed can be disabled with `./run_sim.sh --no-
 
 A first-flight guide introduces these steps. During flight the interface overlays are hidden by default; turn them back on in **Settings → In-flight overlays**, or press `T` to show the controls guide. Display mode can be set to windowed, fullscreen, or fullscreen windowed in Settings (applied on restart), while **VSync**, **FPS limit**, and **Flight Yoke & Pedals** settings apply live.
 
-**F2 Balanced 60 FPS** is the default for new installations. It keeps the cockpit instruments at output resolution and caps presentation at 60 FPS. On Windows, F1 and F2 use a software deadline by default. **F1 Laptop / Battery** reduces render load further. **F3 High Quality** and **F4 Max Dedicated GPU** increase terrain and cloud detail, with F4 unlocked for high-refresh displays. The function keys apply the same presets as the graphics settings screen.
+**F2 Balanced 60 FPS** is the default for new installations. It keeps the cockpit instruments at output resolution and adjusts the scene resolution up to the selected limit as frame times allow. On Windows, F1 and F2 use a software deadline by default. **F1 Laptop / Battery** reduces render load further. **F3 High Quality** and **F4 Max Dedicated GPU** increase terrain and cloud detail, with F4 unlocked for high-refresh displays. The function keys apply the same presets as the graphics settings screen.
 
 ## Architecture
 

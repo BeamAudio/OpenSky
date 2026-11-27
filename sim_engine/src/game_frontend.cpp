@@ -1385,7 +1385,9 @@ void GameFrontend::draw_settings(AircraftAndHud &ui, int &time_of_day, RegionalA
     const int profile_delta = setting(0, "Performance preset", presets[s.quality_preset]);
     if (profile_delta != 0) apply_graphics_profile(s, (s.quality_preset + profile_delta + 4) % 4);
     std::snprintf(value, sizeof(value), "%d%%", s.pixel_percent);
-    s.pixel_percent = std::clamp(s.pixel_percent + 5 * setting(1, "Render resolution", value), 35, 150);
+    const bool adaptive_resolution = s.quality_preset == 1 && s.fps_limit == 60;
+    s.pixel_percent = std::clamp(s.pixel_percent + 5 * setting(1,
+        adaptive_resolution ? "Render resolution limit" : "Render resolution", value), 35, 150);
     s.aa_mode = (s.aa_mode + setting(2, "Anti-aliasing", aa[s.aa_mode]) + 3) % 3;
     {
         int ai = 2;

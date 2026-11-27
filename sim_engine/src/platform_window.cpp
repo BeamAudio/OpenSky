@@ -305,7 +305,7 @@ PlatformWindow::~PlatformWindow() {
     destroy();
 }
 
-bool PlatformWindow::create(const char *title, int aspect_w, int aspect_h, DisplayMode mode, bool visible) {
+bool PlatformWindow::create(const char *title, int aspect_w, int aspect_h, DisplayMode mode, bool visible, bool compact_preview) {
     destroy();
     enable_per_monitor_dpi();
 
@@ -388,7 +388,7 @@ bool PlatformWindow::create(const char *title, int aspect_w, int aspect_h, Displ
     if (mode == DisplayMode::Fullscreen || mode == DisplayMode::FullscreenWindowed) {
         bounds = monitor;
     } else {
-        const int w = std::min(monitor.w * 9 / 10, work.w);
+        const int w = std::min(compact_preview ? 1280 : monitor.w * 9 / 10, work.w);
         const int h = std::min(monitor.h * 9 / 10, std::max(1, work.h - 48));
         bounds = fit_rect({work.x + (work.w - w) / 2, work.y + (work.h - h) / 2, w, h}, aspect_w, aspect_h);
     }
@@ -490,9 +490,9 @@ bool PlatformWindow::create(const char *title, int aspect_w, int aspect_h, Displ
     }
 
     if (visible) {
-        ShowWindow(impl_->hwnd, SW_SHOW);
+        ShowWindow(impl_->hwnd, compact_preview ? SW_SHOWNOACTIVATE : SW_SHOW);
         UpdateWindow(impl_->hwnd);
-        SetForegroundWindow(impl_->hwnd);
+        if (!compact_preview) SetForegroundWindow(impl_->hwnd);
         focused_ = (GetForegroundWindow() == impl_->hwnd);
     }
 
@@ -770,7 +770,7 @@ PlatformWindow::~PlatformWindow() {
     destroy();
 }
 
-bool PlatformWindow::create(const char *title, int aspect_w, int aspect_h, DisplayMode mode, bool visible) {
+bool PlatformWindow::create(const char *title, int aspect_w, int aspect_h, DisplayMode mode, bool visible, bool compact_preview) {
     impl_ = new Impl();
     impl_->gl_lib = dlopen("libGL.so.1", RTLD_LAZY | RTLD_LOCAL);
     if (!impl_->gl_lib) {
@@ -807,7 +807,7 @@ bool PlatformWindow::create(const char *title, int aspect_w, int aspect_h, Displ
     if (mode == DisplayMode::Fullscreen || mode == DisplayMode::FullscreenWindowed) {
         bounds = monitor;
     } else {
-        const int w = std::min(monitor.w * 9 / 10, work.w);
+        const int w = std::min(compact_preview ? 1280 : monitor.w * 9 / 10, work.w);
         const int h = std::min(monitor.h * 9 / 10, std::max(1, work.h - 48));
         bounds = fit_rect({work.x + (work.w - w) / 2, work.y + (work.h - h) / 2, w, h},
                           aspect_w, aspect_h);

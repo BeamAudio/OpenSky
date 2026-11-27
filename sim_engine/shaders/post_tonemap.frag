@@ -162,7 +162,9 @@ void main() {
             float delta_luma = abs(dot(history_color - hdr, vec3(0.2126, 0.7152, 0.0722))) /
                                max(0.10, dot(hdr, vec3(0.2126, 0.7152, 0.0722)));
             float stability = 1.0 - smoothstep(0.20, 0.85, delta_luma) * 0.46;
-            float history_weight = u_aa_mode == 2 ? 0.34 : 0.48;
+            // The volume already has motion-compensated history. Limit the
+            // geometry history where its reprojection sees through clouds.
+            float history_weight = (u_aa_mode == 2 ? 0.34 : 0.48) * (1.0 - cld.a * 0.8);
             hdr = mix(hdr, history_color, history_weight * depth_gate * stability);
         }
     }

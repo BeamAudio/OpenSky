@@ -23,7 +23,6 @@ public:
         double main_cpu_percent = -1.0;
         int64_t rss_kib = -1, peak_rss_kib = -1, available_kib = -1, total_kib = -1;
         int64_t gpu_busy_pct = -1, vram_used_bytes = -1, vram_total_bytes = -1, gtt_used_bytes = -1;
-        int64_t cpu_temp_millic = -1, gpu_temp_millic = -1, gpu_power_microwatts = -1;
     };
 
     FlightProfiler();
@@ -44,7 +43,8 @@ public:
     double cpu_start() const;
     void cpu_end(CpuPhase phase, double start);
     void end_frame(const StreamStats &stream, const WeatherWorkStats &weather,
-                   const PackReader &pack, int max_lod, int scene_w, int scene_h);
+                   const PackReader &pack, int max_lod, int scene_w, int scene_h,
+                   bool budget_limited = false);
 
     const HostSample &host() const { return host_; }
     const auto &latest_gpu_ms() const { return latest_gpu_ms_; }
@@ -55,7 +55,6 @@ public:
     double frame_p99_ms() const { return frame_p99_ms_; }
     double encode_ms_per_page() const;
     double build_ms_per_page() const;
-    static double peak_package_temp_c();
 
 private:
     struct QueryFrame {

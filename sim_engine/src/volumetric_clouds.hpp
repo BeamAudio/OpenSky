@@ -50,7 +50,10 @@ public:
         const WeatherSnapshot *baked = nullptr, int season_override = -1,
         double day_cycle_elapsed_sec = -1.0
     );
-    void reset_temporal_history() { history_valid_ = false; post_history_valid_ = false; prev_camera_valid_ = false; }
+    void reset_temporal_history() {
+        history_valid_ = post_history_valid_ = prev_camera_valid_ = false;
+        cloud_filter_time_ = -1.0;
+    }
     void update_reflection_map_if_needed(double sim_time_sec);
 
     void begin_scene_pass();
@@ -61,13 +64,13 @@ public:
     void capture_cloud_occlusion_depth();
     // Run 1/4-res temporally reprojected 3D volumetric cloud raymarch + AgX/LUT composite to backbuffer!
     void render_clouds_and_post(
-        const Mat4 &vp, const Mat4 &inv_vp,
+        const Mat4 &vp, const Mat4 &inv_vp, const Mat4 &cloud_vp,
         const Vec3 &camera_forward,
         double cam_east_m, double cam_north_m, double cam_alt_m,
         GLuint cloud_noise_tex, GLuint cloud_vol_tex, GLuint cloud_detail_tex, GLuint lut_tex,
         GLuint atmo_field_tex, GLuint atmo_terrain_tex, const Vec4 &atmo_domain,
         GLuint local_atmo_field_tex, GLuint local_atmo_terrain_tex, const Vec4 &local_atmo_domain,
-        float time_sec, int frame_idx,
+        float time_sec,
         const Vec4 &wx_fx = {0.0f, 0.0f, 0.0f, 0.0f}
     );
     // Draw a native-resolution cockpit over the reconstructed world image.
@@ -97,7 +100,7 @@ private:
     GLint u_cld_inv_vp_ = -1, u_cld_prev_vp_ = -1, u_cld_sun_ = -1, u_cld_cam_en_ = -1, u_cld_cam_alt_ = -1;
     GLint u_cld_cam_delta_ = -1;
     GLint u_cld_base_ = -1, u_cld_thick_ = -1, u_cld_cov_ = -1, u_cld_precip_ = -1, u_cld_time_ = -1;
-    GLint u_cld_frame_ = -1, u_cld_tblend_ = -1, u_cld_steps_ = -1;
+    GLint u_cld_tblend_ = -1, u_cld_steps_ = -1;
     GLint u_cld_lit_ = -1, u_cld_sh_ = -1, u_cld_cool_ = -1, u_cld_warm_ = -1, u_cld_dom_ = -1, u_cld_local_dom_ = -1, u_cld_wx_fx_ = -1;
     GLint u_cld_advect_ = -1;
     GLint u_post_exp_ = -1, u_post_sun_uv_ = -1, u_post_warm_ = -1;
@@ -125,9 +128,13 @@ private:
     int cloud_ping_ = 0;
     bool history_valid_ = false;
     Mat4 prev_vp_ = Mat4::identity();
+    Mat4 prev_cloud_vp_ = Mat4::identity();
     double prev_cam_east_m_ = 0.0, prev_cam_north_m_ = 0.0, prev_cam_alt_m_ = 0.0;
     Vec2 cloud_advect_en_{0.0f, 0.0f};
+    Vec2 prev_cloud_advect_en_{0.0f, 0.0f};
     double cloud_advect_time_ = -1.0;
+    double cloud_filter_time_ = -1.0;
+    float cloud_base_ = 0.0f, cloud_thickness_ = 0.0f, cloud_coverage_ = 0.0f, cloud_precip_ = 0.0f;
     Vec3 prev_camera_forward_{0.0f, 0.0f, -1.0f};
     bool prev_camera_valid_ = false;
     bool cycle_clock_seeded_ = false;

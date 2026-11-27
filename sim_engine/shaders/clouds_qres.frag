@@ -24,7 +24,6 @@ uniform float u_cloud_thick_m;
 uniform float u_coverage;
 uniform float u_precip;
 uniform float u_time;
-uniform int u_frame_idx;
 uniform float u_temporal_blend;
 uniform int u_steps;
 uniform vec3 u_cloud_lit;
@@ -250,12 +249,11 @@ float sample_cloud_modern(vec2 p_en, float h01, float altitude_msl, vec2 wind_ba
     float footprint = max(dist_m * 0.00014, step_m / 300.0);
     float w_lod = clamp(log2(max(1.0, footprint)), 0.0, 2.8);
     vec4 w = textureLod(u_cloud_detail, w_coord, w_lod);
-    vec4 w2 = w;
-    if (dist_m < 10000.0) {
+    vec4 w2 = w.barg;
+    if (dist_m < 11000.0) {
         vec3 w2_coord = vec3(mat2(0.80, 0.60, -0.60, 0.80) * p * 0.00185 + vec2(0.19, 0.73), w_coord.z * 1.4);
-        w2 = textureLod(u_cloud_detail, w2_coord, min(w_lod + 0.45, 3.25));
-    } else {
-        w2 = w.barg;
+        vec4 fine = textureLod(u_cloud_detail, w2_coord, min(w_lod + 0.45, 3.25));
+        w2 = mix(fine, w2, smoothstep(9000.0, 11000.0, dist_m));
     }
 
     // The broad 3D body modulates the weather envelope at all heights so a
@@ -299,7 +297,6 @@ void main() {
     float slab_top = u_cloud_base_m + u_cloud_thick_m;
     float t0 = 0.0, t1 = 0.0;
     bool valid = true;
-    bool in_slab = false;
     if (u_cam_alt_m < u_cloud_base_m) {
         if (vy < -0.004) valid = false;
         else {
@@ -322,7 +319,6 @@ void main() {
         }
     } else {
         // Aircraft is flying INSIDE the volumetric cloud layer: start 4m ahead & intersect exact top/bottom shell!
-        in_slab = true;
         t0 = 2.0;
         if (vy >= 0.0) {
             t1 = intersect_shell_above(slab_top - u_cam_alt_m, vy);
@@ -350,7 +346,9 @@ void main() {
         rain_end = min(rain_end, intersect_shell_above(u_cloud_base_m - u_cam_alt_m, vy));
     }
     // Volumetric rain shafts, snow curtains & low valley radiation fog in front of mountains!
-    bool do_rain = (u_precip > 0.045 || u_wx_fx.w > 0.35) && u_cam_alt_m < (u_cloud_base_m + 350.0) && rain_end > 12.0;
+    float rain_strength = max(smoothstep(0.025, 0.09, u_precip), smoothstep(0.25, 0.45, u_wx_fx.w));
+    float rain_visibility = rain_strength * (1.0 - smoothstep(200.0, 500.0, u_cam_alt_m - u_cloud_base_m));
+    bool do_rain = rain_visibility > 0.0 && rain_end > 12.0;
     bool do_vfog = (u_wx_fx.x > 0.04) && rain_end > 18.0;
     if (do_rain || do_vfog) {
         float jitter = 0.5;
@@ -368,7 +366,7 @@ void main() {
             float sig_r = 0.0;
             if (do_rain) {
                 float depth = max(0.0, u_cloud_base_m - alt);
-                sig_r = rain_extinction(u_cam_en + ray_en * t, alt, depth);
+                sig_r = rain_extinction(u_cam_en + ray_en * t, alt, depth) * rain_visibility;
             }
             float sig_f = do_vfog ? valley_fog_extinction(u_cam_en + ray_en * t, alt) : 0.0;
             float sig_tot = sig_r + sig_f;
@@ -392,7 +390,8 @@ void main() {
         // Smooth synoptic upper-level shear across the slab (immune to pitch/ridge artifacts).
         vec2 shear_en = sample_regional_layer(u_cam_en, 2.0).xy * 2.2;
         float eff_cov = clamp(u_coverage, 0.06, 0.96);
-        float max_m = in_slab ? 12000.0 : 18000.0;
+        float inside = smoothstep(0.0, 350.0, min(u_cam_alt_m - u_cloud_base_m, slab_top - u_cam_alt_m));
+        float max_m = mix(18000.0, 12000.0, inside);
         float march_len = min(t1 - t0, max_m);
 
         {
@@ -407,10 +406,8 @@ void main() {
 
             int steps = clamp(u_steps, 8, 36);
             float inv_steps = 1.0 / float(steps);
-            // Coherent stratified quadrature keeps adjacent rays on the same
-            // integration phase. Accumulate substep phases over time, avoiding
-            // stippled silhouettes on thin cloud boundaries.
-            float jitter = fract(float(u_frame_idx & 15) * 0.618034);
+            // Fixed midpoint quadrature prevents dense cloud silhouettes from
+            // pulsing in place as the integration phase changes each frame.
             float segment_start = t0;
             for (int i = 0; i < steps; i++) {
                 if (trans < 0.025) break;
@@ -419,8 +416,7 @@ void main() {
                 float u = float(i + 1) * inv_steps;
                 float segment_end = t0 + march_len * mix(u, u * u, 0.55);
                 float dt_cur = segment_end - segment_start;
-                float phase = fract(jitter + float(i) * 0.75487766);
-                float t = mix(segment_start, segment_end, 0.37 + 0.26 * phase);
+                float t = (segment_start + segment_end) * 0.5;
                 segment_start = segment_end;
                 vec3 rp = view_dir * t;
                 float curv_rise = dot(rp.xz, rp.xz) / (2.0 * R_EARTH);
@@ -466,9 +462,9 @@ void main() {
                     vec3 weather_tint = mix(vec3(1.0), vec3(0.60, 0.68, 0.78),
                                             clamp(storm_tint * 0.76 + overcast_tint * 0.18, 0.0, 0.80));
                     step_c *= weather_tint;
-                    if (in_slab) {
+                    if (inside > 0.0) {
                         float rim = pow(max(0.0, cos_th), 7.5) * (1.0 - d * 0.55) * (0.32 + 0.68 * h01);
-                        step_c += u_cloud_lit * vec3(1.22, 0.96, 0.72) * (rim * 0.88);
+                        step_c += u_cloud_lit * vec3(1.22, 0.96, 0.72) * (rim * 0.88 * inside);
                     }
                     if (u_wx_fx.z > 0.02) {
                         float flash = u_wx_fx.z * smoothstep(0.16, 0.65, d) * (1.0 - abs(h01 - 0.45));

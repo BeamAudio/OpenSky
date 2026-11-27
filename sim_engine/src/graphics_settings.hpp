@@ -19,7 +19,7 @@ inline constexpr bool kLaptopVsync = true;
 
 struct GraphicsSettings {
     // Percentage of native output pixels shaded before the spatial/temporal resolve (35..150%).
-    int pixel_percent = 40;
+    int pixel_percent = 48;
     // 0 = spatial FXAA, 1 = balanced TAA, 2 = crisp TAA.
     int aa_mode = 1;
     // Multiplier for terrain mesh LOD transition distances (50..250%).
@@ -102,7 +102,7 @@ inline void apply_graphics_profile(GraphicsSettings &settings, int profile_id) {
         settings.vsync = kLaptopVsync;
         settings.fps_limit = 60;
     } else if (profile_id == 1) {
-        settings.pixel_percent = 40;
+        settings.pixel_percent = 48;
         settings.aa_mode = 1;
         settings.terrain_lod_percent = 75;
         settings.cockpit_native = true;

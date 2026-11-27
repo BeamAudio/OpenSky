@@ -103,6 +103,7 @@ public:
     void commit_async_transition();
     void cancel_async_transition();
     int worker_count() const { return static_cast<int>(workers_.size()); }
+    void limit_workers(bool limited);
     void set_anisotropy(int max_aniso);
 
     void set_sun_direction(const Vec3 &sun_dir);
@@ -177,7 +178,7 @@ private:
     static constexpr bool is_compressed(OrthoFormat format) { return format != OrthoFormat::RGBA8; }
     static PageLayout make_page_layout(OrthoFormat format);
 
-    void worker_loop();
+    void worker_loop(int index);
     bool coarse_root_ready() const;
     static void queue_request(std::unordered_map<uint64_t, float> &requests, RequestHeap &heap,
                               uint64_t key, float priority);
@@ -210,6 +211,7 @@ private:
 
     mutable std::mutex req_mtx_;
     std::condition_variable req_cv_;
+    bool workers_limited_ = false; // guarded by req_mtx_
     std::unordered_map<uint64_t, float> pending_reqs_;
     RequestHeap pending_req_heap_;
     std::unordered_map<uint64_t, uint64_t> pending_req_frame_;

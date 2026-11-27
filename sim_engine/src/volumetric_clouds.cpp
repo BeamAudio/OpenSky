@@ -41,7 +41,6 @@ bool SkyAndClouds::init(const std::string &shader_root, int win_w, int win_h, in
     u_cld_cov_     = glGetUniformLocation(cloud_prog_, "u_coverage");
     u_cld_precip_  = glGetUniformLocation(cloud_prog_, "u_precip");
     u_cld_time_    = glGetUniformLocation(cloud_prog_, "u_time");
-    u_cld_frame_   = glGetUniformLocation(cloud_prog_, "u_frame_idx");
     u_cld_tblend_  = glGetUniformLocation(cloud_prog_, "u_temporal_blend");
     u_cld_steps_   = glGetUniformLocation(cloud_prog_, "u_steps");
     u_cld_lit_     = glGetUniformLocation(cloud_prog_, "u_cloud_lit");
@@ -382,7 +381,6 @@ void SkyAndClouds::update_solar_and_weather(
         atmo_.cloud_base_m = static_cast<float>(std::clamp(std::max(ground_m + base_off, std::lerp(2450.0, 1420.0, wx)), 1320.0, 2950.0));
         atmo_.cloud_thick_m = std::lerp(1450.0f, 2450.0f, wx);
     }
-
     char tod_tag[32];
     if (tod_slot >= 0 && tod_slot <= 9) {
         atmo_.sun_elev_deg = kTodElDeg[tod_slot];
@@ -518,13 +516,13 @@ void SkyAndClouds::capture_cloud_occlusion_depth() {
 }
 
 void SkyAndClouds::render_clouds_and_post(
-    const Mat4 &vp, const Mat4 &inv_vp,
+    const Mat4 &vp, const Mat4 &inv_vp, const Mat4 &cloud_vp,
     const Vec3 &camera_forward,
     double cam_east_m, double cam_north_m, double cam_alt_m,
     GLuint cloud_noise_tex, GLuint cloud_vol_tex, GLuint cloud_detail_tex, GLuint lut_tex,
     GLuint atmo_field_tex, GLuint atmo_terrain_tex, const Vec4 &atmo_domain,
     GLuint local_atmo_field_tex, GLuint local_atmo_terrain_tex, const Vec4 &local_atmo_domain,
-    float time_sec, int frame_idx, const Vec4 &wx_fx
+    float time_sec, const Vec4 &wx_fx
 ) {
     Vec3 camera_delta{0.0f, 0.0f, 0.0f};
     if (prev_camera_valid_) {
@@ -547,6 +545,16 @@ void SkyAndClouds::render_clouds_and_post(
     const float temporal_blend = (!history_valid_ || camera_step_m > 40.0)
         ? 0.0f
         : std::clamp(0.68f - static_cast<float>(camera_step_m) * 0.008f - camera_turn_rad * 2.5f, 0.35f, 0.68f);
+    // Blend the cloud renderer's inputs between weather solves. The model
+    // snapshot used for flight dynamics and weather readouts stays intact.
+    const double cloud_dt = time_sec - cloud_filter_time_;
+    const float blend = cloud_filter_time_ >= 0.0 && cloud_dt >= 0.0 && cloud_dt < 4.0
+        ? static_cast<float>(1.0 - std::exp(-cloud_dt / 1.5)) : 1.0f;
+    cloud_base_ = std::lerp(cloud_base_, atmo_.cloud_base_m, blend);
+    cloud_thickness_ = std::lerp(cloud_thickness_, atmo_.cloud_thick_m, blend);
+    cloud_coverage_ = std::lerp(cloud_coverage_, atmo_.cloud_cov, blend);
+    cloud_precip_ = std::lerp(cloud_precip_, atmo_.precip, blend);
+    cloud_filter_time_ = time_sec;
 
     // 1. Quarter-Resolution Temporally Reprojected Living 3D Volumetric Cloud Pass (~0.35ms on Renoir iGPU!)
     int dst_idx = cloud_ping_;
@@ -559,18 +567,21 @@ void SkyAndClouds::render_clouds_and_post(
     glDisable(GL_BLEND);
 
     glUseProgram(cloud_prog_);
-    glUniformMatrix4fv(u_cld_inv_vp_, 1, GL_FALSE, inv_vp.m);
-    glUniformMatrix4fv(u_cld_prev_vp_, 1, GL_FALSE, prev_vp_.m);
-    glUniform3f(u_cld_cam_delta_, camera_delta.x, camera_delta.y, camera_delta.z);
+    // The terrain samples subpixels for TAA. Keep rays through the volume
+    // stable and reproject along the motion of the cloud field itself.
+    const Mat4 inv_cloud_vp = cloud_vp.inverse();
+    glUniformMatrix4fv(u_cld_inv_vp_, 1, GL_FALSE, inv_cloud_vp.m);
+    glUniformMatrix4fv(u_cld_prev_vp_, 1, GL_FALSE, prev_cloud_vp_.m);
+    const Vec2 advect_delta = cloud_advect_en_ - prev_cloud_advect_en_;
+    glUniform3f(u_cld_cam_delta_, camera_delta.x - advect_delta.x, camera_delta.y, camera_delta.z + advect_delta.y);
     glUniform3f(u_cld_sun_, atmo_.sun_dir.x, atmo_.sun_dir.y, atmo_.sun_dir.z);
     glUniform2f(u_cld_cam_en_, static_cast<float>(cam_east_m), static_cast<float>(cam_north_m));
     glUniform1f(u_cld_cam_alt_, static_cast<float>(cam_alt_m));
-    glUniform1f(u_cld_base_, atmo_.cloud_base_m);
-    glUniform1f(u_cld_thick_, atmo_.cloud_thick_m);
-    glUniform1f(u_cld_cov_, atmo_.cloud_cov);
-    glUniform1f(u_cld_precip_, atmo_.precip);
+    glUniform1f(u_cld_base_, cloud_base_);
+    glUniform1f(u_cld_thick_, cloud_thickness_);
+    glUniform1f(u_cld_cov_, cloud_coverage_);
+    glUniform1f(u_cld_precip_, cloud_precip_);
     glUniform1f(u_cld_time_, time_sec);
-    glUniform1i(u_cld_frame_, frame_idx);
     glUniform1f(u_cld_tblend_, temporal_blend);
     static constexpr GLint kCloudSteps[4] = {8, 14, 24, 36};
     glUniform1i(u_cld_steps_, kCloudSteps[std::clamp(cloud_quality_, 0, 3)]);
@@ -646,6 +657,8 @@ void SkyAndClouds::render_clouds_and_post(
     post_history_valid_ = true;
     post_ping_ = post_src;
     prev_vp_ = vp;
+    prev_cloud_vp_ = cloud_vp;
+    prev_cloud_advect_en_ = cloud_advect_en_;
     prev_cam_east_m_ = cam_east_m;
     prev_cam_north_m_ = cam_north_m;
     prev_cam_alt_m_ = cam_alt_m;

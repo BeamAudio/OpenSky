@@ -58,6 +58,11 @@ def summarize(directory, requested_scenes):
         print(f"\n{scene} (quality {quality}, {len(elapsed)} frame intervals)")
         print(f"  {1000 / mean(elapsed):.1f} FPS | p95 {percentile(elapsed, .95):.2f} ms"
               f" | p99 {percentile(elapsed, .99):.2f} ms | max {max(elapsed):.2f} ms")
+        print(f"  Frames over 20 ms: {sum(ms > 20.0 for ms in elapsed)}"
+              f" | over 33.3 ms: {sum(ms > 1000.0 / 30 for ms in elapsed)}")
+        if "scene_w" in first and "scene_h" in first:
+            sizes = sorted({(int(row["scene_w"]), int(row["scene_h"])) for row in samples})
+            print("  Scene resolution " + ", ".join(f"{width}x{height}" for width, height in sizes))
         print(f"  Pages built {built:.0f} | final queue {last['pages_queued']}"
               f" | last draw L{last['max_draw_lod']} | resident L7/L8/L9 "
               f"{last['pages_l7']}/{last['pages_l8']}/{last['pages_l9']}")

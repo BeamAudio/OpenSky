@@ -190,11 +190,9 @@ bool AsyncTerrainStreamer::init(const PackReader *pack, int worker_count, OrthoF
     }
 
     stop_.store(false);
-    // Default to 3 workers so streaming keeps pace with fast/accelerated flight while thermal
-    // regulation in main.cpp keeps CPU package temperatures below 80 C.
     int nw = (worker_count > 0) ? std::clamp(worker_count, 1, 10) : 3;
     for (int i = 0; i < nw; i++) {
-        workers_.emplace_back(&AsyncTerrainStreamer::worker_loop, this);
+        workers_.emplace_back(&AsyncTerrainStreamer::worker_loop, this, i);
     }
     return true;
 }
@@ -300,7 +298,16 @@ void AsyncTerrainStreamer::fill_staging_slot(StagingSlot &slot, uint64_t key, co
     avg_worker_ms_.store(prev <= 0.0 ? slot.worker_ms : (prev * 0.9 + slot.worker_ms * 0.1), std::memory_order_relaxed);
 }
 
-void AsyncTerrainStreamer::worker_loop() {
+void AsyncTerrainStreamer::limit_workers(bool limited) {
+    {
+        std::lock_guard lock(req_mtx_);
+        if (workers_limited_ == limited) return;
+        workers_limited_ = limited;
+    }
+    req_cv_.notify_all();
+}
+
+void AsyncTerrainStreamer::worker_loop(int index) {
     while (!stop_.load(std::memory_order_relaxed)) {
         uint64_t best_key = UINT64_MAX;
         float best_prio = 0.0f;
@@ -311,7 +318,8 @@ void AsyncTerrainStreamer::worker_loop() {
         {
             std::unique_lock<std::mutex> lk(req_mtx_);
             const auto has_work = [&]() {
-                return !pending_reqs_.empty() || (pending_gen_.load(std::memory_order_acquire) != 0 && !pending_reqs_next_.empty());
+                return (index == 0 || !workers_limited_) &&
+                       (!pending_reqs_.empty() || (pending_gen_.load(std::memory_order_acquire) != 0 && !pending_reqs_next_.empty()));
             };
             req_cv_.wait(lk, [&]() { return stop_.load(std::memory_order_relaxed) || has_work(); });
             // Staging fences are reclaimed by the render thread. Retry only
@@ -326,7 +334,7 @@ void AsyncTerrainStreamer::worker_loop() {
             if (stop_.load(std::memory_order_relaxed)) break;
             const uint64_t cur_pending = pending_gen_.load(std::memory_order_acquire);
             const bool have_next = (cur_pending != 0) && !pending_reqs_next_.empty();
-            if (!have_next && pending_reqs_.empty()) continue;
+            if (!has_work()) continue;
 
             for (int i = 0; i < NUM_STAGING; i++) {
                 StageState expect = StageState::FREE;
@@ -790,13 +798,16 @@ void AsyncTerrainStreamer::request_page(uint64_t key, float priority) {
     h = (h ^ (h >> 27)) * 0x94d049bb133111ebULL;
     float jitter = 0.88f + static_cast<float>((h >> 32) & 0xFFFFu) * (0.24f / 65535.0f);
     float j_prio = priority * jitter;
+    bool limited;
     {
         std::lock_guard<std::mutex> lk(req_mtx_);
         if (inflight_active_.find(key) != inflight_active_.end()) return;
         pending_req_frame_[key] = cur_frame_;
         queue_request(pending_reqs_, pending_req_heap_, key, j_prio);
+        limited = workers_limited_;
     }
-    req_cv_.notify_one();
+    if (limited) req_cv_.notify_all();
+    else req_cv_.notify_one();
 }
 
 int AsyncTerrainStreamer::allocate_cache_slice(

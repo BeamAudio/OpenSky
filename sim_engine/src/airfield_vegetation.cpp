@@ -337,7 +337,8 @@ void AirfieldVegetation::prepare_at(const PackReader &pack, const PackReader::Wo
 }
 
 void AirfieldVegetation::draw(const Mat4 &vp, Vec3 camera_enu, const AtmosphereState &atmo,
-                              float agl, float time_sec, Vec2 wind_en, int season, float snowline_m) {
+                              float agl, float time_sec, Vec2 wind_en, int season, float snowline_m,
+                              int veg_detail) {
     {
         std::lock_guard<std::mutex> lk(mtx_);
         if (ready_upload_) {
@@ -352,8 +353,12 @@ void AirfieldVegetation::draw(const Mat4 &vp, Vec3 camera_enu, const AtmosphereS
             ready_data_.clear();
         }
     }
-    if (!prog_ || count_ <= 0 || agl > 365.0f) return;
+    const float max_agl = (veg_detail >= 3) ? 520.0f : (veg_detail <= 0 ? 220.0f : 365.0f);
+    if (!prog_ || count_ <= 0 || agl > max_agl) return;
     if (std::hypot(camera_enu.x - centre_.x, camera_enu.z - centre_.y) > 920.0f) return;
+    int draw_count = count_;
+    if (veg_detail <= 0) draw_count = std::max(1, count_ / 4);
+    else if (veg_detail == 1) draw_count = std::max(1, (count_ * 3) / 5);
 
     glDisable(GL_CULL_FACE);
     glUseProgram(prog_);
@@ -376,7 +381,7 @@ void AirfieldVegetation::draw(const Mat4 &vp, Vec3 camera_enu, const AtmosphereS
 
     // 1 single instanced draw call: 4 verts (2 tris) per volumetric tree!
     glBindVertexArray(vao_);
-    glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, count_);
+    glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, draw_count);
     glBindVertexArray(0);
     glEnable(GL_CULL_FACE);
 }

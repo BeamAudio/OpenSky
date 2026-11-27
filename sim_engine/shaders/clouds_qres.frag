@@ -252,8 +252,13 @@ float sample_cloud_modern(vec2 p_en, float h01, float altitude_msl, vec2 wind_ba
     vec3 w_coord = vec3((p + curl) * 0.00070, (altitude_msl - u_cloud_base_m) * 0.00078 - u_time * 0.00035);
     float w_lod = clamp(log2(max(1.0, dist_m * 0.00014)), 0.0, 1.05);
     vec4 w = textureLod(u_cloud_detail, w_coord, w_lod);
-    vec3 w2_coord = vec3(mat2(0.80, 0.60, -0.60, 0.80) * p * 0.00185 + vec2(0.19, 0.73), w_coord.z * 1.4);
-    vec4 w2 = textureLod(u_cloud_detail, w2_coord, clamp(w_lod + 0.20, 0.0, 1.35));
+    vec4 w2 = w;
+    if (dist_m < 10000.0) {
+        vec3 w2_coord = vec3(mat2(0.80, 0.60, -0.60, 0.80) * p * 0.00185 + vec2(0.19, 0.73), w_coord.z * 1.4);
+        w2 = textureLod(u_cloud_detail, w2_coord, clamp(w_lod + 0.20, 0.0, 1.35));
+    } else {
+        w2 = w.barg;
+    }
 
     // Solid dense cumulus core + sharp cauliflower edge carving (zero milky fog, zero hollow cores!)
     float worley_lo = w.a * 0.52 + w.b * 0.30 + w2.a * 0.18;
@@ -425,9 +430,10 @@ void main() {
             float s_y = max(0.06, sdir.y);
             float inv_thick = 1.0 / max(150.0, u_cloud_thick_m);
 
-            int steps = clamp(u_steps, 8, 18);
+            int steps = clamp(u_steps, 7, 18);
             float dt_cur = march_len / float(steps);
-            float t = t0 + dt_cur * (0.15 + 0.70 * ign_noise(gl_FragCoord.xy));
+            float jit = fract(ign_noise(gl_FragCoord.xy) + float(u_frame_idx & 3) * 0.25);
+            float t = t0 + dt_cur * (0.34 + 0.32 * jit);
             float t_end = t0 + march_len;
             for (int i = 0; i < steps; i++) {
                 if (trans < 0.025 || t >= t_end) break;

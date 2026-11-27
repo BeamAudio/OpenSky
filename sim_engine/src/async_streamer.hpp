@@ -103,6 +103,7 @@ public:
     void commit_async_transition();
     void cancel_async_transition();
     int worker_count() const { return static_cast<int>(workers_.size()); }
+    void set_anisotropy(int max_aniso);
 
     void set_sun_direction(const Vec3 &sun_dir);
     void begin_frame(uint64_t frame_idx);

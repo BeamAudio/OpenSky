@@ -690,7 +690,7 @@ int main(int argc, char **argv) {
 
     const unsigned cpu_threads = std::thread::hardware_concurrency();
     const int terrain_workers = promo_only ? std::clamp(static_cast<int>(cpu_threads / 2), 3, 8)
-                                           : (cpu_threads >= 8 ? 4 : 3);
+                                           : ((quality >= 3 && cpu_threads >= 8) ? 4 : 2);
     const int page_capacity = promo_only ? 1024 : AsyncTerrainStreamer::MAX_PAGES;
     if (!streamer.init(&pack, terrain_workers, ortho_format, page_capacity)) return 1;
     profiler.startup_stage("terrain_streamer_allocate");
@@ -746,6 +746,10 @@ int main(int argc, char **argv) {
     profiler.startup_stage("world_resources");
     if (!ac_hud.init(&pack, root + "/game/assets", aircraft_package, root + "/sim_engine/shaders")) return 1;
     ac_hud.set_graphics_settings(graphics_settings);
+    int active_aniso = graphics_settings.anisotropy;
+    streamer.set_anisotropy(active_aniso);
+    terrain.set_anisotropy(active_aniso);
+    objects.set_anisotropy(active_aniso);
     profiler.startup_stage("aircraft_resources");
     const bool interactive = interactive_run;
     audio.init(interactive && !no_audio);
@@ -990,14 +994,21 @@ int main(int argc, char **argv) {
 
         sky_clouds.resize_if_needed(output_w, output_h, quality,
                                     eff_pixel_pct, render_settings.aa_mode, render_settings.weather_detail);
+        if (render_settings.anisotropy != active_aniso) {
+            active_aniso = render_settings.anisotropy;
+            streamer.set_anisotropy(active_aniso);
+            terrain.set_anisotropy(active_aniso);
+            objects.set_anisotropy(active_aniso);
+        }
         profiler.cpu_end(FlightProfiler::Prepare, prepare_start);
         const LocalAirSample &air_now = ac_hud.last_air();
         const Vec2 local_wind_en{static_cast<float>(air_now.wind_east_mps), static_cast<float>(air_now.wind_north_mps)};
         streamer.begin_frame(frame_idx);
         streamer.refine_online_pages(PlatformWindow::now_sec());
         // Frame-time-budgeted upload cap; drains PBO staging bursts quickly without long frame stalls.
-        const int max_up = streamer.has_async_transition() ? 10 : ((quality <= 1) ? 5 : 6);
-        const double up_budget_ms = streamer.has_async_transition() ? 3.0 : ((quality == 0) ? 1.4 : (quality == 1 ? 1.8 : 2.2));
+        const int steady_up = (streamer.stats().resident_pages >= 200) ? 1 : 3;
+        const int max_up = streamer.has_async_transition() ? 6 : ((quality == 0) ? 1 : (quality <= 2 ? steady_up : 6));
+        const double up_budget_ms = streamer.has_async_transition() ? 2.4 : ((quality == 0) ? 0.5 : (quality <= 2 ? 0.65 : 2.2));
         profiler.begin(FlightProfiler::Upload);
         streamer.pump_gpu_uploads(static_cast<float>(sim_time), max_up, up_budget_ms);
         profiler.end(FlightProfiler::Upload);
@@ -1116,6 +1127,12 @@ int main(int argc, char **argv) {
             ac_hud.last_air().lightning_flash,
             std::max(reg_atmo.weather().storm_int, sky_clouds.atmo().precip)
         };
+        const int eff_terrain_q = render_settings.terrain_detail == 0
+            ? quality : std::clamp(render_settings.terrain_detail - 1, 0, 3);
+        const int eff_veg_q = render_settings.vegetation_detail == 0
+            ? quality : std::clamp(render_settings.vegetation_detail - 1, 0, 3);
+        const int eff_world_q = render_settings.world_detail == 0
+            ? quality : (render_settings.world_detail >= 4 ? 4 : std::clamp(render_settings.world_detail - 1, 0, 3));
         terrain.update_and_render(
             streamer, vp, frustum,
             cam_e, cam_n, cam_alt, cam_agl,
@@ -1125,7 +1142,8 @@ int main(int argc, char **argv) {
             sky_clouds.atmo().haze_density, sky_clouds.atmo().cloud_cov,
             static_cast<float>(sim_time), local_wind_en, sky_clouds.refl_env_tex(), quality,
             reg_atmo.weather().season, reg_atmo.weather().snowline_m,
-            render_settings.terrain_lod_percent, grass_zone, terrain_wx_env
+            render_settings.terrain_lod_percent, grass_zone, terrain_wx_env,
+            eff_terrain_q, eff_veg_q
         );
         profiler.end(FlightProfiler::Terrain);
         const double t_p2 = PlatformWindow::now_sec();
@@ -1137,14 +1155,15 @@ int main(int argc, char **argv) {
         if (!cockpit_qa) {
             objects.update_and_render(
                 vp, frustum, cam_e, cam_n, cam_alt,
-                sky_clouds.atmo(), static_cast<float>(sim_time), local_wind_en, sky_clouds.refl_env_tex(), quality, max_new_tree_cells
+                sky_clouds.atmo(), static_cast<float>(sim_time), local_wind_en, sky_clouds.refl_env_tex(), quality,
+                max_new_tree_cells, eff_world_q
             );
             if (topdown_dir.empty()) {
                 vegetation.update_around(pack, lat, lon, static_cast<float>(cam_agl));
                 vegetation.draw(
                     vp, Vec3{static_cast<float>(cam_e), static_cast<float>(cam_alt), static_cast<float>(cam_n)},
                     sky_clouds.atmo(), static_cast<float>(cam_agl), static_cast<float>(sim_time),
-                    local_wind_en, reg_atmo.weather().season, reg_atmo.weather().snowline_m
+                    local_wind_en, reg_atmo.weather().season, reg_atmo.weather().snowline_m, eff_veg_q
                 );
             }
         }
@@ -1159,7 +1178,7 @@ int main(int argc, char **argv) {
         // 4. Living AI aircraft/maritime traffic + C172S interior/exterior GLBs (after CloudDepth so moving silhouettes never ghost in cloud history).
         profiler.begin(FlightProfiler::Aircraft);
         if (!cockpit_qa) {
-            living_traffic.update_and_render(vp, cam_e, cam_n, cam_alt, sky_clouds.atmo(), static_cast<float>(sim_time), quality);
+            living_traffic.update_and_render(vp, cam_e, cam_n, cam_alt, sky_clouds.atmo(), static_cast<float>(sim_time), eff_world_q);
         }
         const bool native_cockpit = !walking && st.view_mode == 0 && render_settings.cockpit_native;
         if (walking) {
@@ -1306,7 +1325,7 @@ int main(int argc, char **argv) {
                 step_flight(1.0 / 60.0);
                 capture_frame(1.0 / 60.0, true);
                 double spare = (1.0 / 60.0) - (PlatformWindow::now_sec() - f0);
-                if (spare > 0.001) std::this_thread::sleep_for(std::chrono::duration<double>(spare));
+                if (spare > 0.0005) PlatformWindow::sleep_sec(spare);
             }
             if (!win.should_close()) {
                 profiler.set_scene(std::string(name) + "_capture");
@@ -1897,7 +1916,8 @@ int main(int argc, char **argv) {
         auto snap = [&](const std::string &fname, double lat, double lon, double agl, double hdg, double pitch, int vmode,
                         double time_advance = 0.0, float look_yaw = 0.0f, float look_pitch = 0.0f,
                         double roll = 0.0, double ail = 0.0, bool draw_hud = true,
-                        bool weather_model_overlay = false, bool save_capture = true) {
+                        bool weather_model_overlay = false, bool save_capture = true,
+                        double ias_kt = 100.0) {
             FlightSimState &s = ac_hud.state();
             profiler.set_scene(promo_only ? fname + " warmup" : fname);
             s.paused = true;
@@ -1916,7 +1936,7 @@ int main(int argc, char **argv) {
                 pack.set_online_camera(lat + std::cos(azimuth) * forward_m / metres_lat,
                                        lon + std::sin(azimuth) * forward_m / metres_lon);
             }
-            ac_hud.reset_flight(lat, lon, gnd + agl, hdg, 100.0, false);
+            ac_hud.reset_flight(lat, lon, gnd + agl, hdg, ias_kt, false);
             // Ordinary QA shots share one region anchor. Promo shots move
             // across large areas, so transition_world reanchors and cancels
             // stale work while preserving the target site's prewarm requests.
@@ -2021,6 +2041,10 @@ int main(int argc, char **argv) {
                  0.0f, -7.0f, 0.0, -0.25, false);
             snap("cockpit_side_rain.png", 42.53131, 0.47676, 110.0, 160.0, 0.0, 0, 0.0,
                  82.0f, -16.0f, 0.0, 0.0, false);
+            snap("cockpit_rain_parked.png", 42.53131, 0.47676, 2.0, 160.0, 2.0, 0, 0.0,
+                 0.0f, -7.0f, 0.0, 0.0, false, false, true, 0.0);
+            snap("cockpit_rain_banked.png", 42.53131, 0.47676, 150.0, 160.0, 10.0, 0, 0.0,
+                 0.0f, -7.0f, 38.0, 0.0, false, false, true, 110.0);
             std::printf("[COCKPIT-QA] Local forward-pane rain sample: %.2f mm/h\n",
                         ac_hud.last_air().precipitation_mm_hr);
             reg_atmo.set_regime(WindRegime::PYRENEAN_THERMAL);
@@ -3212,9 +3236,10 @@ int main(int argc, char **argv) {
             render_one_frame(false, 1, "", 50.0f, true);
             push_audio_state(dt, true);
             const int lim = ac_hud.graphics_settings().fps_limit;
-            const double eff_period = lim > 0 ? (1.0 / static_cast<double>(lim)) : 0.0;
+            const bool vsync_paces = active_vsync && (lim <= 0 || static_cast<double>(lim) >= win.refresh_hz() - 1.5);
+            const double eff_period = (!vsync_paces && lim > 0) ? (1.0 / static_cast<double>(lim)) : 0.0;
             const double spare = eff_period - (PlatformWindow::now_sec() - now);
-            if (spare > 0.0005) std::this_thread::sleep_for(std::chrono::duration<double>(spare));
+            if (spare > 0.0004) PlatformWindow::sleep_sec(spare);
             continue;
         }
 
@@ -3263,9 +3288,10 @@ int main(int argc, char **argv) {
             const int lim = ac_hud.graphics_settings().fps_limit;
             const double user_p = lim > 0 ? (1.0 / static_cast<double>(lim)) : 0.0;
             const double menu_period = std::max(user_p, 1.0 / 60.0);
-            const double spare = menu_period - (PlatformWindow::now_sec() - now);
+            const bool vsync_paces = active_vsync && ((1.0 / menu_period) >= win.refresh_hz() - 1.5);
+            const double spare = vsync_paces ? 0.0 : (menu_period - (PlatformWindow::now_sec() - now));
             push_audio_state(dt, true);
-            if (spare > 0.0005) std::this_thread::sleep_for(std::chrono::duration<double>(spare));
+            if (spare > 0.0004) PlatformWindow::sleep_sec(spare);
             continue;
         }
         if (frontend.walking()) {
@@ -3275,9 +3301,10 @@ int main(int argc, char **argv) {
             render_one_frame(true);
             push_audio_state(dt, false);
             const int lim = ac_hud.graphics_settings().fps_limit;
-            const double walk_period = lim > 0 ? (1.0 / static_cast<double>(lim)) : 0.0;
+            const bool vsync_paces = active_vsync && (lim <= 0 || static_cast<double>(lim) >= win.refresh_hz() - 1.5);
+            const double walk_period = (!vsync_paces && lim > 0) ? (1.0 / static_cast<double>(lim)) : 0.0;
             const double spare = walk_period - (PlatformWindow::now_sec() - now);
-            if (spare > 0.0005) std::this_thread::sleep_for(std::chrono::duration<double>(spare));
+            if (spare > 0.0004) PlatformWindow::sleep_sec(spare);
             continue;
         }
 
@@ -3373,11 +3400,12 @@ int main(int argc, char **argv) {
             ac_hud.graphics_settings().show_flight_hud || frontend.tutorial_open();
         render_one_frame(show_flight_overlays);
         push_audio_state(dt, ac_hud.state().paused || ac_hud.state().menu_open);
-        // Frame pacing respects the user FPS limit.
+        // Frame pacing respects the user FPS limit without double-sleeping against VSync.
         const int lim = ac_hud.graphics_settings().fps_limit;
-        const double eff_period = lim > 0 ? (1.0 / static_cast<double>(lim)) : 0.0;
+        const bool vsync_paces = active_vsync && (lim <= 0 || static_cast<double>(lim) >= win.refresh_hz() - 1.5);
+        const double eff_period = (!vsync_paces && lim > 0) ? (1.0 / static_cast<double>(lim)) : 0.0;
         const double spare = eff_period - (PlatformWindow::now_sec() - now);
-        if (spare > 0.0005) std::this_thread::sleep_for(std::chrono::duration<double>(spare));
+        if (spare > 0.0004) PlatformWindow::sleep_sec(spare);
     }
 
     cancel_async_crossing();

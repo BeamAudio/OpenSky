@@ -16,6 +16,7 @@ out vec4 v_col;
 out vec2 v_uv;
 out vec3 v_obj_pos;
 out vec3 v_ac_pos;
+out vec4 v_clip_pos;
 
 float dmg_wave(vec3 p) {
     float a = sin(p.x * 13.7 + p.z * 9.3 + p.y * 7.1);
@@ -53,5 +54,7 @@ void main() {
     v_uv = a_uv;
     v_obj_pos = lp;
     v_ac_pos = (u_ac_node * vec4(lp, 1.0)).xyz;
-    gl_Position = u_mvp * vec4(lp, 1.0);
+    vec4 clip = u_mvp * vec4(lp, 1.0);
+    v_clip_pos = clip;
+    gl_Position = clip;
 }

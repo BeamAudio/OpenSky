@@ -52,6 +52,8 @@ bool AircraftAndHud::init(const PackReader *pack, const std::string &asset_root,
     u_ac_unlit_ = glGetUniformLocation(ac_prog_, "u_unlit");
     u_ac_cabin_glass_ = glGetUniformLocation(ac_prog_, "u_cabin_glass");
     u_ac_glass_weather_ = glGetUniformLocation(ac_prog_, "u_glass_weather");
+    u_ac_glass_flow_f_ = glGetUniformLocation(ac_prog_, "u_glass_flow_front");
+    u_ac_glass_flow_s_ = glGetUniformLocation(ac_prog_, "u_glass_flow_side");
     u_ac_glass_fx_ = glGetUniformLocation(ac_prog_, "u_glass_fx");
     u_ac_plane_wx_ = glGetUniformLocation(ac_prog_, "u_plane_wx");
     u_ac_dmg_zones_ = glGetUniformLocation(ac_prog_, "u_dmg_zones");
@@ -1680,6 +1682,7 @@ void AircraftAndHud::init_avionics_display_texture() {
         glGetTextureLevelParameteriv(avionics_tex_, 0, GL_TEXTURE_WIDTH, &avionics_tex_w_);
         glGetTextureLevelParameteriv(avionics_tex_, 0, GL_TEXTURE_HEIGHT, &avionics_tex_h_);
         if (avionics_tex_w_ == 1024 && avionics_tex_h_ == 1536) {
+            glTextureParameteri(avionics_tex_, GL_TEXTURE_MAX_LEVEL, 4);
             avionics_base_rgba_.resize(1024u * 1536u * 4u);
             glGetTextureImage(avionics_tex_, 0, GL_RGBA, GL_UNSIGNED_BYTE,
                               static_cast<GLsizei>(avionics_base_rgba_.size()), avionics_base_rgba_.data());
@@ -1694,6 +1697,7 @@ void AircraftAndHud::init_avionics_display_texture() {
         glGetTextureLevelParameteriv(panel_face_tex_, 0, GL_TEXTURE_WIDTH, &panel_face_w_);
         glGetTextureLevelParameteriv(panel_face_tex_, 0, GL_TEXTURE_HEIGHT, &panel_face_h_);
         if (panel_face_w_ == 2560 && panel_face_h_ == 768) {
+            glTextureParameteri(panel_face_tex_, GL_TEXTURE_MAX_LEVEL, 4);
             std::vector<uint8_t> full_pf(2560u * 768u * 4u);
             glGetTextureImage(panel_face_tex_, 0, GL_RGBA, GL_UNSIGNED_BYTE,
                               static_cast<GLsizei>(full_pf.size()), full_pf.data());
@@ -1714,6 +1718,7 @@ void AircraftAndHud::init_avionics_display_texture() {
         glGetTextureLevelParameteriv(steam_dials_tex_, 0, GL_TEXTURE_WIDTH, &steam_dials_w_);
         glGetTextureLevelParameteriv(steam_dials_tex_, 0, GL_TEXTURE_HEIGHT, &steam_dials_h_);
         if (steam_dials_w_ == 1536 && steam_dials_h_ == 1536) {
+            glTextureParameteri(steam_dials_tex_, GL_TEXTURE_MAX_LEVEL, 4);
             steam_base_rgba_.resize(1536u * 1536u * 4u);
             glGetTextureImage(steam_dials_tex_, 0, GL_RGBA, GL_UNSIGNED_BYTE,
                               static_cast<GLsizei>(steam_base_rgba_.size()), steam_base_rgba_.data());
@@ -2604,6 +2609,14 @@ void AircraftAndHud::draw_glb(
             glUniform1i(u_ac_cabin_glass_, glass_mode);
             const float glass_rain_mm = (last_air_.precipitation_mm_hr >= 0.45) ? static_cast<float>(last_air_.precipitation_mm_hr) : 0.0f;
             glUniform3f(u_ac_glass_weather_, glass_rain_mm, sim_time_sec, relative_airspeed);
+            if (u_ac_glass_flow_f_ >= 0) {
+                glUniform4f(u_ac_glass_flow_f_, rain_flow_front_.x, rain_flow_front_.y,
+                            rain_vel_front_.x, rain_vel_front_.y);
+            }
+            if (u_ac_glass_flow_s_ >= 0) {
+                glUniform4f(u_ac_glass_flow_s_, rain_flow_side_.x, rain_flow_side_.y,
+                            rain_vel_side_.x, rain_vel_side_.y);
+            }
             const float defrost_clear = std::clamp(static_cast<float>((systems_.get_oil_temp_f() - 120.0) / 55.0), 0.0f, 1.0f);
             const float wet_sheen = std::clamp(static_cast<float>(last_air_.precipitation_mm_hr / 6.0), 0.0f, 1.0f);
             glUniform4f(u_ac_glass_fx_, windscreen_frost_, cabin_mist_,
@@ -2729,6 +2742,48 @@ void AircraftAndHud::render_aircraft_3d(const Mat4 &vp, const Vec3 &cam_off, con
     }
     if (eff_prop_rpm > 5.0f) {
         prop_angle_rad_ = std::fmod(prop_angle_rad_ + rdt * eff_prop_rpm * 0.032f, 2.0f * PI_F);
+    }
+    {
+        // Physically coupled windshield & side-window rain flow from attitude (pitch/roll),
+        // aerodynamic slipstream (TAS + sideslip), and propeller slipstream wash.
+        const float pitch_r = static_cast<float>(st_.pitch_deg * DEG2RAD_D);
+        const float roll_r  = static_cast<float>(st_.roll_deg * DEG2RAD_D);
+        const float beta_r  = st_.slew_fast ? 0.0f : static_cast<float>(std::clamp(fs.beta_deg, -35.0, 35.0) * DEG2RAD_D);
+        const float gx = std::cos(pitch_r) * std::sin(roll_r);
+        const float gy = -std::cos(pitch_r) * std::cos(roll_r);
+        const float gz = std::sin(pitch_r);
+        const float tas_mps = st_.slew_fast
+            ? static_cast<float>(std::max(0.0, st_.speed_mps))
+            : static_cast<float>(std::max(0.0, fs.tas_kt) * 0.514444);
+        const float propwash_mps = st_.slew_fast ? 0.0f
+            : std::clamp((eff_prop_rpm - 450.0f) / 1850.0f, 0.0f, 1.0f) * 14.5f;
+        const float v_front_eff = tas_mps + propwash_mps;
+        const float v_side_eff  = tas_mps + propwash_mps * 0.25f;
+        const float q_front = std::pow(std::clamp(v_front_eff / 34.0f, 0.0f, 2.2f), 1.45f);
+        const float q_side  = std::pow(std::clamp(v_side_eff  / 34.0f, 0.0f, 2.2f), 1.45f);
+        rain_speed01_ = std::clamp((v_front_eff - 3.5f) / 48.0f, 0.0f, 1.0f);
+
+        const float grav_front_v = gy * (-0.74f) + gz * 0.67f;
+        const float aero_front_u = -std::sin(beta_r) * q_front * 0.95f;
+        const float aero_front_v = -q_front * 1.15f;
+        rain_vel_front_ = {
+            (gx * 0.65f + aero_front_u * 0.95f) * 0.36f,
+            (grav_front_v * 0.52f + aero_front_v) * 0.42f
+        };
+        rain_vel_side_ = {
+            (gz * 0.42f + q_side * 1.25f) * 0.40f,
+            (-gy * 0.56f - q_side * 0.10f) * 0.40f
+        };
+        if (last_air_.precipitation_mm_hr >= 0.35) {
+            auto wrap = [](float v) {
+                v = std::fmod(v, 64.0f);
+                return (v < 0.0f) ? (v + 64.0f) : v;
+            };
+            rain_flow_front_.x = wrap(rain_flow_front_.x + rain_vel_front_.x * rdt);
+            rain_flow_front_.y = wrap(rain_flow_front_.y + rain_vel_front_.y * rdt);
+            rain_flow_side_.x  = wrap(rain_flow_side_.x  + rain_vel_side_.x  * rdt);
+            rain_flow_side_.y  = wrap(rain_flow_side_.y  + rain_vel_side_.y  * rdt);
+        }
     }
     // Engine-driven vacuum pump spools the attitude & directional gyros upright above 2.2 inHg, tumbles when off!
     const float gyro_target = (rpm > 450.0f && systems_.get_vacuum_inhg() >= 2.2) ? 1.0f : 0.0f;

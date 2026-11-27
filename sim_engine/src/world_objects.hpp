@@ -76,8 +76,9 @@ public:
         const Mat4 &vp, const Frustum &frustum,
         double cam_east_m, double cam_north_m, double cam_alt_m,
         const AtmosphereState &atmo, float time_sec, const Vec2 &wind_en_mps, GLuint refl_env_tex, int quality,
-        int max_new_tree_cells = 1
+        int max_new_tree_cells = 1, int world_detail = -1
     );
+    void set_anisotropy(int max_aniso);
 
     // Load a colored .glb (used by AircraftHud for C172S exterior & cockpit!)
     static bool load_colored_glb(const std::string &path, GlbMeshData &out);

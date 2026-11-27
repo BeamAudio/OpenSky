@@ -54,6 +54,7 @@ public:
 
     PixelRect presentation_rect(int output_w, int output_h) const;
     static double now_sec();
+    static void sleep_sec(double seconds);
     static bool save_framebuffer_png(const std::string &path, int width, int height);
 
 private:

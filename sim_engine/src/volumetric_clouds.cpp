@@ -109,6 +109,7 @@ void SkyAndClouds::free_fbos() {
         if (post_history_tex_[i]) { glDeleteTextures(1, &post_history_tex_[i]); post_history_tex_[i] = 0; }
     }
     if (display_fbo_) { glDeleteFramebuffers(1, &display_fbo_); display_fbo_ = 0; }
+    if (post_ldr_tex_) { glDeleteTextures(1, &post_ldr_tex_); post_ldr_tex_ = 0; }
     if (post_display_tex_) { glDeleteTextures(1, &post_display_tex_); post_display_tex_ = 0; }
     if (display_depth_) { glDeleteTextures(1, &display_depth_); display_depth_ = 0; }
 }
@@ -118,20 +119,27 @@ void SkyAndClouds::alloc_fbos(int win_w, int win_h, int quality, int pixel_perce
     cur_win_w_ = std::max(320, win_w);
     cur_win_h_ = std::max(240, win_h);
     cur_quality_ = std::clamp(quality, 0, 3);
-    cloud_quality_ = weather_detail == 0 ? cur_quality_ : std::clamp(weather_detail - 1, 0, 2);
-    cur_pixel_percent_ = std::clamp(pixel_percent, 40, 100);
+    cloud_quality_ = weather_detail == 0 ? cur_quality_ : std::clamp(weather_detail - 1, 0, 3);
+    cur_pixel_percent_ = std::clamp(pixel_percent, 35, 150);
     cur_aa_mode_ = std::clamp(aa_mode, 0, 2);
 
-    // Keep the output native while letting users select the shaded pixel budget.
+    // Keep the output native while letting users select the shaded pixel budget (down to 35% laptop / up to 150% SSAA).
     // sqrt maps the requested pixel-area percentage onto both buffer dimensions.
     float scale = std::sqrt(cur_pixel_percent_ / 100.0f);
     scene_w_ = std::max(320, static_cast<int>(cur_win_w_ * scale));
     scene_h_ = std::max(180, static_cast<int>(cur_win_h_ * scale));
 
-    // Render clouds at 1/2 internal res on High/Ultra (1/3 on Low/Medium) for crisp defined silhouettes at 60 FPS!
-    int cdiv = (cloud_quality_ >= 2) ? 2 : 3;
-    cloud_w_ = std::max(160, scene_w_ / cdiv);
-    cloud_h_ = std::max(90,  scene_h_ / cdiv);
+    // Render clouds at 2/3 on Ultra (dGPU), 2/5 on High (Renoir 60 FPS), 1/3 on Low/Medium!
+    if (cloud_quality_ >= 3) {
+        cloud_w_ = std::max(160, (scene_w_ * 2) / 3);
+        cloud_h_ = std::max(90,  (scene_h_ * 2) / 3);
+    } else if (cloud_quality_ == 2) {
+        cloud_w_ = std::max(160, (scene_w_ * 2) / 5);
+        cloud_h_ = std::max(90,  (scene_h_ * 2) / 5);
+    } else {
+        cloud_w_ = std::max(160, scene_w_ / 3);
+        cloud_h_ = std::max(90,  scene_h_ / 3);
+    }
 
     glCreateTextures(GL_TEXTURE_2D, 1, &scene_col_);
     glTextureStorage2D(scene_col_, 1, GL_RGBA16F, scene_w_, scene_h_);
@@ -173,7 +181,7 @@ void SkyAndClouds::alloc_fbos(int win_w, int win_h, int quality, int pixel_perce
         glNamedFramebufferDrawBuffers(cloud_fbo_[i], 1, &db);
     }
 
-    // Full-resolution temporal history stores resolved HDR color and reverse-Z depth.
+    // Full-resolution display target for native cockpit + UI; post/TAA runs at internal scene res.
     glCreateTextures(GL_TEXTURE_2D, 1, &post_display_tex_);
     glTextureStorage2D(post_display_tex_, 1, GL_RGBA8, cur_win_w_, cur_win_h_);
     glTextureParameteri(post_display_tex_, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
@@ -190,16 +198,27 @@ void SkyAndClouds::alloc_fbos(int win_w, int win_h, int quality, int pixel_perce
     glTextureParameteri(display_depth_, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glNamedFramebufferTexture(display_fbo_, GL_DEPTH_ATTACHMENT, display_depth_, 0);
     glNamedFramebufferDrawBuffers(display_fbo_, 1, &db);
+
+    const bool scaled_post = (scene_w_ != cur_win_w_ || scene_h_ != cur_win_h_);
+    if (scaled_post) {
+        glCreateTextures(GL_TEXTURE_2D, 1, &post_ldr_tex_);
+        glTextureStorage2D(post_ldr_tex_, 1, GL_RGBA8, scene_w_, scene_h_);
+        glTextureParameteri(post_ldr_tex_, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTextureParameteri(post_ldr_tex_, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTextureParameteri(post_ldr_tex_, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTextureParameteri(post_ldr_tex_, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
     for (int i = 0; i < 2; i++) {
         glCreateTextures(GL_TEXTURE_2D, 1, &post_history_tex_[i]);
-        glTextureStorage2D(post_history_tex_[i], 1, GL_RGBA16F, cur_win_w_, cur_win_h_);
+        glTextureStorage2D(post_history_tex_[i], 1, GL_RGBA16F, scene_w_, scene_h_);
         glTextureParameteri(post_history_tex_[i], GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTextureParameteri(post_history_tex_[i], GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTextureParameteri(post_history_tex_[i], GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTextureParameteri(post_history_tex_[i], GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
         glCreateFramebuffers(1, &post_fbo_[i]);
-        glNamedFramebufferTexture(post_fbo_[i], GL_COLOR_ATTACHMENT0, post_display_tex_, 0);
+        glNamedFramebufferTexture(post_fbo_[i], GL_COLOR_ATTACHMENT0,
+                                  scaled_post ? post_ldr_tex_ : post_display_tex_, 0);
         glNamedFramebufferTexture(post_fbo_[i], GL_COLOR_ATTACHMENT1, post_history_tex_[i], 0);
         GLenum post_db[2] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1};
         glNamedFramebufferDrawBuffers(post_fbo_[i], 2, post_db);
@@ -210,10 +229,10 @@ void SkyAndClouds::alloc_fbos(int win_w, int win_h, int quality, int pixel_perce
 }
 
 void SkyAndClouds::resize_if_needed(int win_w, int win_h, int quality, int pixel_percent, int aa_mode, int weather_detail) {
-    pixel_percent = std::clamp(pixel_percent, 40, 100);
+    pixel_percent = std::clamp(pixel_percent, 35, 150);
     aa_mode = std::clamp(aa_mode, 0, 2);
     if (win_w != cur_win_w_ || win_h != cur_win_h_ || quality != cur_quality_ || pixel_percent != cur_pixel_percent_ ||
-        cloud_quality_ != (weather_detail == 0 ? quality : std::clamp(weather_detail - 1, 0, 2))) {
+        cloud_quality_ != (weather_detail == 0 ? quality : std::clamp(weather_detail - 1, 0, 3))) {
         alloc_fbos(win_w, win_h, quality, pixel_percent, aa_mode, weather_detail);
     } else if (aa_mode != cur_aa_mode_) {
         cur_aa_mode_ = aa_mode;
@@ -544,7 +563,7 @@ void SkyAndClouds::render_clouds_and_post(
     glUniform1f(u_cld_time_, time_sec);
     glUniform1i(u_cld_frame_, frame_idx);
     glUniform1f(u_cld_tblend_, temporal_blend);
-    static constexpr GLint kCloudSteps[4] = {8, 10, 12, 16};
+    static constexpr GLint kCloudSteps[4] = {7, 8, 9, 18};
     glUniform1i(u_cld_steps_, kCloudSteps[std::clamp(cloud_quality_, 0, 3)]);
     glUniform1i(u_cld_sparse_, sparse_period);
     glUniform3f(u_cld_lit_, atmo_.cloud_lit.x, atmo_.cloud_lit.y, atmo_.cloud_lit.z);
@@ -572,12 +591,12 @@ void SkyAndClouds::render_clouds_and_post(
     history_valid_ = true;
     cloud_ping_ = 1 - cloud_ping_;
 
-    // 2. Reprojected temporal AA + AgX/LUT composite. The history stores linear HDR
-    // and reverse-Z depth, so stable far terrain converges across subpixel jitter.
+    // 2. Reprojected temporal AA + AgX/LUT composite at internal scene resolution.
+    // The history matches the scene jitter grid and stores linear HDR + reverse-Z depth.
     int post_dst = post_ping_;
     int post_src = 1 - post_ping_;
     glBindFramebuffer(GL_FRAMEBUFFER, post_fbo_[post_dst]);
-    glViewport(0, 0, cur_win_w_, cur_win_h_);
+    glViewport(0, 0, scene_w_, scene_h_);
     glUseProgram(post_prog_);
     glUniform1f(u_post_exp_, atmo_.exposure);
     glUniformMatrix4fv(u_post_inv_vp_, 1, GL_FALSE, inv_vp.m);
@@ -603,6 +622,13 @@ void SkyAndClouds::render_clouds_and_post(
     glBindTextureUnit(4, post_history_tex_[post_src]);
     glBindVertexArray(dummy_vao_);
     glDrawArrays(GL_TRIANGLES, 0, 3);
+
+    if (post_ldr_tex_ && (scene_w_ != cur_win_w_ || scene_h_ != cur_win_h_)) {
+        glBlitNamedFramebuffer(post_fbo_[post_dst], display_fbo_,
+                               0, 0, scene_w_, scene_h_,
+                               0, 0, cur_win_w_, cur_win_h_,
+                               GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    }
 
     // Draw HUD and read captures from the resolved image. The display FBO
     // shares the color target and has no temporal history attachment.

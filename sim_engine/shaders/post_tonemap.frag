@@ -68,17 +68,17 @@ void main() {
             scene = mix(scene, edge_pair, strength * (u_aa_mode != 0 ? 0.24 : 0.44));
         }
     }
+    vec3 nb_lo = min(min(north, south), min(east, west));
+    vec3 nb_hi = max(max(north, south), max(east, west));
     if (u_aa_mode != 0) {
         // Bounded reconstruction sharpening; crisp mode offsets the selected
         // low internal pixel budget without a second full-screen texture pass.
         // Reuse the FXAA neighborhood taps, so ortho detail is restored without
         // another texture pass or amplifying values beyond the local sample range.
         vec3 neighborhood = (north + south + east + west) * 0.25;
-        vec3 lo = min(min(north, south), min(east, west));
-        vec3 hi = max(max(north, south), max(east, west));
         float sharpen_amount = u_aa_mode == 2 ? 0.48 : 0.26;
         vec3 sharpened = scene + (scene - neighborhood) * (sharpen_amount * (1.0 - strength));
-        scene = clamp(sharpened, lo - vec3(0.012), hi + vec3(0.012));
+        scene = clamp(sharpened, nb_lo - vec3(0.012), nb_hi + vec3(0.012));
     }
     vec4 cld = texture(u_cloud_tex, v_uv);
     float d_here = textureLod(u_scene_depth, v_uv, 0.0).r;
@@ -127,8 +127,8 @@ void main() {
             } else {
                 depth_gate = 1.0 - smoothstep(0.00001, 0.00008, hist.a);
             }
-            vec3 lo = min(hdr, min(scene, min(min(north, south), min(east, west))));
-            vec3 hi = max(hdr, max(scene, max(max(north, south), max(east, west))));
+            vec3 lo = min(hdr, min(scene, nb_lo));
+            vec3 hi = max(hdr, max(scene, nb_hi));
             vec3 pad = max(vec3(0.025), abs(hdr) * 0.045);
             vec3 history_color = clamp(hist.rgb, lo - pad, hi + pad);
             float delta_luma = abs(dot(history_color - hdr, vec3(0.2126, 0.7152, 0.0722))) /

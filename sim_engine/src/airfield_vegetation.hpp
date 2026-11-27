@@ -25,7 +25,8 @@ public:
     void update_around(const PackReader &pack, double lat_deg, double lon_deg, float agl);
     void invalidate();
     void draw(const Mat4 &vp, Vec3 camera_enu, const AtmosphereState &atmo,
-              float agl, float time_sec, Vec2 wind_en, int season, float snowline_m);
+              float agl, float time_sec, Vec2 wind_en, int season, float snowline_m,
+              int veg_detail = 2);
     int instance_count() const { return count_; }
 
 private:

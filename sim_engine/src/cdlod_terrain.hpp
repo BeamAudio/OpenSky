@@ -56,8 +56,10 @@ public:
         const Vec2 &wind_en_mps, GLuint refl_env_tex, int quality,
         int season, float snowline_m, int lod_distance_percent = 100,
         const TerrainGrassZone &grass_zone = {},
-        const Vec4 &wx_env = {0.0f, 0.0f, 0.0f, 0.0f}
+        const Vec4 &wx_env = {0.0f, 0.0f, 0.0f, 0.0f},
+        int terrain_detail = -1, int veg_detail = -1
     );
+    void set_anisotropy(int max_aniso);
 
     GLuint cloud_noise_tex() const { return cloud_noise_tex_; }
     GLuint cloud_vol_tex() const { return cloud_vol_tex_; }
@@ -105,7 +107,7 @@ private:
     GLuint prog_ = 0;
     struct TerrainUniforms {
         GLint vp = -1, cam_alt = -1, cam_agl = -1, sun_dir = -1, haze_cool = -1, haze_warm = -1;
-        GLint haze_density = -1, cloud_cov = -1, time = -1, detail_strength = -1, wind_en = -1, quality = -1;
+        GLint haze_density = -1, cloud_cov = -1, time = -1, detail_strength = -1, wind_en = -1, quality = -1, veg_detail = -1;
         GLint season = -1, snowline_m = -1;
         GLint grass_zone = -1, grass_zone_bounds = -1, wx_env = -1;
     } u_{};

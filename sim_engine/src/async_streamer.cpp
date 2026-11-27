@@ -158,7 +158,7 @@ bool AsyncTerrainStreamer::init(const PackReader *pack, int worker_count, OrthoF
     glTextureParameteri(ortho_arr_, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTextureParameteri(ortho_arr_, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTextureParameteri(ortho_arr_, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTextureParameterf(ortho_arr_, GL_TEXTURE_MAX_ANISOTROPY, 8.0f);
+    glTextureParameterf(ortho_arr_, GL_TEXTURE_MAX_ANISOTROPY, 4.0f);
 
     glCreateTextures(GL_TEXTURE_2D_ARRAY, 1, &norm_arr_);
     glTextureStorage3D(norm_arr_, 1, GL_RGBA8, AUX_RES, AUX_RES, page_capacity_);
@@ -988,6 +988,14 @@ StreamStats AsyncTerrainStreamer::stats() const {
     s.worker_encode_total_ms = worker_encode_us_.load(std::memory_order_relaxed) / 1000.0;
     s.gpu_page_bytes = layout_.ortho_bytes + SZ_HEIGHT + 2 * SZ_AUX;
     return s;
+}
+
+void AsyncTerrainStreamer::set_anisotropy(int max_aniso) {
+    if (!ortho_arr_) return;
+    float max_hw = 1.0f;
+    glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY, &max_hw);
+    const float a = std::clamp(static_cast<float>(max_aniso), 1.0f, max_hw);
+    glTextureParameterf(ortho_arr_, GL_TEXTURE_MAX_ANISOTROPY, a);
 }
 
 } // namespace nsim

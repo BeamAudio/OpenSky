@@ -1351,45 +1351,64 @@ void GameFrontend::draw_logbook(AircraftAndHud &ui) {
 
 void GameFrontend::draw_settings(AircraftAndHud &ui, int &time_of_day, RegionalAtmosphere *reg_atmo) {
     label(ui, 64, 111, 44, "Settings");
-    label(ui, 66, 166, 21, "Tune performance, cockpit POV feel, audio, clarity, and live weather.", true);
+    label(ui, 66, 166, 21, "Scale visuals from battery-saving laptop mode up to max dedicated-GPU detail.", true);
     panel(ui, {64,225,1100,720});
-    label(ui, 91, 246, 24, "Graphics & Streaming");
+    label(ui, 91, 240, 22, "Graphics, Hardware Tuning & Streaming");
     auto &s = ui.graphics_settings_;
     bool changed = false;
+
+    // One-click hardware profile bar (adapts all tuning sliders for laptops/iGPUs vs dedicated GPUs)
+    if (button(ui, {91,  274, 248, 34}, "Laptop / Battery",   true, s.quality_preset == 0)) { apply_graphics_profile(s, 0); changed = true; }
+    if (button(ui, {356, 274, 248, 34}, "Balanced 60 FPS",    true, s.quality_preset == 1)) { apply_graphics_profile(s, 1); changed = true; }
+    if (button(ui, {621, 274, 248, 34}, "High Quality",       true, s.quality_preset == 2)) { apply_graphics_profile(s, 2); changed = true; }
+    if (button(ui, {886, 274, 251, 34}, "Max Dedicated GPU",  true, s.quality_preset == 3)) { apply_graphics_profile(s, 3); changed = true; }
+
     auto setting = [&](int row, const char *name, const char *value) {
-        const int y = 290 + row * 50;
-        ui.hud_rect(91,y+43,1046,1,.21f,.32f,.39f,.85f);
-        label(ui, 91, y+8, 19, name);
-        label(ui, 763, y+8, 18, value);
-        if (button(ui, {697,y,44,36}, "<")) { changed = true; return -1; }
-        if (button(ui, {1093,y,44,36}, ">")) { changed = true; return 1; }
+        const int y = 320 + row * 39;
+        ui.hud_rect(91,y+34,1046,1,.21f,.32f,.39f,.85f);
+        label(ui, 91, y+6, 17, name);
+        label(ui, 756, y+6, 16, value);
+        if (button(ui, {697,y,42,30}, "<")) { changed = true; return -1; }
+        if (button(ui, {1095,y,42,30}, ">")) { changed = true; return 1; }
         return 0;
     };
-    static const char *presets[] = {"Low (F1 / Cooler)", "Medium (F2 / 60 FPS)", "High (F3 / Balanced)", "Ultra (F4 / dGPU)"};
-    static const char *weather[] = {"Follow preset", "Low", "Medium", "High"};
+    static const char *presets[] = {"Low (F1 / Laptop)", "Medium (F2 / 60 FPS)", "High (F3 / Balanced)", "Ultra (F4 / dGPU)"};
+    static const char *weather[] = {"Follow preset", "Low (Fastest)", "Medium", "High", "Ultra (Max Clouds)"};
+    static const char *surf[] = {"Follow preset", "Fast (Ortho only)", "Balanced", "High (PBR relief)", "Extreme (Full PBR)"};
+    static const char *world[] = {"Follow preset", "Sparse (Laptop)", "Medium", "High", "Max (Dense Cities)"};
+    static const char *veg[] = {"Follow preset", "Minimal", "Standard", "High", "Dense Forest"};
     static const char *aa[] = {"Spatial FXAA", "Balanced TAA", "Crisp TAA"};
     static const char *clarity[] = {"Crisp VFR", "Natural", "Hazy"};
+    static constexpr int kAnisoVals[] = {1, 2, 4, 8, 16};
     char value[48];
     s.quality_preset = (s.quality_preset + setting(0, "Performance preset", presets[s.quality_preset]) + 4) % 4;
     std::snprintf(value, sizeof(value), "%d%%", s.pixel_percent);
-    s.pixel_percent = std::clamp(s.pixel_percent + 5 * setting(1, "Render resolution budget", value), 40, 100);
+    s.pixel_percent = std::clamp(s.pixel_percent + 5 * setting(1, "Render resolution", value), 35, 150);
     s.aa_mode = (s.aa_mode + setting(2, "Anti-aliasing", aa[s.aa_mode]) + 3) % 3;
-    s.atmosphere_clarity = (s.atmosphere_clarity + setting(3, "Atmosphere clarity", clarity[s.atmosphere_clarity]) + 3) % 3;
+    {
+        int ai = 2;
+        for (int i = 0; i < 5; ++i) if (kAnisoVals[i] == s.anisotropy) ai = i;
+        std::snprintf(value, sizeof(value), "%dx Anisotropic", s.anisotropy);
+        if (int d = setting(3, "Texture filtering", value))
+            s.anisotropy = kAnisoVals[(ai + d + 5) % 5];
+    }
     std::snprintf(value, sizeof(value), "%d%%", s.terrain_lod_percent);
-    s.terrain_lod_percent = std::clamp(s.terrain_lod_percent + 25 * setting(4, "Terrain LOD radius", value), 75, 200);
-    if (setting(5, "Online PNOA streaming", s.terrain_streaming ? "On / IGN PNOA" : "Off / installed packs"))
-        s.terrain_streaming = !s.terrain_streaming;
-    s.weather_detail = (s.weather_detail + setting(6, "Cloud & weather detail", weather[s.weather_detail]) + 4) % 4;
-    if (setting(7, "Cockpit detail / native res", s.cockpit_native ? (s.aircraft_detail ? "Native + High" : "Native + Std") : "Scaled")) {
+    s.terrain_lod_percent = std::clamp(s.terrain_lod_percent + 25 * setting(4, "Terrain mesh distance", value), 50, 250);
+    s.terrain_detail = (s.terrain_detail + setting(5, "Terrain surface detail", surf[s.terrain_detail]) + 5) % 5;
+    s.weather_detail = (s.weather_detail + setting(6, "Cloud & sky quality", weather[s.weather_detail]) + 5) % 5;
+    s.world_detail = (s.world_detail + setting(7, "Cities & road traffic", world[s.world_detail]) + 5) % 5;
+    s.vegetation_detail = (s.vegetation_detail + setting(8, "Forest & tree detail", veg[s.vegetation_detail]) + 5) % 5;
+    if (setting(9, "Cockpit detail / native res", s.cockpit_native ? (s.aircraft_detail ? "Native + High" : "Native + Std") : "Scaled (Laptop)")) {
         if (!s.cockpit_native) { s.cockpit_native = true; s.aircraft_detail = 0; }
         else if (s.aircraft_detail == 0) { s.aircraft_detail = 1; }
         else { s.cockpit_native = false; s.aircraft_detail = 0; }
     }
-    if (setting(8, "In-flight overlays", s.show_flight_hud ? "On" : "Off"))
-        s.show_flight_hud = !s.show_flight_hud;
+    s.atmosphere_clarity = (s.atmosphere_clarity + setting(10, "Atmosphere clarity", clarity[s.atmosphere_clarity]) + 3) % 3;
+    if (setting(11, "Online PNOA streaming", s.terrain_streaming ? "On / IGN PNOA" : "Off / installed packs"))
+        s.terrain_streaming = !s.terrain_streaming;
     static const char *display_modes[] = {"Windowed", "Fullscreen", "Fullscreen windowed"};
-    s.display_mode = (s.display_mode + setting(9, "Display mode", display_modes[s.display_mode]) + 3) % 3;
-    if (setting(10, "VSync", s.vsync ? "On (Tear-free)" : "Off (Low latency)"))
+    s.display_mode = (s.display_mode + setting(12, "Display mode", display_modes[s.display_mode]) + 3) % 3;
+    if (setting(13, "VSync", s.vsync ? "On (Tear-free)" : "Off (Low latency)"))
         s.vsync = !s.vsync;
     static constexpr int kFpsLimits[] = {30, 45, 60, 75, 90, 120, 144, 0};
     constexpr int kFpsCount = static_cast<int>(sizeof(kFpsLimits) / sizeof(kFpsLimits[0]));
@@ -1401,19 +1420,19 @@ void GameFrontend::draw_settings(AircraftAndHud &ui, int &time_of_day, RegionalA
     }
     if (s.fps_limit > 0) std::snprintf(value, sizeof(value), "%d FPS", s.fps_limit);
     else std::snprintf(value, sizeof(value), "Unlimited");
-    if (int delta = setting(11, "FPS limit", value))
+    if (int delta = setting(14, "FPS limit", value))
         s.fps_limit = kFpsLimits[(fps_idx + delta + kFpsCount) % kFpsCount];
-    label(ui, 91, 900, 13, "Display mode applies after restart; VSync and FPS limit apply live.", true);
+    label(ui, 91, 914, 13, "Display mode applies after restart; quality sliders, VSync & FPS limit apply live.", true);
 
     panel(ui, {1192,225,664,720});
-    label(ui, 1218, 246, 24, "Cockpit POV & Audio");
+    label(ui, 1218, 240, 22, "Cockpit POV, HUD & Audio");
     auto rsetting = [&](int row, const char *name, const char *val) {
-        const int y = 296 + row * 68;
-        ui.hud_rect(1218, y + 47, 612, 1, .21f, .32f, .39f, .85f);
-        label(ui, 1218, y + 9, 19, name);
-        label(ui, 1598, y + 9, 18, val);
-        if (button(ui, {1540, y, 42, 38}, "<")) { changed = true; return -1; }
-        if (button(ui, {1788, y, 42, 38}, ">")) { changed = true; return 1; }
+        const int y = 286 + row * 54;
+        ui.hud_rect(1218, y + 40, 612, 1, .21f, .32f, .39f, .85f);
+        label(ui, 1218, y + 7, 18, name);
+        label(ui, 1598, y + 7, 17, val);
+        if (button(ui, {1540, y, 42, 34}, "<")) { changed = true; return -1; }
+        if (button(ui, {1788, y, 42, 34}, ">")) { changed = true; return 1; }
         return 0;
     };
     static const char *head_modes[] = {"Off", "Subtle", "Realistic"};
@@ -1422,6 +1441,8 @@ void GameFrontend::draw_settings(AircraftAndHud &ui, int &time_of_day, RegionalA
     s.head_motion_mode = (s.head_motion_mode + rsetting(1, "Head G-feel & turn look", head_modes[s.head_motion_mode]) + 3) % 3;
     std::snprintf(value, sizeof(value), "%d%%", s.audio_volume_percent);
     s.audio_volume_percent = std::clamp(s.audio_volume_percent + 5 * rsetting(2, "Master audio volume", value), 0, 100);
+    if (rsetting(3, "In-flight HUD overlay", s.show_flight_hud ? "On" : "Off"))
+        s.show_flight_hud = !s.show_flight_hud;
 
     label(ui, 1218, 514, 24, "Time of day");
     int time_index = time_of_day < 0 ? 0 : (time_of_day == 10 ? 11 : time_of_day + 1);

@@ -824,8 +824,8 @@ void LivingTraffic::update_and_render(
 
     for (auto &b : gpu_batches_) b.clear();
 
-    const double max_air_d = (quality == 0) ? 26000.0 : 42000.0;
-    const double max_sea_d = (quality == 0) ? 22000.0 : 34000.0;
+    const double max_air_d = (quality == 0) ? 20000.0 : (quality >= 4 ? 56000.0 : 42000.0);
+    const double max_sea_d = (quality == 0) ? 16000.0 : (quality >= 4 ? 48000.0 : 34000.0);
 
     int drawn_air = 0, drawn_sea = 0;
     for (auto &a : air_agents_) {

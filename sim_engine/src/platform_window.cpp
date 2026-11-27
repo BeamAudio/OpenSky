@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 #ifdef _WIN32
@@ -19,6 +20,7 @@
 #endif
 #include <windows.h>
 #include <windowsx.h>
+#include <mmsystem.h>
 #else
 #include <X11/Xlib.h>
 #include <X11/XKBlib.h>
@@ -187,6 +189,7 @@ struct PlatformWindow::Impl {
     HGLRC hglrc = nullptr;
     PFN_wglSwapIntervalEXT swap_interval_fn = nullptr;
     PlatformWindow *owner = nullptr;
+    bool timer_period_set = false;
 
     static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         if (msg == WM_NCCREATE) {
@@ -308,6 +311,7 @@ bool PlatformWindow::create(const char *title, int aspect_w, int aspect_h, Displ
     impl_ = new Impl();
     impl_->owner = this;
     impl_->hinst = GetModuleHandleW(nullptr);
+    impl_->timer_period_set = (timeBeginPeriod(1) == TIMERR_NOERROR);
 
     constexpr wchar_t kClassName[] = L"OpenSkyVFRWindow";
     WNDCLASSEXW wc{};
@@ -513,6 +517,10 @@ void PlatformWindow::destroy() {
     if (impl_->hwnd) {
         DestroyWindow(impl_->hwnd);
         impl_->hwnd = nullptr;
+    }
+    if (impl_->timer_period_set) {
+        timeEndPeriod(1);
+        impl_->timer_period_set = false;
     }
     delete impl_;
     impl_ = nullptr;
@@ -1073,6 +1081,58 @@ double PlatformWindow::now_sec() {
     using clock = std::chrono::steady_clock;
     static const auto t0 = clock::now();
     return std::chrono::duration<double>(clock::now() - t0).count();
+}
+
+void PlatformWindow::sleep_sec(double seconds) {
+    if (seconds <= 0.0) return;
+#ifdef _WIN32
+    const double deadline = now_sec() + seconds;
+    // Use Windows 10+ high-resolution waitable timer + short spin tail to avoid
+    // Windows' default 15.625 ms timer tick stalling 60 FPS pacing into 30-40 FPS.
+    struct HiResTimer {
+        HANDLE h = nullptr;
+        HiResTimer() {
+            using CreateExFn = HANDLE (WINAPI *)(LPSECURITY_ATTRIBUTES, LPCWSTR, DWORD, DWORD);
+            HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+            auto create_ex = k32 ? reinterpret_cast<CreateExFn>(reinterpret_cast<void *>(
+                                       GetProcAddress(k32, "CreateWaitableTimerExW")))
+                                 : nullptr;
+            if (create_ex) {
+                constexpr DWORD kHighRes = 0x00000002u;
+                h = create_ex(nullptr, nullptr, kHighRes, TIMER_MODIFY_STATE | SYNCHRONIZE);
+            }
+            if (!h) h = CreateWaitableTimerW(nullptr, TRUE, nullptr);
+        }
+        ~HiResTimer() {
+            if (h) CloseHandle(h);
+        }
+    };
+    thread_local HiResTimer timer;
+    for (;;) {
+        const double rem = deadline - now_sec();
+        if (rem <= 0.0) break;
+        if (rem > 0.0018) {
+            const double wait_s = rem - 0.0012;
+            if (timer.h) {
+                LARGE_INTEGER due{};
+                due.QuadPart = -static_cast<LONGLONG>(wait_s * 1.0e7);
+                if (due.QuadPart < 0 && SetWaitableTimer(timer.h, &due, 0, nullptr, nullptr, FALSE)) {
+                    WaitForSingleObject(timer.h, static_cast<DWORD>(wait_s * 1000.0) + 2u);
+                    continue;
+                }
+            }
+            const DWORD ms = static_cast<DWORD>(wait_s * 1000.0);
+            if (ms > 0) Sleep(ms);
+            else SwitchToThread();
+        } else if (rem > 0.0003) {
+            SwitchToThread();
+        } else {
+            YieldProcessor();
+        }
+    }
+#else
+    std::this_thread::sleep_for(std::chrono::duration<double>(seconds));
+#endif
 }
 
 PixelRect PlatformWindow::presentation_rect(int output_w, int output_h) const {

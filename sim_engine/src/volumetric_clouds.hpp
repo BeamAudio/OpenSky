@@ -136,6 +136,7 @@ private:
 
     GLuint post_fbo_[2]{};
     GLuint display_fbo_ = 0;
+    GLuint post_ldr_tex_ = 0;
     GLuint post_display_tex_ = 0;
     GLuint display_depth_ = 0;
     GLuint post_history_tex_[2]{};

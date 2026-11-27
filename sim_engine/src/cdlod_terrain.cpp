@@ -112,7 +112,7 @@ GLuint CdlodTerrain::load_tex2d(const std::string &path, bool srgb, bool mipmaps
     glTextureParameteri(tex, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTextureParameteri(tex, GL_TEXTURE_WRAP_S, repeat ? GL_REPEAT : GL_CLAMP_TO_EDGE);
     glTextureParameteri(tex, GL_TEXTURE_WRAP_T, repeat ? GL_REPEAT : GL_CLAMP_TO_EDGE);
-    if (mipmaps) glTextureParameterf(tex, GL_TEXTURE_MAX_ANISOTROPY, 8.0f);
+    if (mipmaps) glTextureParameterf(tex, GL_TEXTURE_MAX_ANISOTROPY, 4.0f);
     stbi_image_free(pix);
     return tex;
 }
@@ -149,7 +149,7 @@ bool CdlodTerrain::load_sat_array_16(const std::string &atlas_path) {
     glTextureParameteri(sat_array_tex_, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTextureParameteri(sat_array_tex_, GL_TEXTURE_WRAP_S, GL_REPEAT);
     glTextureParameteri(sat_array_tex_, GL_TEXTURE_WRAP_T, GL_REPEAT);
-    glTextureParameterf(sat_array_tex_, GL_TEXTURE_MAX_ANISOTROPY, 8.0f);
+    glTextureParameterf(sat_array_tex_, GL_TEXTURE_MAX_ANISOTROPY, 4.0f);
     stbi_image_free(pix);
     return true;
 }
@@ -290,6 +290,7 @@ bool CdlodTerrain::init(const std::string &asset_root, const std::string &shader
     u_.detail_strength = glGetUniformLocation(prog_, "u_detail_strength");
     u_.wind_en         = glGetUniformLocation(prog_, "u_wind_en");
     u_.quality         = glGetUniformLocation(prog_, "u_quality");
+    u_.veg_detail      = glGetUniformLocation(prog_, "u_veg_detail");
     u_.season          = glGetUniformLocation(prog_, "u_season");
     u_.snowline_m      = glGetUniformLocation(prog_, "u_snowline_m");
     u_.grass_zone      = glGetUniformLocation(prog_, "u_grass_zone");
@@ -557,6 +558,15 @@ void CdlodTerrain::select_node(
     if (k.lod < 12) stats_.visible_by_lod[k.lod]++;
 }
 
+void CdlodTerrain::set_anisotropy(int max_aniso) {
+    float max_hw = 1.0f;
+    glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY, &max_hw);
+    const float a = std::clamp(static_cast<float>(max_aniso), 1.0f, max_hw);
+    for (GLuint t : {sat_array_tex_, rock_albedo_tex_, rock_normal_tex_, grass_albedo_tex_, grass_normal_tex_, gravel_albedo_tex_, gravel_normal_tex_}) {
+        if (t) glTextureParameterf(t, GL_TEXTURE_MAX_ANISOTROPY, a);
+    }
+}
+
 void CdlodTerrain::update_and_render(
     AsyncTerrainStreamer &streamer,
     const Mat4 &vp,
@@ -569,7 +579,9 @@ void CdlodTerrain::update_and_render(
     const Vec2 &wind_en_mps, GLuint refl_env_tex, int quality,
     int season, float snowline_m, int lod_distance_percent,
     const TerrainGrassZone &grass_zone,
-    const Vec4 &wx_env
+    const Vec4 &wx_env,
+    int terrain_detail,
+    int veg_detail
 ) {
     visible_.clear();
     stats_ = {};
@@ -586,7 +598,7 @@ void CdlodTerrain::update_and_render(
     else if (cam_agl_m > 1150.0) max_lod = std::min(max_lod, 8);
 
     // Balanced LOD distance scale keeps sharp L8/L9 near camera while hitting 60 FPS on Renoir iGPUs
-    float q_mult = (quality == 0) ? 2.25f : (quality == 1 ? 2.65f : (quality == 2 ? 2.90f : 3.45f));
+    float q_mult = (quality == 0) ? 2.25f : (quality == 1 ? 2.25f : (quality == 2 ? 2.25f : 3.45f));
     q_mult *= std::clamp(lod_distance_percent, 75, MAX_LOD_DISTANCE_PERCENT) / 100.0f;
     for (int l = 1; l <= AsyncTerrainStreamer::MAX_LOD; l++) {
         double quad_size = AsyncTerrainStreamer::WORLD_SPAN_M / static_cast<double>(1u << l);
@@ -602,6 +614,15 @@ void CdlodTerrain::update_and_render(
     stats_.visible_nodes = static_cast<int>(visible_.size());
     if (visible_.empty()) return;
 
+    // Sort front-to-back so hardware Early-Z rejects occluded back-slopes in mountainous terrain.
+    std::sort(visible_.begin(), visible_.end(), [](const NodeInstanceGpu &a, const NodeInstanceGpu &b) {
+        const float ax = a.min_e_rel + a.size_m * 0.5f;
+        const float az = a.min_n_rel + a.size_m * 0.5f;
+        const float bx = b.min_e_rel + b.size_m * 0.5f;
+        const float bz = b.min_n_rel + b.size_m * 0.5f;
+        return (ax * ax + az * az) < (bx * bx + bz * bz);
+    });
+
     glNamedBufferSubData(inst_ssbo_, 0, static_cast<GLsizeiptr>(visible_.size() * sizeof(NodeInstanceGpu)), visible_.data());
 
     glUseProgram(prog_);
@@ -614,9 +635,12 @@ void CdlodTerrain::update_and_render(
     glUniform1f(u_.haze_density, haze_density);
     glUniform1f(u_.cloud_cov, cloud_coverage);
     glUniform1f(u_.time, time_sec);
-    glUniform1f(u_.detail_strength, quality == 0 ? 0.94f : 1.0f);
+    const int eff_t = (terrain_detail < 0) ? quality : std::clamp(terrain_detail, 0, 3);
+    const int eff_v = (veg_detail < 0) ? quality : std::clamp(veg_detail, 0, 3);
+    glUniform1f(u_.detail_strength, eff_t == 0 ? 0.94f : (terrain_detail >= 3 ? 1.10f : 1.0f));
     glUniform2f(u_.wind_en, wind_en_mps.x, wind_en_mps.y);
-    glUniform1i(u_.quality, quality);
+    glUniform1i(u_.quality, eff_t);
+    if (u_.veg_detail >= 0) glUniform1i(u_.veg_detail, eff_v);
     glUniform1i(u_.season, std::clamp(season, 0, 3));
     glUniform1f(u_.snowline_m, std::clamp(snowline_m, 1000.0f, 5000.0f));
     glUniform4f(u_.grass_zone, grass_zone.center_en.x, grass_zone.center_en.y,

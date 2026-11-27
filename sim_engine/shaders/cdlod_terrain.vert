@@ -77,17 +77,19 @@ void main() {
     vec2 uv_m = a_uv - frac_odd * (morph / 32.0);
     vec2 p_uv = vec2(nd.parent_uv_off_x, nd.parent_uv_off_y) + uv_m * 0.5;
 
-    float h_child  = textureLod(u_height_arr, vec3(height_uv(uv_m), nd.page_slice), 0.0).r;
-    float h_parent = textureLod(u_height_arr, vec3(height_uv(p_uv), nd.parent_slice), 0.0).r;
-    float h = mix(h_child, h_parent, morph);
+    float h_child = textureLod(u_height_arr, vec3(height_uv(uv_m), nd.page_slice), 0.0).r;
+    float h = (morph > 0.001)
+        ? mix(h_child, textureLod(u_height_arr, vec3(height_uv(p_uv), nd.parent_slice), 0.0).r, morph)
+        : h_child;
 
     // Drape the existing orthophoto over the LiDAR canopy. Use the same
     // parent/child morph as the DEM so the canopy follows streamed detail.
     // Keep urban/roadside LiDAR trees intact (strict building/road/runway masks
     // are already applied in surface.r on the CPU page builder); only suppress on water.
     vec4 surf_child = textureLod(u_surf_arr, vec3(aux_uv(uv_m), nd.page_slice), 0.0);
-    vec4 surf_parent = textureLod(u_surf_arr, vec3(aux_uv(p_uv), nd.parent_slice), 0.0);
-    vec4 surface = mix(surf_child, surf_parent, morph);
+    vec4 surface = (morph > 0.001)
+        ? mix(surf_child, textureLod(u_surf_arr, vec3(aux_uv(p_uv), nd.parent_slice), 0.0), morph)
+        : surf_child;
     vec2 world_en = vec2(nd.world_min_e, nd.world_min_n) + uv_m * nd.size_m;
     float canopy_m = min(surface.r * 25.0, 13.5);
     // Crisp shoulder ramp so hedgerows & forest walls rise cleanly instead of melting into flat clay ramps.
@@ -97,32 +99,39 @@ void main() {
 
     // Cellular individual tree-crown domes (7.2 m spacing) break smooth LiDAR blobs into distinct
     // interlocking tree crowns with per-tree species variation (v_crown_id) and zero 3D region baking!
-    vec2 cell_p = world_en * (1.0 / 7.2);
-    vec2 cell_i = floor(cell_p);
-    vec2 cell_f = fract(cell_p);
-    float min_d2 = 4.0;
+    // Skip the 3x3 Voronoi cell search whenever vertices are outside near_crown range or lack canopy.
     float crown_id = 0.5;
-    for (int dy = -1; dy <= 1; ++dy) {
-        for (int dx = -1; dx <= 1; ++dx) {
-            vec2 nb = vec2(float(dx), float(dy));
-            vec2 rnd = hash22_v(cell_i + nb);
-            vec2 diff = nb + (0.18 + 0.64 * rnd) - cell_f;
-            float d2_c = dot(diff, diff);
-            if (d2_c < min_d2) {
-                min_d2 = d2_c;
-                crown_id = rnd.x;
+    float dome = 0.5;
+    float bough_jag = 0.5;
+    float near_crown = 1.0 - smoothstep(140.0, 620.0, est_dist);
+    if (canopy_cover > 0.005 && forest_lod_weight > 0.005 && near_crown > 0.002) {
+        vec2 cell_p = world_en * (1.0 / 7.2);
+        vec2 cell_i = floor(cell_p);
+        vec2 cell_f = fract(cell_p);
+        float min_d2 = 4.0;
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                vec2 nb = vec2(float(dx), float(dy));
+                vec2 rnd = hash22_v(cell_i + nb);
+                vec2 diff = nb + (0.18 + 0.64 * rnd) - cell_f;
+                float d2_c = dot(diff, diff);
+                if (d2_c < min_d2) {
+                    min_d2 = d2_c;
+                    crown_id = rnd.x;
+                }
             }
         }
+        dome = sqrt(max(0.0, 1.0 - min(1.0, min_d2 * 1.45)));
+        bough_jag = 0.5 + 0.5 * sin(world_en.x * 1.35 + crown_id * 6.28) * cos(world_en.y * 1.28 - crown_id * 4.1);
     }
-    float dome = sqrt(max(0.0, 1.0 - min(1.0, min_d2 * 1.45)));
-    float bough_jag = 0.5 + 0.5 * sin(world_en.x * 1.35 + crown_id * 6.28) * cos(world_en.y * 1.28 - crown_id * 4.1);
     // Live wind-driven tree sway & gust bending directly from RegionalAtmosphere u_wind_en!
     float wind_spd = length(u_wind_en);
     float wind_freq = 1.2 + clamp(wind_spd * 0.14, 0.0, 2.8);
     float wind_amp = (0.015 + clamp(wind_spd * 0.0085, 0.0, 0.16)) * smoothstep(1.8, 8.5, canopy_m);
-    float wind_wave = sin(u_time * wind_freq + world_en.x * 0.28 + world_en.y * 0.24 + crown_id * 6.28);
+    float wind_wave = (canopy_cover > 0.005 && near_crown > 0.002)
+        ? sin(u_time * wind_freq + world_en.x * 0.28 + world_en.y * 0.24 + crown_id * 6.28)
+        : 0.0;
     float sway = wind_wave * wind_amp;
-    float near_crown = 1.0 - smoothstep(140.0, 620.0, est_dist);
     float crown_billow = mix(0.84 + 0.16 * sin(world_en.x * 0.23) * cos(world_en.y * 0.21),
                              (0.46 + 0.54 * dome) * (0.86 + 0.22 * bough_jag) * (0.84 + 0.32 * crown_id),
                              near_crown) + sway;

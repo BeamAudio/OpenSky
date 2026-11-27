@@ -161,7 +161,7 @@ GLuint WorldObjects::load_tex2d(const std::string &path, bool srgb, bool repeat)
     GLint wrap = repeat ? GL_REPEAT : GL_CLAMP_TO_EDGE;
     glTextureParameteri(tex, GL_TEXTURE_WRAP_S, wrap);
     glTextureParameteri(tex, GL_TEXTURE_WRAP_T, wrap);
-    glTextureParameterf(tex, GL_TEXTURE_MAX_ANISOTROPY, 8.0f);
+    glTextureParameterf(tex, GL_TEXTURE_MAX_ANISOTROPY, 4.0f);
     stbi_image_free(pix);
     return tex;
 }
@@ -536,7 +536,7 @@ bool WorldObjects::load_colored_glb(const std::string &path, GlbMeshData &out) {
         GLint wrap = img_clamp[ii] ? GL_CLAMP_TO_EDGE : GL_REPEAT;
         glTextureParameteri(tex, GL_TEXTURE_WRAP_S, wrap);
         glTextureParameteri(tex, GL_TEXTURE_WRAP_T, wrap);
-        glTextureParameterf(tex, GL_TEXTURE_MAX_ANISOTROPY, 16.0f);
+        glTextureParameterf(tex, GL_TEXTURE_MAX_ANISOTROPY, 4.0f);
         stbi_image_free(pix);
         img_tex[ii] = tex;
         out.owned_textures.push_back(tex);
@@ -1538,7 +1538,7 @@ void WorldObjects::rebuild_local_roads_and_traffic(double cam_e, double cam_n, i
     road_center_n_ = cam_n;
     road_last_q_ = quality;
 
-    double rad_m = (quality == 0) ? 1800.0 : (quality == 1 ? 2300.0 : 2900.0);
+    double rad_m = (quality <= 0) ? 1600.0 : (quality == 1 ? 2200.0 : (quality == 2 ? 2900.0 : (quality == 3 ? 3600.0 : 4800.0)));
     double cam_lat = pack_->anchor_lat() + cam_n / pack_->anchor_m_lat();
     double cam_lon = pack_->anchor_lon() + cam_e / pack_->anchor_m_lon();
     double dlat = rad_m / pack_->anchor_m_lat();
@@ -1685,7 +1685,7 @@ void WorldObjects::rebuild_local_roads_and_traffic(double cam_e, double cam_n, i
     // Spawn compact, naturally spaced moving traffic with individual multi-segment routes!
     agents_.clear();
     if (!active_segs_.empty()) {
-        int target = (quality == 0) ? 140 : (quality == 1 ? 240 : 340);
+        int target = (quality <= 0) ? 110 : (quality == 1 ? 210 : (quality == 2 ? 340 : (quality == 3 ? 520 : 820)));
         target = std::min(target, std::max(8, static_cast<int>(active_segs_.size()) / 3));
         target = std::min(target, MAX_CARS);
         agents_.reserve(target);
@@ -1799,12 +1799,22 @@ void WorldObjects::plan_vehicle_route(TrafficAgent &ag, bool random_progress) {
     ag.cur_yaw = std::atan2(ue0, -un0);
 }
 
+void WorldObjects::set_anisotropy(int max_aniso) {
+    float max_hw = 1.0f;
+    glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY, &max_hw);
+    const float a = std::clamp(static_cast<float>(max_aniso), 1.0f, max_hw);
+    for (GLuint t : {bldg_alb_, bldg_nrm_, bldg_orm_, interior_tex_, asph_tex_, grav_tex_, asph_nrm_, grav_nrm_}) {
+        if (t) glTextureParameterf(t, GL_TEXTURE_MAX_ANISOTROPY, a);
+    }
+}
+
 void WorldObjects::update_and_render(
     const Mat4 &vp, const Frustum &frustum,
     double cam_east_m, double cam_north_m, double cam_alt_m,
     const AtmosphereState &atmo, float time_sec, const Vec2 &wind_en_mps, GLuint refl_env_tex, int quality,
-    int max_new_tree_cells
+    int max_new_tree_cells, int world_detail
 ) {
+    const int wq = (world_detail < 0) ? std::clamp(quality, 0, 3) : std::clamp(world_detail, 0, 4);
     const float phase10 = sun_dir_to_phase10(atmo.sun_dir);
     if (mtn_gi_tex_ && std::abs(phase10 - mtn_gi_phase_) > 0.04f) {
         mtn_gi_phase_ = phase10;
@@ -1843,7 +1853,7 @@ void WorldObjects::update_and_render(
     }
 
     // 2. Real OpenStreetMap Streets, Avenues, Motorways & Sidewalks (streamed around camera!)
-    rebuild_local_roads_and_traffic(cam_east_m, cam_north_m, quality);
+    rebuild_local_roads_and_traffic(cam_east_m, cam_north_m, wq);
     if (road_vert_count_ > 0) {
         glUseProgram(road_prog_);
         glUniformMatrix4fv(u_road_vp_, 1, GL_FALSE, vp.m);
@@ -1986,8 +1996,10 @@ void WorldObjects::update_and_render(
     // 4b. Map-Wide Pre-Baked Exact-Polygon Populated Zones (streamed per region + 4km macro grid cull + Early-Z!)
     if (!city_regions_.empty()) {
         ensure_city_regions_for_camera(cam_east_m, cam_north_m);
-        float max_city_d = (quality == 0) ? 13000.0f : (quality == 1 ? 15500.0f : (quality == 2 ? 17500.0f : 22500.0f));
-        float near_cut   = (quality == 0) ? 650.0f   : (quality == 1 ? 850.0f   : (quality == 2 ? 720.0f : 2200.0f));
+        static constexpr float kCityMaxD[5] = {10500.0f, 14500.0f, 17500.0f, 22500.0f, 28000.0f};
+        static constexpr float kCityNear[5] = {  450.0f,   680.0f,   720.0f,  2200.0f,  3500.0f};
+        float max_city_d = kCityMaxD[wq];
+        float near_cut   = kCityNear[wq];
         float max_d2 = max_city_d * max_city_d;
         float near_cut2 = near_cut * near_cut;
 
@@ -2039,7 +2051,8 @@ void WorldObjects::update_and_render(
             std::sort(far_ch.begin(), far_ch.end(), [](const VisChunk &a, const VisChunk &b) { return a.d2 < b.d2; });
             // Per-frame index budget keeps dense megacities (Barcelona) within iGPU frame time
             // while pulling far-fade smoothly to the farthest included chunk distance.
-            const size_t max_city_idx = (quality == 0) ? 1500000u : (quality == 1 ? 1800000u : (quality == 2 ? 2100000u : 6000000u));
+            static constexpr size_t kCityMaxIdx[5] = {950000u, 1600000u, 2100000u, 6000000u, 9000000u};
+            const size_t max_city_idx = kCityMaxIdx[wq];
             size_t used_idx = 0;
             for (const VisChunk &vc : near_ch) used_idx += cr.chunks[vc.idx].index_count;
             float eff_far_d = max_city_d;
@@ -2125,8 +2138,9 @@ void WorldObjects::update_and_render(
 
     // 5. GPU-Driven 2-Tier Building LOD (Rural Towns & Villages 0..22km!) + Directional Ground Shadows & Contact AO!
     if (total_bldgs_ > 0) {
-        float b_rad = (quality == 0) ? 3200.0f : (quality == 1 ? 4500.0f : (quality == 2 ? 3000.0f : 5800.0f));
-        float far_rad = 22000.0f;
+        static constexpr float kBldgRad[5] = {2400.0f, 3200.0f, 2600.0f, 5800.0f, 7500.0f};
+        float b_rad = kBldgRad[wq];
+        float far_rad = wq >= 4 ? 26000.0f : 22000.0f;
         glNamedBufferSubData(bldg_cmd_ssbo_, 0, sizeof(bldg_base_cmds_), bldg_base_cmds_);
         glNamedBufferSubData(bldg_sh_cmd_ssbo_, 0, sizeof(bldg_sh_base_cmds_), bldg_sh_base_cmds_);
         glNamedBufferSubData(bldg_lod1_cmd_ssbo_, 0, sizeof(bldg_lod1_base_cmd_), &bldg_lod1_base_cmd_);

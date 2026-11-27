@@ -24,6 +24,7 @@ uniform float u_time;
 uniform float u_detail_strength;
 uniform vec2 u_wind_en; // Live RegionalAtmosphere local wind (East, North m/s) -> wind-driven water waves & chop!
 uniform int u_quality; // F3 High uses baked light + compact material lookups at native resolution.
+uniform int u_veg_detail; // 0=Minimal, 1=Standard, 2=High, 3=Dense forest detail
 uniform int u_season; // 0 winter, 1 spring, 2 summer, 3 autumn; sourced from the regional weather library.
 uniform float u_snowline_m; // Season- and weather-specific regional snowline above MSL.
 uniform vec4 u_grass_zone;        // EN center, then runway direction (E,N).
@@ -74,8 +75,9 @@ void apply_canopy_volume(inout vec3 albedo, inout vec3 normal, float strength, f
     if (strength <= 0.01) return;
     vec3 crown_n = normal;
     // 1. Smooth 2-tap forward-difference LiDAR canopy gradient (replaces 4-tap diff & faceted triangle normals)
-    if (v_dist < 4200.0) {
-        float near_grad = 1.0 - smoothstep(1800.0, 4200.0, v_dist);
+    float lidar_range = (u_veg_detail >= 3) ? 4500.0 : (u_veg_detail == 2 ? 1600.0 : (u_veg_detail == 1 ? 900.0 : 0.0));
+    if (v_dist < lidar_range) {
+        float near_grad = 1.0 - smoothstep(lidar_range * 0.45, lidar_range, v_dist);
         float step_u = 1.0 / 129.0;
         float h_e = textureLod(u_surf_arr, vec3(min(aux_uv_c.x + step_u, 0.996), aux_uv_c.y, page_slice), 0.0).r;
         float h_n = textureLod(u_surf_arr, vec3(aux_uv_c.x, min(aux_uv_c.y + step_u, 0.996), page_slice), 0.0).r;
@@ -91,7 +93,8 @@ void apply_canopy_volume(inout vec3 albedo, inout vec3 normal, float strength, f
     float dome_h;
     float leaf_mask;
     float dist_fade = 1.0 - smoothstep(7000.0, 22000.0, v_dist);
-    if (v_dist < 3000.0) {
+    float crown_par_range = (u_veg_detail >= 3) ? 3200.0 : (u_veg_detail == 2 ? 1200.0 : (u_veg_detail == 1 ? 650.0 : 0.0));
+    if (v_dist < crown_par_range) {
         vec2 uv_near = rot27(v_world_en) * 0.082;
         vec4 m_near = texture(u_micro_detail, uv_near);
         vec2 ray = rot27(vec2(view_dir.x, -view_dir.z)) / max(abs(view_dir.y), 0.42);
@@ -146,11 +149,15 @@ void apply_canopy_volume(inout vec3 albedo, inout vec3 normal, float strength, f
             }
             albedo = mix(albedo, leafy_col, ground_foliage * 0.94);
         }
-    } else {
+    } else if (v_dist < 14000.0) {
         vec4 m_far = texture(u_micro_detail, v_world_en * 0.024);
         dome_g = (m_far.rg - vec2(0.5)) * 0.92;
         dome_h = m_far.b;
         leaf_mask = m_far.a;
+    } else {
+        dome_g = vec2(0.0);
+        dome_h = 0.5;
+        leaf_mask = 0.5;
     }
     crown_n = normalize(crown_n + vec3(dome_g.x, 0.0, dome_g.y) * (strength * 0.65 * dist_fade));
     normal = crown_n;
@@ -303,26 +310,24 @@ void main() {
 
     vec2 ortho_c_dx = dFdx(ortho_c_uv), ortho_c_dy = dFdy(ortho_c_uv);
     vec2 ortho_p_dx = dFdx(ortho_p_uv), ortho_p_dy = dFdy(ortho_p_uv);
-    vec2 aux_c_dx = dFdx(aux_c_uv), aux_c_dy = dFdy(aux_c_uv);
-    vec2 aux_p_dx = dFdx(aux_p_uv), aux_p_dy = dFdy(aux_p_uv);
     vec3 ortho;
     vec4 nao_v;
     vec4 surf;
     if (tex_morph <= 0.001) {
         ortho = textureGrad(u_ortho_arr, vec3(ortho_c_uv, v_page_slice), ortho_c_dx, ortho_c_dy).rgb;
-        nao_v = textureGrad(u_norm_arr, vec3(aux_c_uv, v_page_slice), aux_c_dx, aux_c_dy);
-        surf = textureGrad(u_surf_arr, vec3(aux_c_uv, v_page_slice), aux_c_dx, aux_c_dy);
+        nao_v = textureLod(u_norm_arr, vec3(aux_c_uv, v_page_slice), 0.0);
+        surf = textureLod(u_surf_arr, vec3(aux_c_uv, v_page_slice), 0.0);
     } else if (tex_morph >= 0.999) {
         ortho = textureGrad(u_ortho_arr, vec3(ortho_p_uv, v_parent_slice), ortho_p_dx, ortho_p_dy).rgb;
-        nao_v = textureGrad(u_norm_arr, vec3(aux_p_uv, v_parent_slice), aux_p_dx, aux_p_dy);
-        surf = textureGrad(u_surf_arr, vec3(aux_p_uv, v_parent_slice), aux_p_dx, aux_p_dy);
+        nao_v = textureLod(u_norm_arr, vec3(aux_p_uv, v_parent_slice), 0.0);
+        surf = textureLod(u_surf_arr, vec3(aux_p_uv, v_parent_slice), 0.0);
     } else {
         ortho = mix(textureGrad(u_ortho_arr, vec3(ortho_c_uv, v_page_slice), ortho_c_dx, ortho_c_dy).rgb,
                     textureGrad(u_ortho_arr, vec3(ortho_p_uv, v_parent_slice), ortho_p_dx, ortho_p_dy).rgb, tex_morph);
-        nao_v = mix(textureGrad(u_norm_arr, vec3(aux_c_uv, v_page_slice), aux_c_dx, aux_c_dy),
-                    textureGrad(u_norm_arr, vec3(aux_p_uv, v_parent_slice), aux_p_dx, aux_p_dy), tex_morph);
-        surf = mix(textureGrad(u_surf_arr, vec3(aux_c_uv, v_page_slice), aux_c_dx, aux_c_dy),
-                   textureGrad(u_surf_arr, vec3(aux_p_uv, v_parent_slice), aux_p_dx, aux_p_dy), tex_morph);
+        nao_v = mix(textureLod(u_norm_arr, vec3(aux_c_uv, v_page_slice), 0.0),
+                    textureLod(u_norm_arr, vec3(aux_p_uv, v_parent_slice), 0.0), tex_morph);
+        surf = mix(textureLod(u_surf_arr, vec3(aux_c_uv, v_page_slice), 0.0),
+                   textureLod(u_surf_arr, vec3(aux_p_uv, v_parent_slice), 0.0), tex_morph);
     }
     vec3 nao = nao_v.rgb;
     float rt_night = nao_v.a; // Pre-baked 3.9m/px 2.5D DSM ray-traced night local streetlamp irradiance!
@@ -350,7 +355,7 @@ void main() {
         float veg_fast = clamp(max(forest_fast, green_fast * (1.0 - rock_fast)), 0.0, 1.0);
         vec3 fast_albedo = ortho;
         // Skip u_sat_arr lookup on dense forest canopy (ortho + LiDAR canopy volume supplies the detail).
-        if (forest_fast < 0.82) {
+        if (forest_fast < 0.82 && v_dist < 14000.0) {
             int layer_fast = (rock_fast > 0.42) ? ((v_elev_m > 1650.0) ? 13 : 12) :
                              (forest_fast > 0.28) ? ((v_elev_m > 1080.0) ? 9 : 6) :
                              (green_fast > 0.42) ? 2 : 4;
@@ -376,7 +381,7 @@ void main() {
         float water_raw_fast = max(surf.b * water_slope_fast, smoothstep(0.02, 0.22, surf.b) * aqua_fast * water_slope_fast * 0.95);
         float water_mask_fast = smoothstep(0.32, 0.50, water_raw_fast);
 
-        float near_w_fast = 1.0 - smoothstep(60.0, 1400.0, v_dist);
+        float near_w_fast = 1.0 - smoothstep(45.0, 750.0, v_dist);
         if (near_w_fast > 0.01 && water_mask_fast < 0.15) {
             vec2 micro_uv = v_world_en * 0.28;
             vec3 close_tex = (veg_fast > 0.38)
@@ -393,8 +398,8 @@ void main() {
             }
         }
         // Slope-anchored rock normal + subtle zero-mean grain for sharp uninhabited ridges/cliffs aloft.
-        if (u_quality >= 1 && water_mask_fast < 0.20 && v_dist < 4200.0) {
-            float cliff_w = smoothstep(0.16, 0.36, slope_fast) * (1.0 - smoothstep(2200.0, 4200.0, v_dist));
+        if (u_quality >= 1 && water_mask_fast < 0.20 && v_dist < 2600.0) {
+            float cliff_w = smoothstep(0.16, 0.36, slope_fast) * (1.0 - smoothstep(1400.0, 2600.0, v_dist));
             if (cliff_w > 0.02) {
                 vec2 r_uv = rot27(v_world_en) * 0.055;
                 vec3 rn = texture(u_rock_normal, r_uv).rgb * 2.0 - 1.0;
@@ -415,14 +420,15 @@ void main() {
 
         // 1-tap LiDAR canopy contact shadow on adjacent sunlit ground/streets (iGPU friendly, zero shadow map!)
         float canopy_vis_fast = 1.0;
-        if (v_dist < 2200.0 && sdir.y > 0.10 && water_mask_fast < 0.15 && surf.r < 0.12) {
+        float par_lim = (u_veg_detail <= 1) ? 800.0 : 1400.0;
+        if (v_dist < par_lim && sdir.y > 0.10 && water_mask_fast < 0.15 && surf.r < 0.12) {
             float parallax_m = clamp(6.0 / max(sdir.y, 0.14), 3.0, 40.0);
             float parent_page = (tex_morph >= 0.5) ? 2.0 : 1.0;
             vec2 sun_en = vec2(sdir.x, -sdir.z);
             vec2 p_uv_s = aux_c_use + sun_en * (parallax_m / max(v_node_size * parent_page, 1.0)) * (128.0 / 129.0);
             if (all(greaterThanEqual(p_uv_s, vec2(0.004))) && all(lessThanEqual(p_uv_s, vec2(0.996)))) {
                 float caster = textureLod(u_surf_arr, vec3(p_uv_s, slice_use), 0.0).r;
-                float fade_p = 1.0 - smoothstep(1400.0, 2200.0, v_dist);
+                float fade_p = 1.0 - smoothstep(par_lim * 0.62, par_lim, v_dist);
                 canopy_vis_fast = 1.0 - smoothstep(0.08, 0.34, caster) * 0.34 * fade_p;
             }
         }
@@ -548,9 +554,9 @@ void main() {
                         step(0.004, sample_uv.y) * step(sample_uv.y, 0.996);
         vec4 blocker;
         if (tex_morph >= 0.5)
-            blocker = textureGrad(u_surf_arr, vec3(clamp(sample_uv, 0.004, 0.996), v_parent_slice), aux_p_dx, aux_p_dy);
+            blocker = textureLod(u_surf_arr, vec3(clamp(sample_uv, 0.004, 0.996), v_parent_slice), 0.0);
         else
-            blocker = textureGrad(u_surf_arr, vec3(clamp(sample_uv, 0.004, 0.996), v_page_slice), aux_c_dx, aux_c_dy);
+            blocker = textureLod(u_surf_arr, vec3(clamp(sample_uv, 0.004, 0.996), v_page_slice), 0.0);
         float crown_height_m = blocker.r * 25.0;
         float crown_cover = smoothstep(0.025, 0.11, blocker.r) * (1.0 - smoothstep(0.08, 0.35, blocker.a));
         float projected_contact = smoothstep(3.8, 7.2, crown_height_m);

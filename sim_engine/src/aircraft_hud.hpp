@@ -253,6 +253,9 @@ private:
     float prop_angle_rad_ = 0.0f;
     float ai_gyro_spool_ = 0.0f;
     float prev_render_t_ = -1.0f;
+    Vec2 rain_flow_front_{0.0f, 0.0f}, rain_flow_side_{0.0f, 0.0f};
+    Vec2 rain_vel_front_{0.0f, 0.15f}, rain_vel_side_{0.05f, 0.15f};
+    float rain_speed01_ = 0.0f;
     double mouse_yoke_roll_ = 0.0, mouse_yoke_pitch_ = 0.0;
     double anchor_mx_ = 0.0, anchor_my_ = 0.0;
     double raw_yoke_x_ = 0.0, raw_yoke_y_ = 0.0;
@@ -306,6 +309,7 @@ private:
     GLint u_ac_mvp_ = -1, u_ac_model_ = -1, u_ac_node_ = -1, u_ac_sun_ = -1, u_ac_cool_ = -1, u_ac_warm_ = -1;
     GLint u_ac_tint_ = -1, u_ac_pbr_ = -1, u_ac_em_ = -1, u_ac_int_ = -1, u_ac_alpha_ = -1, u_ac_livery_ = -1;
     GLint u_ac_unlit_ = -1, u_ac_cabin_glass_ = -1, u_ac_glass_weather_ = -1;
+    GLint u_ac_glass_flow_f_ = -1, u_ac_glass_flow_s_ = -1;
     GLint u_ac_glass_fx_ = -1, u_ac_plane_wx_ = -1, u_ac_dmg_zones_ = -1, u_ac_dmg_extra_ = -1;
     GLint u_ac_baked_reflection_ = -1, u_ac_detail_ = -1;
     GLint u_ac_native_output_ = -1, u_ac_output_exposure_ = -1, u_ac_output_lut_ = -1;

@@ -22,8 +22,8 @@ struct GraphicsSettings {
     int pixel_percent = 100;
     // 0 = spatial FXAA, 1 = balanced TAA, 2 = crisp TAA.
     int aa_mode = 1;
-    // Multiplier for terrain mesh LOD transition distances (50..250%).
-    int terrain_lod_percent = 100;
+    // Multiplier for terrain mesh LOD transition distances (50..450%).
+    int terrain_lod_percent = 300;
     // Render the cockpit after scene reconstruction at output resolution.
     bool cockpit_native = true;
     bool terrain_streaming = true;
@@ -60,7 +60,7 @@ inline std::filesystem::path graphics_settings_path() {
 inline void clamp_graphics_settings(GraphicsSettings &settings) {
     settings.pixel_percent = std::clamp(settings.pixel_percent, 35, 150);
     settings.aa_mode = std::clamp(settings.aa_mode, 0, 2);
-    settings.terrain_lod_percent = std::clamp(settings.terrain_lod_percent, 50, 250);
+    settings.terrain_lod_percent = std::clamp(settings.terrain_lod_percent, 50, 450);
     settings.aircraft_detail = std::clamp(settings.aircraft_detail, 0, 1);
     settings.weather_detail = std::clamp(settings.weather_detail, 0, 7);
     settings.cloud_res_percent = settings.cloud_res_percent <= 0 ? 0 : std::clamp(settings.cloud_res_percent, 35, 100);
@@ -92,7 +92,7 @@ inline void apply_graphics_profile(GraphicsSettings &settings, int profile_id) {
     if (profile_id == 0) {
         settings.pixel_percent = 38;
         settings.aa_mode = 0;
-        settings.terrain_lod_percent = 75;
+        settings.terrain_lod_percent = 225;
         settings.cockpit_native = false;
         settings.aircraft_detail = 0;
         settings.weather_detail = 1;
@@ -107,7 +107,7 @@ inline void apply_graphics_profile(GraphicsSettings &settings, int profile_id) {
     } else if (profile_id == 1) {
         settings.pixel_percent = 100;
         settings.aa_mode = 1;
-        settings.terrain_lod_percent = 100;
+        settings.terrain_lod_percent = 300;
         settings.cockpit_native = true;
         settings.aircraft_detail = 0;
         settings.weather_detail = 0;
@@ -122,7 +122,7 @@ inline void apply_graphics_profile(GraphicsSettings &settings, int profile_id) {
     } else if (profile_id == 2) {
         settings.pixel_percent = 68;
         settings.aa_mode = 2;
-        settings.terrain_lod_percent = 100;
+        settings.terrain_lod_percent = 300;
         settings.cockpit_native = true;
         settings.aircraft_detail = 1;
         settings.weather_detail = 0;
@@ -137,7 +137,7 @@ inline void apply_graphics_profile(GraphicsSettings &settings, int profile_id) {
     } else {
         settings.pixel_percent = 125;
         settings.aa_mode = 2;
-        settings.terrain_lod_percent = 225;
+        settings.terrain_lod_percent = 450;
         settings.cockpit_native = true;
         settings.aircraft_detail = 1;
         settings.weather_detail = 7;

@@ -1390,7 +1390,7 @@ void GameFrontend::draw_settings(AircraftAndHud &ui, int &time_of_day, RegionalA
             s.anisotropy = kAnisoVals[(ai + d + 5) % 5];
     }
     std::snprintf(value, sizeof(value), "%d%%", s.terrain_lod_percent);
-    s.terrain_lod_percent = std::clamp(s.terrain_lod_percent + 25 * setting(4, "Terrain mesh distance", value), 50, 250);
+    s.terrain_lod_percent = std::clamp(s.terrain_lod_percent + 25 * setting(4, "Terrain mesh distance", value), 50, 450);
     s.terrain_detail = (s.terrain_detail + setting(5, "Terrain surface detail", surf[s.terrain_detail]) + 5) % 5;
     s.weather_detail = (s.weather_detail + setting(6, "Cloud & sky quality", weather[s.weather_detail]) + 8) % 8;
     if (s.cloud_res_percent <= 0) std::snprintf(value, sizeof(value), "Auto (Preset)");

@@ -139,6 +139,14 @@ Prebuilt `.deb` installers are published on [GitHub Releases](https://github.com
    ./run_sim.sh
    ```
 
+### Windows (prebuilt `.zip` release)
+
+Prebuilt Windows x64 archives are published on [GitHub Releases](https://github.com/BeamAudio/OpenSky/releases):
+
+1. Download and extract `OpenSky-<version>-win64.zip` (includes `OpenSky.exe`, `libJSBSim.dll`, runtime DLLs, shaders, C172S aircraft, and Aragón Pyrenees baseline scenery).
+2. To add Catalonia (or any other regional `.zip` add-on such as `OpenSky-<version>-win64-catalonia-coast.zip` and `OpenSky-<version>-win64-catalonia-pyrenees.zip`), extract the add-on `.zip` directly into your `OpenSky-<version>-win64` folder so its `packs/` files merge into `packs/` (or copy the files inside `packs/` into `%LOCALAPPDATA%\opensky-vfr\packs\`).
+3. Double-click `OpenSky.bat` to launch.
+
 ### Windows (native build)
 
 Build in an MSYS2 UCRT64 environment with the MinGW-w64 C++ compiler, CMake and Ninja.

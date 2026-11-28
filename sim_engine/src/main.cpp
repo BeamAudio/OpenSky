@@ -1115,7 +1115,22 @@ int main(int argc, char **argv) {
         const double cam_alt = walking ? walker.alt : st.alt_msl_m;
         const double cam_ground = walking ? walker.alt - 1.68 : st.ground_m;
         const double cam_agl = std::max(0.0, cam_alt - cam_ground);
-        if (!promo_only) pack.set_online_camera(lat, lon);
+        if (!promo_only) {
+            pack.set_online_camera(lat, lon);
+            // Rank PNOA downloads by the nearer of the aircraft and a point ~25 s ahead (capped 4 km)
+            // so imagery is fetched in front of the nose, not behind the tail.
+            const double vel_e = walking ? 0.0 : st.vel_east_mps;
+            const double vel_n = walking ? 0.0 : st.vel_north_mps;
+            const double v_len = std::hypot(vel_e, vel_n);
+            if (v_len > 8.0) {
+                const double ahead_m = std::min(4000.0, v_len * 25.0);
+                const double ahead_lat = lat + (vel_n / v_len) * ahead_m / pack.anchor_m_lat();
+                const double ahead_lon = lon + (vel_e / v_len) * ahead_m / pack.anchor_m_lon();
+                pack.set_online_lookahead(ahead_lat, ahead_lon, true);
+            } else {
+                pack.set_online_lookahead(lat, lon, false);
+            }
+        }
 
         sky_clouds.resize_if_needed(output_w, output_h, quality,
                                     eff_pixel_pct, render_settings.aa_mode,

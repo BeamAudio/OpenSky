@@ -642,9 +642,9 @@ void CdlodTerrain::update_and_render(
     visible_.clear();
     stats_ = {};
 
-    // Velocity-predictive lookahead scales smoothly with airspeed (100 kt -> ~4s, 350 kt -> ~14s ahead!)
+    // Velocity-predictive lookahead scales smoothly with airspeed (100 kt -> ~9 s, 350 kt -> ~24 s ahead!)
     double spd = std::hypot(vel_east_mps, vel_north_mps);
-    double lookahead_s = std::clamp(2.5 + spd * 0.065, 2.5, 16.0);
+    double lookahead_s = std::clamp(4.0 + spd * 0.11, 4.0, 24.0);
     double pred_e = cam_east_m + vel_east_mps * lookahead_s;
     double pred_n = cam_north_m + vel_north_mps * lookahead_s;
 

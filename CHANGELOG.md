@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.3 (2026-11-28)
+
+- Tripled the default terrain mesh distance (`terrain_lod_percent` `100%` → `300%` for Balanced/High, `75%` → `225%` for Laptop, `225%` → `450%` for Max) and widened the Settings range to `50–450%`, so new terrain is built well before the aircraft reaches it.
+- Fixed terrain and PNOA ortho imagery lagging behind the aircraft during long flights: the online tile download queue is now ranked by the nearer of the aircraft and a point ~25 s ahead along its velocity (capped at 4 km), the CDLOD velocity lookahead grows to `4 s + 0.11 s per m/s` (up to 24 s), online page refinement runs every 0.12 s and requeues 12 pages per pass, and the terrain upload budget scales up when many pages are queued and frame time has headroom.
+- Doubled the resident terrain page cache (`512` → `1024` pages) so the larger LOD radius does not evict visible pages.
+- Added Windows regional scenery add-on `.zip` packaging (`tools/package_windows.py --addons ...`) and published `catalonia-coast` / `catalonia-pyrenees` Windows archives.
+- Note: an existing `%APPDATA%\opensky-vfr\graphics.ini` keeps its saved `terrain_lod_percent`; pick a quality preset (`F1`–`F4`) or set **Settings → Terrain mesh distance** to `300%` to adopt the new default.
+
 ## 0.3.2 (2026-11-27)
 
 - Fixed wind seams between regional weather fields and preserved solved wind when the aircraft crosses into a new terrain frame. The World map now has separate Wind and Cloud & Rain overlays, and cloud initialization no longer adds artificial bands.

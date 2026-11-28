@@ -117,18 +117,37 @@ bool extract_json_num(const std::string &obj, const char *key, double &out) {
 // scale once so scanning the bounded queue under its mutex stays cheap.
 struct OnlineTileFocus {
     double x, y, span_m;
+    double x2 = 0.0, y2 = 0.0;
+    bool has_ahead = false;
 
     OnlineTileFocus(double lat, double lon)
         : x((lon + 180.0) / 360.0),
           y((1.0 - std::asinh(std::tan(lat * DEG2RAD_D)) / PI_D) * 0.5),
           span_m(40075016.69 * std::cos(lat * DEG2RAD_D)) {}
 
+    // Second focus point ahead of the aircraft: queue ranking uses the nearer of the two so
+    // tiles along the flight path are fetched before the camera reaches them.
+    OnlineTileFocus(double lat, double lon, double ahead_lat, double ahead_lon, bool use_ahead)
+        : OnlineTileFocus(lat, lon) {
+        if (!use_ahead) return;
+        has_ahead = true;
+        x2 = (ahead_lon + 180.0) / 360.0;
+        y2 = (1.0 - std::asinh(std::tan(ahead_lat * DEG2RAD_D)) / PI_D) * 0.5;
+    }
+
     double distance_m(uint64_t key) const {
         const int zoom = static_cast<int>((key >> 48) & 0xFFu);
         const double n = static_cast<double>(1u << zoom);
-        const double dx = (((key >> 24) & 0xFFFFFFu) + 0.5) / n - x;
-        const double dy = ((key & 0xFFFFFFu) + 0.5) / n - y;
-        return std::sqrt(dx * dx + dy * dy) * span_m;
+        const double tx = (((key >> 24) & 0xFFFFFFu) + 0.5) / n;
+        const double ty = ((key & 0xFFFFFFu) + 0.5) / n;
+        double dx = tx - x, dy = ty - y;
+        double d = std::sqrt(dx * dx + dy * dy) * span_m;
+        if (has_ahead) {
+            dx = tx - x2;
+            dy = ty - y2;
+            d = std::min(d, std::sqrt(dx * dx + dy * dy) * span_m);
+        }
+        return d;
     }
 };
 
@@ -201,6 +220,12 @@ void PackReader::set_online_camera(double lat_deg, double lon_deg) {
     online_cam_lon_bits_.store(double_bits(lon_deg), std::memory_order_relaxed);
 }
 
+void PackReader::set_online_lookahead(double lat_deg, double lon_deg, bool valid) {
+    online_ahead_lat_bits_.store(double_bits(lat_deg), std::memory_order_relaxed);
+    online_ahead_lon_bits_.store(double_bits(lon_deg), std::memory_order_relaxed);
+    online_ahead_valid_.store(valid, std::memory_order_relaxed);
+}
+
 int PackReader::online_page_zoom(double lat, double lon, double half_span_m, int ortho_res) const {
     if (online_provider() != OnlineOrthoProvider::PNOA) return 0;
     const double cam_lat = bits_double(online_cam_lat_bits_.load(std::memory_order_relaxed));
@@ -259,7 +284,10 @@ void PackReader::online_dl_worker() const {
             const bool have_cam = (std::abs(cam_lat) > 0.1 || std::abs(cam_lon) > 0.1);
             size_t best_idx = online_dl_queue_.size() - 1;
             if (have_cam) {
-                const OnlineTileFocus focus(cam_lat, cam_lon);
+                const OnlineTileFocus focus(cam_lat, cam_lon,
+                    bits_double(online_ahead_lat_bits_.load(std::memory_order_relaxed)),
+                    bits_double(online_ahead_lon_bits_.load(std::memory_order_relaxed)),
+                    online_ahead_valid_.load(std::memory_order_relaxed));
                 std::erase_if(online_dl_queue_, [&](uint64_t key) {
                     if (focus.distance_m(key) <= 55000.0) return false;
                     online_dl_seen_.erase(key);
@@ -334,7 +362,10 @@ std::shared_ptr<DecodedRgbTile> PackReader::get_online_rgb_tile(
                 if (online_dl_queue_.size() >= 256) {
                     const double cam_lat = bits_double(online_cam_lat_bits_.load(std::memory_order_relaxed));
                     const double cam_lon = bits_double(online_cam_lon_bits_.load(std::memory_order_relaxed));
-                    const OnlineTileFocus focus(cam_lat, cam_lon);
+                    const OnlineTileFocus focus(cam_lat, cam_lon,
+                        bits_double(online_ahead_lat_bits_.load(std::memory_order_relaxed)),
+                        bits_double(online_ahead_lon_bits_.load(std::memory_order_relaxed)),
+                        online_ahead_valid_.load(std::memory_order_relaxed));
                     size_t worst_idx = 0;
                     double worst_score = -1.0;
                     for (size_t qi = 0; qi < online_dl_queue_.size(); ++qi) {

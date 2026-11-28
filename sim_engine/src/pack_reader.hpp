@@ -282,6 +282,8 @@ public:
     uint64_t online_revision() const { return online_revision_.load(std::memory_order_acquire); }
     int online_page_zoom(double lat, double lon, double half_span_m, int ortho_res) const;
     void set_online_camera(double lat_deg, double lon_deg);
+    // Point ahead of the aircraft along its velocity; PNOA downloads are ranked by the nearer of camera/lookahead.
+    void set_online_lookahead(double lat_deg, double lon_deg, bool valid);
     void prefetch_online_box(double center_lat, double center_lon, double half_span_m, int zoom = 17) const;
 
 private:
@@ -388,6 +390,9 @@ private:
     mutable std::vector<std::thread> online_workers_;
     mutable std::atomic<uint64_t> online_cam_lat_bits_{0};
     mutable std::atomic<uint64_t> online_cam_lon_bits_{0};
+    mutable std::atomic<uint64_t> online_ahead_lat_bits_{0};
+    mutable std::atomic<uint64_t> online_ahead_lon_bits_{0};
+    mutable std::atomic<bool> online_ahead_valid_{false};
 };
 
 } // namespace nsim

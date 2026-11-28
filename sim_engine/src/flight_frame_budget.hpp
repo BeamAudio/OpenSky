@@ -162,9 +162,12 @@ public:
         if (reduced_detail_ || cpu_work_ms > 7.5 || pressure_ > 0.70f) {
             decision_.max_uploads = 1;
             decision_.upload_budget_ms = 0.40;
-        } else if (queued_jobs > 8 && pressure_ < 0.28f && gpu_ema_ms_ < soft_budget_ms - 0.8 && cpu_work_ms < 5.0) {
+        } else if (queued_jobs > 12 && pressure_ < 0.35f && gpu_ema_ms_ < soft_budget_ms - 0.6 && cpu_work_ms < 6.0) {
+            decision_.max_uploads = 3;
+            decision_.upload_budget_ms = 1.25;
+        } else if (queued_jobs > 4 && pressure_ < 0.55f && gpu_ema_ms_ < soft_budget_ms) {
             decision_.max_uploads = 2;
-            decision_.upload_budget_ms = 0.95;
+            decision_.upload_budget_ms = 0.85;
         } else {
             decision_.max_uploads = 1;
             decision_.upload_budget_ms = 0.58;

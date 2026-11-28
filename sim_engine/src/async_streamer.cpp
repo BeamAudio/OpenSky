@@ -502,7 +502,7 @@ void AsyncTerrainStreamer::invalidate_close_pages() {
 
 void AsyncTerrainStreamer::refine_online_pages(double now_sec) {
     if (now_sec < next_imagery_refine_sec_ || pack_->online_provider() == OnlineOrthoProvider::OFF) return;
-    next_imagery_refine_sec_ = now_sec + 0.20;
+    next_imagery_refine_sec_ = now_sec + 0.12;
     const uint64_t revision = pack_->online_revision();
     std::vector<RequestOrder> candidates;
     const auto &frame = *world_frame_;
@@ -537,7 +537,7 @@ void AsyncTerrainStreamer::refine_online_pages(double now_sec) {
             if (inflight_active_.contains(request.key)) continue;
             queue_request(pending_reqs_, pending_req_heap_, request.key, request.priority);
             pending_req_frame_[request.key] = cur_frame_;
-            if (++queued == 6) break;
+            if (++queued == 12) break;
         }
     }
     req_cv_.notify_all();

@@ -67,8 +67,8 @@ class AsyncTerrainStreamer {
 public:
     static constexpr double WORLD_SPAN_M = 163840.0; // 163.84 km corridor
     static constexpr int MAX_LOD = 9;                // L0=163.84km .. L9=320m (0.625m/px @ 512 ortho!)
-    // 512 resident pages (~240 MB GPU) prevents L6-L9 thrash in full valleys while reserving plenty of VRAM headroom.
-    static constexpr int MAX_PAGES = 512;
+    // 1024 resident pages (~480 MB GPU) prevents L6-L9 thrash at 300%+ terrain LOD while keeping ample VRAM headroom.
+    static constexpr int MAX_PAGES = 1024;
     static constexpr int HEIGHT_N = 67;              // 65x65 patch verts + 1-texel seamless gutter (4x terrain mesh detail!)
     static constexpr int ORTHO_RES = 512;            // 512x512 ortho per page (4x sharper IGN PNOA!)
     static constexpr int ORTHO_MIPS = 6;             // 512, 256, 128, 64, 32, 16 (pre-built off-thread!)

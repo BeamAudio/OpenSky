@@ -5,6 +5,7 @@
 #include "platform_io.hpp"
 #include "../../protocol/weather_format.h"
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <unordered_map>
@@ -66,6 +67,7 @@ public:
     const std::string &label() const { return snapshot_.label; }
 
     WeatherCell sample(double east_m, double north_m, double agl_m) const;
+    std::array<double, 4> grid_bounds() const { return {min_e_, min_n_, span_e_, span_n_}; }
     const std::vector<float> &field_rgba() const { return field_rgba_; }
     int active_state() const { return active_state_; }
 

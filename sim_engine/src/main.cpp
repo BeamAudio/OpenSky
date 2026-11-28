@@ -931,7 +931,7 @@ int main(int argc, char **argv) {
                 objects.commit_staged_reanchor_upload();
                 living_traffic.on_reanchor();
                 sky_clouds.reset_temporal_history();
-                reg_atmo.sync_region(pack.anchor_lat(), pack.anchor_lon());
+                reg_atmo.sync_region(lat, lon);
                 reg_atmo.update_field(sky_clouds.atmo().sun_dir, sim_time, false, wx_advance);
             } else {
                 streamer.cancel_async_transition();

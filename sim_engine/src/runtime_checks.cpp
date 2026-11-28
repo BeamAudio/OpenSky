@@ -187,8 +187,17 @@ bool world_check(PackReader &pack, bool gpu, bool full_outlook) {
     AsyncTerrainStreamer stream;
     if (gpu && !stream.init(&pack, 2, OrthoFormat::BC7Fast)) return false;
     double time = 0.0;
+    // Sample the same air column in the overlapping Aragón and Catalan Pyrenees grids.
+    constexpr double seam_lat = 42.53, seam_lon = 0.56;
+    const double seam_alt = pack.sample_elevation(seam_lat, seam_lon) + 1200.0;
+    const auto sample_wind = [&] { return weather.sample_at(seam_lat, seam_lon, seam_alt, check_sun, time); };
+    const auto wind_delta = [](const LocalAirSample &a, const LocalAirSample &b) {
+        return std::hypot(a.wind_east_mps - b.wind_east_mps, a.wind_north_mps - b.wind_north_mps);
+    };
     const uint64_t streamed = QuadKey{7, 61, 63}.pack();
     for (const AirportInfo *target : {cat, home, cat}) {
+        if (!weather.covers(seam_lat, seam_lon)) return false;
+        const auto before = sample_wind();
         weather.request_outlook();
         if (gpu) {
             stream.request_page(streamed, 20000.0f);
@@ -203,7 +212,13 @@ bool world_check(PackReader &pack, bool gpu, bool full_outlook) {
         weather.sync_region(target->lat, target->lon);
         time += 1.0;
         weather.update_field(check_sun, time);
+        const double pending_delta = wind_delta(before, sample_wind());
         weather.finish_pending_initialization();
+        const double published_delta = wind_delta(before, sample_wind());
+        std::printf("[WX-HANDOFF] %s wind delta while pending %.3f m/s, after publish %.3f m/s\n",
+                    target->id.c_str(), pending_delta, published_delta);
+        if (!(pending_delta < 0.01 && published_delta < 0.55 && weather.covers(seam_lat, seam_lon)))
+            return false;
         const auto *region = pack.find_region_at(pack.anchor_lat(), pack.anchor_lon());
         if (!region || !weather.covers(target->lat, target->lon) ||
             weather.outlook().status != WeatherOutlook::Status::Idle ||

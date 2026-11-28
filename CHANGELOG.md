@@ -2,6 +2,7 @@
 
 ## 0.3.2 (2026-11-27)
 
+- Fixed wind seams between regional weather fields and preserved solved wind when the aircraft crosses into a new terrain frame. The World map now has separate Wind and Cloud & Rain overlays, and cloud initialization no longer adds artificial bands.
 - Expanded `weather_detail` to 7 gradual volumetric cloud quality tiers (`Very Low` through `Ultra (Max Clouds)`, plus `Follow preset`) with `cloud_res_percent` scaling across 1080p–4K displays.
 - Rebuilt volumetric cloud shading in `clouds_qres.frag` around a unified 3D Perlin-Worley/Worley density field coupled directly to the solved mesoscale weather field (`0.56*L1 + 0.44*L2` mid-cloud steering wind with 60 Hz continuous field-advection interpolation, downwind vertical shear, dynamic `2/3/4`-tap directional sun light marching driven by Settings & `FlightFrameBudget`, opaque zero-visibility IMC interiors, and smooth mountain-crest depth fusion in `post_tonemap.frag`).
 - Added a real-time 2D `256x160` `GL_RGBA16F` shallow-water windshield fluid simulation (`windshield_rain_sim.frag`) driven by 3D body-frame airspeed, ambient crosswind/headwind, gravity projection, and clockwise propeller slipstream wash, plus articulated 3D conformal pantograph windshield wipers (`KEY_J` / panel switch) and metric object-space rain/fluid parity across lateral and rear cockpit windows.

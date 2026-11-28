@@ -487,7 +487,7 @@ def solve_thermal(dem: np.ndarray, forest: np.ndarray, water: np.ndarray,
 
 def solve_moisture(dem: np.ndarray, w_field: np.ndarray, oat_c: float, dew_c: float,
                    cloud_hint: float, precip_hint: float, storm: float,
-                   season: int, slot: int) -> tuple[np.ndarray, dict]:
+                   season: int) -> tuple[np.ndarray, dict]:
     """LCL-based RH profile + orographic condensation / Foehn drying."""
     T = oat_c - dem * 0.0065
     Td = dew_c - dem * 0.0018
@@ -502,12 +502,6 @@ def solve_moisture(dem: np.ndarray, w_field: np.ndarray, oat_c: float, dew_c: fl
     lift = np.clip(w_surf * 0.30, -2.0, 2.0)
     cloud = np.clip((rh - 0.76) / 0.24 + lift * 0.42 + (cloud_hint - 0.35) * 0.55
                     - np.clip(-w_surf, 0.0, 3.0) * 0.22, -1.0, 1.0)
-    # Travelling convective cells: deterministic spatial pattern, not per-frame noise.
-    yy, xx = np.mgrid[0:dem.shape[0], 0:dem.shape[1]]
-    cell = np.sin(xx * 0.19 + slot * 1.7) * np.cos(yy * 0.23 - season * 2.1)
-    cloud += cell * 0.22 * storm
-    cloud = np.clip(cloud, -1.0, 1.0)
-
     cov = float(np.clip(np.mean(np.clip(cloud, 0.0, 1.0)) * 1.55 + cloud_hint * 0.35, 0.05, 0.97))
     precip = float(np.clip(max(precip_hint / 5.0, (cov - 0.62) / 0.38) * (1.0 if storm > 0.1 else 0.4), 0.0, 1.0))
     base = float(np.clip(np.percentile(lcl, 35) + dem.mean() * 0.12, 900.0, 2900.0))
@@ -571,7 +565,7 @@ def build_library(reader: PackReader, offline: bool, out_path: Path = OUT_PATH) 
                 u = base[..., 0] + thermal[..., 0]
                 v = base[..., 1] + thermal[..., 1]
                 w = base[..., 2] + thermal[..., 2]
-                cloud, sc = solve_moisture(dem, w, tc, td, cc, pr, storm, season, slot)
+                cloud, sc = solve_moisture(dem, w, tc, td, cc, pr, storm, season)
 
                 # TKE from vertical shear + buoyancy + storm intensity.
                 shear = float(np.mean(np.abs(base[2, ..., 0] - base[0, ..., 0]) +

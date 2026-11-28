@@ -109,7 +109,7 @@ private:
     const PackReader *pack_ = nullptr;
     GLuint backdrop_ = 0, land_ = 0, bounds_ = 0, vao_ = 0, font_ = 0, relief_ = 0, region_wx_ = 0;
     GLint globe_uniform_ = -1, region_count_uniform_ = -1, aspect_uniform_ = -1;
-    GLint wx_geo_uniform_ = -1, wx_overlay_uniform_ = -1, wx_time_uniform_ = -1, wx_base_cloud_uniform_ = -1;
+    GLint wx_geo_uniform_ = -1, wx_wind_uniform_ = -1, wx_cloud_rain_uniform_ = -1, wx_time_uniform_ = -1;
     std::vector<RegionWeatherPreview> region_wx_previews_;
     int wx_preview_state_key_ = -1;
     int region_count_ = 0;
@@ -127,7 +127,8 @@ private:
     AircraftSession session_;
     int model_history_page_ = 0;
     bool show_outlook_ = false;
-    bool weather_overlay_ = true;
+    bool wind_overlay_ = true;
+    bool cloud_rain_overlay_ = false;
     bool add_waypoint_ = false;
     bool walking_ = false, inspecting_ = false;
     WalkStation active_station_ = WalkStation::Door;

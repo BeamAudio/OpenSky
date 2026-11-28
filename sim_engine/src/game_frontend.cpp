@@ -127,9 +127,9 @@ bool GameFrontend::init(const PackReader &pack, const std::string &shader_root, 
     region_count_uniform_ = glGetUniformLocation(backdrop_, "u_region_count");
     aspect_uniform_ = glGetUniformLocation(backdrop_, "u_aspect");
     wx_geo_uniform_ = glGetUniformLocation(backdrop_, "u_wx_geo");
-    wx_overlay_uniform_ = glGetUniformLocation(backdrop_, "u_wx_overlay");
+    wx_wind_uniform_ = glGetUniformLocation(backdrop_, "u_wx_wind");
+    wx_cloud_rain_uniform_ = glGetUniformLocation(backdrop_, "u_wx_cloud_rain");
     wx_time_uniform_ = glGetUniformLocation(backdrop_, "u_wx_time");
-    wx_base_cloud_uniform_ = glGetUniformLocation(backdrop_, "u_wx_base_cloud");
     int tw, th, channels;
     unsigned char *pixels = stbi_load((asset_root + "/ui/globe_land.png").c_str(), &tw, &th, &channels, 1);
     if (!pixels) {
@@ -187,7 +187,7 @@ bool GameFrontend::init(const PackReader &pack, const std::string &shader_root, 
     region_count_ = static_cast<int>(pack.regions().size());
     if (wx_layer_count > 0) {
         glCreateTextures(GL_TEXTURE_2D_ARRAY, 1, &region_wx_);
-        glTextureStorage3D(region_wx_, 1, GL_RGBA16F, 256, 192, wx_layer_count);
+        glTextureStorage3D(region_wx_, 1, GL_RG16F, 256, 192, wx_layer_count);
         glTextureParameteri(region_wx_, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTextureParameteri(region_wx_, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTextureParameteri(region_wx_, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -468,7 +468,7 @@ void GameFrontend::sync_region_weather_previews(const RegionalAtmosphere *reg_at
     constexpr size_t kCells = static_cast<size_t>(kW) * kH;
     constexpr int kSrcW = nspain::NSWX_GRID_W, kSrcH = nspain::NSWX_GRID_H;
     constexpr size_t kSrcCells = static_cast<size_t>(kSrcW) * kSrcH;
-    std::vector<float> rgba(kCells * 4, 0.0f);
+    std::vector<float> wind(kCells * 2);
     auto smooth01 = [](float e0, float e1, float x) {
         float t = std::clamp((x - e0) / std::max(1e-5f, e1 - e0), 0.0f, 1.0f);
         return t * t * (3.0f - 2.0f * t);
@@ -528,7 +528,6 @@ void GameFrontend::sync_region_weather_previews(const RegionalAtmosphere *reg_at
         }
         preview.lib->select(season, static_cast<float>(slot), wtype, severity);
         const auto &src = preview.lib->field_rgba();
-        const auto &snap = preview.lib->snapshot();
         if (src.size() != kSrcCells * 4) continue;
         for (int y = 0; y < kH; ++y) {
             const float sy = static_cast<float>(y) / (kH - 1) * (kSrcH - 1);
@@ -548,16 +547,11 @@ void GameFrontend::sync_region_weather_previews(const RegionalAtmosphere *reg_at
                 float u = 0.0f, v = 0.0f;
                 orographic_deflect_wind(bilerp(0), bilerp(1), preview.slope_e[i], preview.slope_n[i],
                                         preview.ridge[i], preview.basin[i], 0.9926f, solar, u, v);
-                const float cloud = std::clamp(snap.cloud_cov + bilerp(3) * 0.35f, 0.0f, 1.0f);
-                // Localize precipitation to denser cloud cores so regions do not tint as solid boxes.
-                const float core = std::clamp((cloud - 0.58f) / 0.36f, 0.0f, 1.0f);
-                rgba[i * 4 + 0] = u;
-                rgba[i * 4 + 1] = v;
-                rgba[i * 4 + 2] = std::clamp(snap.precip_mm_hr * core * core, 0.0f, 48.0f);
-                rgba[i * 4 + 3] = cloud;
+                wind[i * 2] = u;
+                wind[i * 2 + 1] = v;
             }
         }
-        glTextureSubImage3D(region_wx_, 0, 0, 0, preview.layer, kW, kH, 1, GL_RGBA, GL_FLOAT, rgba.data());
+        glTextureSubImage3D(region_wx_, 0, 0, 0, preview.layer, kW, kH, 1, GL_RG, GL_FLOAT, wind.data());
     }
 }
 
@@ -573,28 +567,17 @@ void GameFrontend::draw_globe(const RegionalAtmosphere *reg_atmo, double sim_tim
     glUniform3f(globe_uniform_, float(globe_lat_ * DEG2RAD_D), float(globe_lon_ * DEG2RAD_D), globe_radius * globe_zoom_);
     glBindTextureUnit(0, land_);
     glBindTextureUnit(1, relief_);
-    Vec4 wx_geo{0.0f, 0.0f, 0.0f, 0.0f};
-    const bool has_wx = weather_overlay_ && reg_atmo && reg_atmo->has_model() && reg_atmo->field_tex() != 0 && pack_;
-    if (weather_overlay_) sync_region_weather_previews(reg_atmo);
-    if (has_wx) {
-        const Vec4 db = reg_atmo->domain_bounds();
-        const double span_e = 1.0 / std::max(1e-6f, db.z);
-        const double span_n = 1.0 / std::max(1e-6f, db.w);
-        const double lon_min = pack_->anchor_lon() + db.x / pack_->anchor_m_lon();
-        const double lat_min = pack_->anchor_lat() + db.y / pack_->anchor_m_lat();
-        wx_geo = {static_cast<float>(lon_min), static_cast<float>(lat_min),
-                  static_cast<float>(pack_->anchor_m_lon() / std::max(1.0, span_e)),
-                  static_cast<float>(pack_->anchor_m_lat() / std::max(1.0, span_n))};
-        glBindTextureUnit(2, reg_atmo->field_tex());
-    }
+    const Vec4 wx_geo = reg_atmo ? reg_atmo->map_domain_bounds() : Vec4{};
+    const bool has_wx = wx_geo.z > 0.0f;
+    if (wind_overlay_) sync_region_weather_previews(reg_atmo);
+    glBindTextureUnit(2, has_wx ? reg_atmo->field_tex() : 0);
     if (region_wx_) glBindTextureUnit(3, region_wx_);
-    const bool show_flow = weather_overlay_ && (has_wx || region_wx_ != 0);
     static const double anim_t0 = PlatformWindow::now_sec();
     const float flow_time = (sim_time_sec > 0.01) ? static_cast<float>(sim_time_sec)
                                                   : static_cast<float>(PlatformWindow::now_sec() - anim_t0);
     if (wx_geo_uniform_ >= 0) glUniform4f(wx_geo_uniform_, wx_geo.x, wx_geo.y, wx_geo.z, wx_geo.w);
-    if (wx_overlay_uniform_ >= 0) glUniform1f(wx_overlay_uniform_, show_flow ? 1.0f : 0.0f);
-    if (wx_base_cloud_uniform_ >= 0) glUniform1f(wx_base_cloud_uniform_, has_wx ? reg_atmo->weather().cloud_cov : 0.35f);
+    glUniform1i(wx_wind_uniform_, wind_overlay_ && (has_wx || region_wx_ != 0));
+    glUniform1i(wx_cloud_rain_uniform_, cloud_rain_overlay_ && has_wx);
     if (wx_time_uniform_ >= 0) glUniform1f(wx_time_uniform_, flow_time);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, bounds_);
     glBindVertexArray(vao_);
@@ -801,7 +784,8 @@ void GameFrontend::set_demo_view(int page_idx, double lat, double lon, float zoo
     globe_lat_ = lat;
     globe_lon_ = lon;
     globe_zoom_ = std::clamp(zoom, 0.7f, 64.0f);
-    weather_overlay_ = show_weather;
+    wind_overlay_ = show_weather;
+    cloud_rain_overlay_ = false;
     if (!selected_ap.empty()) selected_id_ = selected_ap;
 }
 
@@ -883,10 +867,10 @@ void GameFrontend::draw_world(AircraftAndHud &ui, const PlatformWindow &win,
     draw_globe(reg_atmo, sim_time_sec);
     ui.hud_border(map_area.x, map_area.y, map_area.w, map_area.h, 1, .29f, .42f, .50f, .8f);
 
-    if (weather_overlay_ && (reg_atmo != nullptr || region_wx_ != 0)) {
+    if (wind_overlay_ && (reg_atmo != nullptr || region_wx_ != 0)) {
         ui.hud_rect(762, 238, 280, 34, .025f, .052f, .072f, .90f);
         ui.hud_border(762, 238, 280, 34, 1, .19f, .36f, .42f, .82f);
-        label(ui, 774, 248, 13, "FLOW", true);
+        label(ui, 774, 248, 13, "WIND", true);
         static const Vec3 kSwatches[4] = {
             {.38f, .78f, .98f}, {.32f, .94f, .86f}, {.95f, .88f, .34f}, {1.00f, .46f, .28f}
         };
@@ -897,10 +881,16 @@ void GameFrontend::draw_world(AircraftAndHud &ui, const PlatformWindow &win,
             label(ui, sx + 16.0f, 248, 12, kSpeeds[i], true);
         }
     }
-    if (button(ui, {1052, 238, 198, 34}, weather_overlay_ ? "Flowmap: ON" : "Flowmap: OFF",
-               reg_atmo != nullptr || region_wx_ != 0, weather_overlay_)) {
-        weather_overlay_ = !weather_overlay_;
-    }
+    if (button(ui, {1052, 238, 198, 34}, wind_overlay_ ? "Wind: ON" : "Wind: OFF",
+               reg_atmo != nullptr || region_wx_ != 0, wind_overlay_))
+        wind_overlay_ = !wind_overlay_;
+    if (button(ui, {553, 238, 199, 34}, cloud_rain_overlay_ ? "Cloud & rain: ON" : "Cloud & rain: OFF",
+               reg_atmo && reg_atmo->has_model(), cloud_rain_overlay_))
+        cloud_rain_overlay_ = !cloud_rain_overlay_;
+    if (wind_overlay_ && region_wx_)
+        label(ui, 770, 279, 12, "Baked wind preview beyond model coverage", true);
+    if (cloud_rain_overlay_)
+        label(ui, 553, 279, 12, "Cloud veil / Precipitation tint", true);
 
     if (parked) {
         Vec3 from = globe_xyz(parked->lat, parked->lon);

@@ -201,6 +201,7 @@ bool RegionalAtmosphere::init(const PackReader *pack, bool create_gpu_tex, const
     pack_ = pack;
     gpu_enabled_ = create_gpu_tex;
     if (!pack_) return false;
+    weather_world_frame_ = pack_->world_frame();
     min_e_ = pack_->corridor_min_e();
     min_n_ = pack_->corridor_min_n();
     span_e_ = pack_->corridor_span_e();
@@ -216,13 +217,12 @@ bool RegionalAtmosphere::init(const PackReader *pack, bool create_gpu_tex, const
     live_overlay_applied_ = false;
 
     std::string wpath = weather_path.empty() ? pack_->active_weather_path(pack_->anchor_lat(), pack_->anchor_lon()) : weather_path;
+    loaded_wx_path_ = wpath;
     allocate_weather_textures();
     if (!wpath.empty() && lib_.load(wpath)) {
-        loaded_wx_path_ = wpath;
         std::printf("[WX] %s | %d baked states | %s\n", wpath.c_str(),
                     nspain::NSWX_STATE_COUNT, lib_.provenance());
     } else {
-        loaded_wx_path_.clear();
         std::printf("[WX] No .nswx weather pack for region — using lightweight synoptic default.\n");
     }
     dirty_ = true;
@@ -243,13 +243,44 @@ bool RegionalAtmosphere::init(const PackReader *pack, bool create_gpu_tex, const
 
 void RegionalAtmosphere::sync_region(double lat_deg, double lon_deg) {
     if (!pack_) return;
-    const double min_e = pack_->corridor_min_e(), min_n = pack_->corridor_min_n();
-    const double span_e = pack_->corridor_span_e(), span_n = pack_->corridor_span_n();
-    // Weather follows the committed world frame, rather than swapping a
-    // climatology underneath an unrelated terrain domain mid-flight.
-    const auto *region = pack_->find_region_at(pack_->anchor_lat(), pack_->anchor_lon());
+    const auto world = pack_->world_frame();
+    const auto *region = pack_->find_region_at(world->anchor_lat, world->anchor_lon);
     const std::string region_id = region ? region->region_id : "";
     const bool region_changed = region_id != active_region_id_;
+    const bool frame_changed = world != weather_world_frame_;
+    const std::string next_p = region ? region->weather_path : "";
+    const bool library_changed = region_changed || next_p != loaded_wx_path_;
+    if (frame_changed || library_changed) {
+        if (weather_init_future_.valid()) {
+            weather_init_future_.wait();
+            try { weather_init_future_.get(); } catch (...) {}
+        }
+        weather_init_pending_ = false;
+        weather_terrain_upload_pending_ = false;
+        stop_weather_worker();
+        if (has_model()) {
+            latch_weather();
+            // Keep the outgoing field available for flight sampling and interpolation while the new grid starts.
+            handoff_weather_ = std::move(frame_weather_);
+        }
+        weather_world_frame_ = world;
+        min_e_ = world->min_e;
+        min_n_ = world->min_n;
+        span_e_ = world->span_e;
+        span_n_ = world->span_n;
+        dirty_ = true;
+        weather_model_ready_ = false;
+        weather_textures_ready_ = false;
+        weather_model_time_ = -1.0;
+        weather_model_accum_ = 0.0;
+        active_weather_ = {};
+        frame_weather_ = {};
+        pending_weather_ = {};
+        staging_weather_ = {};
+        uploaded_weather_generation_ = 0;
+        uploaded_local_weather_generation_ = 0;
+        uploaded_local_terrain_generation_ = 0;
+    }
     {
         std::lock_guard<std::mutex> lk(live_mtx_);
         if (region_changed || std::abs(live_lat_ - lat_deg) > 0.015 || std::abs(live_lon_ - lon_deg) > 0.015) {
@@ -259,19 +290,14 @@ void RegionalAtmosphere::sync_region(double lat_deg, double lon_deg) {
             live_force_fetch_ = true;
             ++live_request_id_;
         }
-        if (region_changed) {
-            live_available_.store(false, std::memory_order_release);
-            live_last_success_utc_.store(0, std::memory_order_release);
-        }
+        // A completed live input stays usable until it expires or the new request succeeds.
     }
     live_cv_.notify_one();
-    const std::string next_p = region ? region->weather_path : "";
-    if (region_changed || next_p != loaded_wx_path_) {
+    if (library_changed) {
         active_region_id_ = region_id;
-        loaded_wx_path_.clear();
+        loaded_wx_path_ = next_p;
         lib_.shutdown();
         if (!next_p.empty() && lib_.load(next_p)) {
-            loaded_wx_path_ = next_p;
             std::printf("[WX] Switched active weather library -> %s\n", next_p.c_str());
         }
         active_weather_init_ = false;
@@ -279,35 +305,6 @@ void RegionalAtmosphere::sync_region(double lat_deg, double lon_deg) {
         synoptic_weather_ = {};
         last_state_ = -1;
         dirty_ = true;
-    }
-    if (region_changed || min_e != min_e_ || min_n != min_n_ || span_e != span_e_ || span_n != span_n_ ||
-        pack_->anchor_lat() != weather_anchor_lat_ || pack_->anchor_lon() != weather_anchor_lon_) {
-        if (weather_init_future_.valid()) {
-            weather_init_future_.wait();
-            try { weather_init_future_.get(); } catch (...) {}
-        }
-        weather_init_pending_ = false;
-        weather_terrain_upload_pending_ = false;
-        stop_weather_worker();
-        min_e_ = min_e;
-        min_n_ = min_n;
-        span_e_ = span_e;
-        span_n_ = span_n;
-        dirty_ = true;
-        weather_model_ready_ = false;
-        weather_textures_ready_ = false;
-        weather_model_time_ = -1.0;
-        weather_model_accum_ = 0.0;
-        active_weather_ = {};
-        {
-            std::lock_guard<std::mutex> lock(weather_publish_mtx_);
-            frame_weather_ = {};
-            pending_weather_ = {};
-            staging_weather_ = {};
-        }
-        uploaded_weather_generation_ = 0;
-        uploaded_local_weather_generation_ = 0;
-        uploaded_local_terrain_generation_ = 0;
     }
     if (weather_grid_detail_ > 0) update_refinement_center(lat_deg, lon_deg);
 }
@@ -346,6 +343,8 @@ void RegionalAtmosphere::shutdown() {
     frame_weather_ = {};
     pending_weather_ = {};
     staging_weather_ = {};
+    handoff_weather_ = {};
+    weather_world_frame_.reset();
 }
 
 bool RegionalAtmosphere::poll_weather_model_initialization() {
@@ -380,6 +379,7 @@ void RegionalAtmosphere::finish_weather_model_initialization() {
     latch_weather();
     upload_field();
     weather_textures_ready_ = true;
+    handoff_weather_ = {};
 }
 
 void RegionalAtmosphere::live_weather_worker() {
@@ -632,20 +632,19 @@ void RegionalAtmosphere::WeatherSolver::advance_dynamic_cells(float dt, float so
 }
 
 void RegionalAtmosphere::evaluate_dynamic_cells(
-    double east_m, double north_m, double agl_m,
+    const WeatherPublication &frame, double east_m, double north_m, double agl_m,
     float &out_cloud_add, float &out_rain_add, float &out_w_add,
     float &out_outflow_e, float &out_outflow_n, float &out_tke_add
-) const {
+) {
     out_cloud_add = out_rain_add = out_w_add = out_outflow_e = out_outflow_n = out_tke_add = 0.0f;
-    if (!has_model()) return;
-    const auto &snap = frame_weather_.cells;
-    const int count = frame_weather_.cell_count;
+    const auto &snap = frame.cells;
+    const int count = frame.cell_count;
     if (count <= 0) return;
     const float base_severity = std::clamp(
-        std::max(frame_forcing().storm_int, frame_forcing().precip) * 0.75f +
-        ((frame_regime() == WindRegime::CONVECTIVE_STORM) ? 0.65f :
-         (frame_regime() == WindRegime::WINTER_ICING) ? 0.55f :
-         (frame_regime() == WindRegime::FOEHN_SUR) ? 0.30f : 0.14f), 0.05f, 1.25f);
+        std::max(frame.forcing.storm_int, frame.forcing.precip) * 0.75f +
+        ((frame.regime == WindRegime::CONVECTIVE_STORM) ? 0.65f :
+         (frame.regime == WindRegime::WINTER_ICING) ? 0.55f :
+         (frame.regime == WindRegime::FOEHN_SUR) ? 0.30f : 0.14f), 0.05f, 1.25f);
 
     for (int i = 0; i < count; ++i) {
         const auto &c = snap[i];
@@ -795,6 +794,7 @@ void RegionalAtmosphere::set_grid_detail(int detail, double aircraft_lat, double
         update_refinement_center(aircraft_lat, aircraft_lon);
         return;
     }
+    finish_pending_initialization();
     stop_weather_worker();
     weather_grid_detail_ = detail;
     local_refinement_pending_ = true;
@@ -802,7 +802,7 @@ void RegionalAtmosphere::set_grid_detail(int detail, double aircraft_lat, double
 }
 
 void RegionalAtmosphere::update_refinement_center(double aircraft_lat, double aircraft_lon) {
-    if (weather_grid_detail_ <= 0) return;
+    if (weather_grid_detail_ <= 0 || weather_init_pending_) return;
     refinement_center_lat_ = aircraft_lat;
     refinement_center_lon_ = aircraft_lon;
     if (!pack_) {
@@ -838,18 +838,40 @@ Vec4 RegionalAtmosphere::local_domain_bounds() const {
             static_cast<float>(1.0 / frame_weather_.local_span_n)};
 }
 
+Vec4 RegionalAtmosphere::map_domain_bounds() const {
+    const auto &frame = frame_weather_;
+    if (!has_model() || !field_tex_ || frame.generation != uploaded_weather_generation_) return {};
+    return {static_cast<float>(frame.anchor_lon + frame.min_e / frame.metres_lon),
+            static_cast<float>(frame.anchor_lat + frame.min_n / frame.metres_lat),
+            static_cast<float>(frame.metres_lon / frame.span_e),
+            static_cast<float>(frame.metres_lat / frame.span_n)};
+}
+
 void RegionalAtmosphere::refresh_climate_field() {
     const int sw = nspain::NSWX_GRID_W, sh = nspain::NSWX_GRID_H;
     const auto &src = lib_.field_rgba();
     const size_t cells = static_cast<size_t>(grid_w_) * grid_h_;
     climate_field_.assign(cells * 4, 0.0f);
     if (!lib_.valid() || src.size() != static_cast<size_t>(sw) * sh * 4) return;
+    const auto &world = *weather_world_frame_;
+    const auto *region = pack_->find_region_by_id(active_region_id_);
+    const auto [baked_min_e, baked_min_n, baked_span_e, baked_span_n] = lib_.grid_bounds();
+    const double scale_e = region ? region->m_lon / world.metres_lon : 1.0;
+    const double scale_n = region ? region->m_lat / world.metres_lat : 1.0;
+    const double offset_e = region ? (world.anchor_lon - region->anchor_lon) * region->m_lon : 0.0;
+    const double offset_n = region ? (world.anchor_lat - region->anchor_lat) * region->m_lat : 0.0;
+    const auto &baked = lib_.snapshot();
+    const double dir = baked.wind_dir_from_deg * DEG2RAD_D;
+    const float background[4] = {static_cast<float>(-std::sin(dir) * baked.wind_speed_10m_mps),
+                                 static_cast<float>(-std::cos(dir) * baked.wind_speed_10m_mps), 0.0f, 0.0f};
     for (int y = 0; y < grid_h_; ++y) {
-        const float gy = static_cast<float>(y) * (sh - 1) / (grid_h_ - 1);
+        const double north = offset_n + scale_n * (min_n_ + span_n_ * y / (grid_h_ - 1)) - baked_min_n;
+        const float gy = static_cast<float>(std::clamp(north / baked_span_n, 0.0, 1.0)) * (sh - 1);
         const int y0 = std::min(sh - 2, static_cast<int>(gy));
         const float ty = gy - y0;
         for (int x = 0; x < grid_w_; ++x) {
-            const float gx = static_cast<float>(x) * (sw - 1) / (grid_w_ - 1);
+            const double east = offset_e + scale_e * (min_e_ + span_e_ * x / (grid_w_ - 1)) - baked_min_e;
+            const float gx = static_cast<float>(std::clamp(east / baked_span_e, 0.0, 1.0)) * (sw - 1);
             const int x0 = std::min(sw - 2, static_cast<int>(gx));
             const float tx = gx - x0;
             const size_t o = (static_cast<size_t>(y) * grid_w_ + x) * 4;
@@ -857,10 +879,13 @@ void RegionalAtmosphere::refresh_climate_field() {
             const size_t b = a + 4;
             const size_t c = a + static_cast<size_t>(sw) * 4;
             const size_t d = c + 4;
+            const float outside_m = static_cast<float>(std::max({0.0, -east, -north,
+                                                                 east - baked_span_e, north - baked_span_n}));
+            const float baked_weight = 1.0f - smooth01(0.0f, 8000.0f, outside_m);
             for (int k = 0; k < 4; ++k) {
                 const float top = std::lerp(src[a + k], src[b + k], tx);
                 const float bot = std::lerp(src[c + k], src[d + k], tx);
-                climate_field_[o + k] = std::lerp(top, bot, ty);
+                climate_field_[o + k] = std::lerp(background[k], std::lerp(top, bot, ty), baked_weight);
             }
         }
     }
@@ -1025,7 +1050,13 @@ bool RegionalAtmosphere::covers(double lat, double lon) const {
     const auto &f = frame_weather_;
     const double e = (lon - f.anchor_lon) * f.metres_lon;
     const double n = (lat - f.anchor_lat) * f.metres_lat;
-    return e >= f.min_e && e <= f.min_e + f.span_e && n >= f.min_n && n <= f.min_n + f.span_n;
+    return distance_inside(f, e, n) >= 0.0;
+}
+
+double RegionalAtmosphere::distance_inside(const WeatherPublication &frame, double east_m, double north_m) {
+    const double e = east_m - frame.min_e;
+    const double n = north_m - frame.min_n;
+    return std::min({e, n, frame.span_e - e, frame.span_n - n});
 }
 
 void RegionalAtmosphere::request_outlook() {
@@ -1150,6 +1181,7 @@ void RegionalAtmosphere::stop_weather_worker() {
 }
 
 void RegionalAtmosphere::initialize_weather_model() {
+    const auto &world = *weather_world_frame_;
     solver_.grid_w_ = grid_w_;
     solver_.grid_h_ = grid_h_;
     const size_t cells = static_cast<size_t>(grid_w_ * grid_h_);
@@ -1169,11 +1201,11 @@ void RegionalAtmosphere::initialize_weather_model() {
     // Resample the pre-baked corridor DEM once. The four atmospheric layers are
     // terrain-relative, so every column carries its own valley/ridge elevation.
     if (pack_) {
-        const auto &dem = pack_->corridor_dem();
+        const auto &dem = world.dem;
         const int dw = pack_->corridor_dem_w(), dh = pack_->corridor_dem_h();
-        const double dmin_e = pack_->corridor_min_e(), dmin_n = pack_->corridor_min_n();
-        const double dspan_e = std::max(1.0, pack_->corridor_span_e());
-        const double dspan_n = std::max(1.0, pack_->corridor_span_n());
+        const double dmin_e = world.min_e, dmin_n = world.min_n;
+        const double dspan_e = std::max(1.0, world.span_e);
+        const double dspan_n = std::max(1.0, world.span_n);
         const bool have_dem = static_cast<int>(dem.size()) == dw * dh && dw > 1 && dh > 1;
         for (int y = 0; y < grid_h_; ++y) {
             for (int x = 0; x < grid_w_; ++x) {
@@ -1190,8 +1222,8 @@ void RegionalAtmosphere::initialize_weather_model() {
                     float b = std::lerp(dem[static_cast<size_t>(y0 + 1) * dw + x0], dem[static_cast<size_t>(y0 + 1) * dw + x0 + 1], tx);
                     solver_.terrain_height_[i] = std::lerp(a, b, ty);
                 } else {
-                    double lat = pack_->anchor_lat() + n / pack_->anchor_m_lat();
-                    double lon = pack_->anchor_lon() + e / pack_->anchor_m_lon();
+                    double lat = world.anchor_lat + n / world.metres_lat;
+                    double lon = world.anchor_lon + e / world.metres_lon;
                     solver_.terrain_height_[i] = static_cast<float>(pack_->sample_elevation(lat, lon));
                 }
             }
@@ -1249,6 +1281,7 @@ void RegionalAtmosphere::initialize_weather_model() {
     const float global_v = static_cast<float>(-std::cos(dir) * synoptic_weather_.wind_speed_10m_mps);
     const float init_solar = std::clamp(solver_.sun.y, 0.0f, 1.0f);
     static constexpr float layer_wind_scale[nspain::NSWX_LEVELS] = {0.82f, 0.94f, 1.08f, 1.28f};
+    const auto &previous = handoff_weather_;
     const auto initialize_layer = [&](int lev) {
         const float agl = nspain::NSWX_LEVEL_AGL_M[lev];
         const float h_fac = std::exp(-agl / 1350.0f);
@@ -1269,19 +1302,25 @@ void RegionalAtmosphere::initialize_weather_model() {
             c.pressure_hpa = synoptic_weather_.qnh_hpa * std::exp(-agl / 8500.0f);
             const float dew = synoptic_weather_.dewpoint_sl_c - agl * 0.0017f;
             const float saturation = saturation_mixing_ratio_gkg(c.temp_c, c.pressure_hpa);
-            const float x = static_cast<float>(i % grid_w_), y = static_cast<float>(i / grid_w_);
-            const float plume = std::sin(x * 0.055f + y * 0.038f + lev * 0.45f) *
-                                std::sin(x * 0.034f - y * 0.068f - lev * 0.35f);
             const float humidity = saturation_mixing_ratio_gkg(dew, c.pressure_hpa) / saturation;
-            const float rh = std::clamp(std::min(humidity, 1.02f) + 0.11f * plume + 0.07f * ref_cloud +
+            const float rh = std::clamp(std::min(humidity, 1.02f) + 0.07f * ref_cloud +
                                         ridge * 0.025f + basin * 0.035f, 0.08f, 1.15f);
             c.vapor_gkg = rh * saturation;
             c.liquid_gkg = std::clamp((rh - 0.70f) * 2.4f + synoptic_weather_.cloud_cov * 0.16f, 0.0f, 2.0f);
             c.cloud_fraction = std::clamp(synoptic_weather_.cloud_cov + ref_cloud * 0.18f +
-                plume * 0.09f + (smooth01(0.87f, 1.04f, rh) - 0.5f) * 0.14f +
+                (smooth01(0.87f, 1.04f, rh) - 0.5f) * 0.14f +
                 ridge * 0.05f + basin * 0.035f, 0.0f, 1.0f);
             c.rain_mm_hr = synoptic_weather_.precip_mm_hr * c.cloud_fraction * 0.40f;
             c.tke = 0.06f + synoptic_weather_.turb_scale * 0.24f;
+            if (!previous.grid.empty()) {
+                const double lon = world.anchor_lon + (min_e_ + dx * (i % grid_w_)) / world.metres_lon;
+                const double lat = world.anchor_lat + (min_n_ + dy * (i / grid_w_)) / world.metres_lat;
+                const double old_e = (lon - previous.anchor_lon) * previous.metres_lon;
+                const double old_n = (lat - previous.anchor_lat) * previous.metres_lat;
+                const float weight = smooth01(0.0f, 8000.0f, static_cast<float>(distance_inside(previous, old_e, old_n)));
+                if (weight > 0.0f)
+                    c = blend_cells(c, sample_weather_model(previous, old_e, old_n, agl, false), weight);
+            }
         }
     };
     // Each layer writes a disjoint weather_grid_ range. Initialize them in
@@ -1310,24 +1349,37 @@ void RegionalAtmosphere::initialize_weather_model() {
     solver_.weather_next_ = solver_.weather_grid_; // Keep fixed boundary cells in both advection buffers.
     solver_.weather_worker_active_ = synoptic_weather_;
     solver_.weather_worker_climate_field_ = climate_field_;
-    if (pack_) {
-        weather_anchor_lat_ = pack_->anchor_lat();
-        weather_anchor_lon_ = pack_->anchor_lon();
-    }
     if (weather_model_time_ < 0.0) weather_model_time_ = last_update_t_;
     solver_.min_e_ = min_e_;
     solver_.min_n_ = min_n_;
     solver_.span_e_ = span_e_;
     solver_.span_n_ = span_n_;
-    solver_.weather_anchor_lat_ = weather_anchor_lat_;
-    solver_.anchor_lon = weather_anchor_lon_;
-    solver_.metres_lat = pack_->anchor_m_lat();
-    solver_.metres_lon = pack_->anchor_m_lon();
+    solver_.weather_anchor_lat_ = world.anchor_lat;
+    solver_.anchor_lon = world.anchor_lon;
+    solver_.metres_lat = world.metres_lat;
+    solver_.metres_lon = world.metres_lon;
     solver_.region_id = active_region_id_;
     solver_.solved_time = last_update_t_;
     solver_.regime_ = regime_;
     solver_.solver_rng_.seed(solver_seed_ ? *solver_seed_ : hardware_entropy_seed(this));
     solver_.seed_dynamic_cells();
+    if (!previous.grid.empty()) {
+        int retained_cells = 0;
+        for (int i = 0; i < previous.cell_count; ++i) {
+            DynamicCell cell = previous.cells[i];
+            const double lat = previous.anchor_lat + cell.north_m / previous.metres_lat;
+            const double lon = previous.anchor_lon + cell.east_m / previous.metres_lon;
+            cell.east_m = static_cast<float>((lon - world.anchor_lon) * world.metres_lon);
+            cell.north_m = static_cast<float>((lat - world.anchor_lat) * world.metres_lat);
+            const double edge = std::min({cell.east_m - min_e_, cell.north_m - min_n_,
+                                          min_e_ + span_e_ - cell.east_m, min_n_ + span_n_ - cell.north_m});
+            if (edge >= -cell.radius_m)
+                solver_.dyn_cells_[retained_cells++] = cell;
+        }
+        solver_.dyn_cell_count_ = std::max(retained_cells, solver_.dyn_cell_count_);
+        for (int i = retained_cells; i < solver_.dyn_cell_count_; ++i)
+            solver_.dyn_cells_[i].phase = 0.02f;
+    }
     solver_.seed_cloud_sim();
     if (weather_grid_detail_ > 0) initialize_local_weather_model();
     else {
@@ -1353,8 +1405,8 @@ void RegionalAtmosphere::initialize_local_weather_model() {
     local_solver_.min_n_ = local_center_n_ - kLocalSpanM * 0.5;
     local_solver_.span_e_ = kLocalSpanM;
     local_solver_.span_n_ = kLocalSpanM;
-    local_solver_.weather_anchor_lat_ = weather_anchor_lat_;
-    local_solver_.anchor_lon = weather_anchor_lon_;
+    local_solver_.weather_anchor_lat_ = solver_.weather_anchor_lat_;
+    local_solver_.anchor_lon = solver_.anchor_lon;
     local_solver_.metres_lat = solver_.metres_lat;
     local_solver_.metres_lon = solver_.metres_lon;
     local_solver_.region_id = active_region_id_;
@@ -1380,7 +1432,7 @@ void RegionalAtmosphere::initialize_local_weather_model() {
     local_solver_.terrain_valley_basin_.assign(local_cells, 0.0f);
     local_solver_.weather_worker_climate_field_.assign(local_cells * 4, 0.0f);
 
-    const auto world = pack_->world_frame();
+    const auto &world = weather_world_frame_;
     if (!world) {
         local_solver_ = {};
         local_refinement_pending_ = true;
@@ -1480,6 +1532,7 @@ void RegionalAtmosphere::initialize_local_weather_model() {
     float level_h_fac[nspain::NSWX_LEVELS];
     for (int level = 0; level < nspain::NSWX_LEVELS; ++level)
         level_h_fac[level] = std::exp(-nspain::NSWX_LEVEL_AGL_M[level] / 1350.0f);
+    const auto &previous = handoff_weather_;
     for (int y = 0; y < resolution; ++y) {
         const double north = local_solver_.min_n_ + y * dy;
         for (int x = 0; x < resolution; ++x) {
@@ -1488,6 +1541,19 @@ void RegionalAtmosphere::initialize_local_weather_model() {
             const float ge = local_solver_.flow_slope_e_[i], gn = local_solver_.flow_slope_n_[i];
             const float ridge = local_solver_.terrain_ridge_exposure_[i];
             const float basin = local_solver_.terrain_valley_basin_[i];
+            double old_e = 0.0, old_n = 0.0;
+            float handoff_weight = 0.0f;
+            if (!previous.local_grid.empty()) {
+                const double lon = world->anchor_lon + east / world->metres_lon;
+                const double lat = world->anchor_lat + north / world->metres_lat;
+                old_e = (lon - previous.anchor_lon) * previous.metres_lon;
+                old_n = (lat - previous.anchor_lat) * previous.metres_lat;
+                const double e = old_e - previous.local_min_e;
+                const double n = old_n - previous.local_min_n;
+                const double fine_edge = std::min({e, n, previous.local_span_e - e, previous.local_span_n - n});
+                handoff_weight = smooth01(0.0f, 600.0f, static_cast<float>(fine_edge)) *
+                    smooth01(0.0f, 8000.0f, static_cast<float>(distance_inside(previous, old_e, old_n)));
+            }
             for (int level = 0; level < nspain::NSWX_LEVELS; ++level) {
                 SimWeatherCell cell = sample_base(east, north, level);
                 // Blend coarse regional flow into fine valley/spur deflection on initialization.
@@ -1496,6 +1562,8 @@ void RegionalAtmosphere::initialize_local_weather_model() {
                                         level_h_fac[level], local_solar, du, dv);
                 cell.u = std::lerp(cell.u, du, 0.72f);
                 cell.v = std::lerp(cell.v, dv, 0.72f);
+                if (handoff_weight > 0.0f)
+                    cell = blend_cells(cell, sample_weather_model(previous, old_e, old_n, nspain::NSWX_LEVEL_AGL_M[level]), handoff_weight);
                 local_solver_.weather_grid_[static_cast<size_t>(level) * local_cells + i] = cell;
             }
             if (!solver_.cloud_sim_.empty()) {
@@ -1745,9 +1813,21 @@ WeatherDebugCell RegionalAtmosphere::debug_sample(double east_m, double north_m,
     return cell;
 }
 
-RegionalAtmosphere::SimWeatherCell RegionalAtmosphere::sample_weather_model(double east_m, double north_m, double agl_m) const {
-    SimWeatherCell zero{};
-    if (!weather_model_ready_) return zero;
+RegionalAtmosphere::SimWeatherCell RegionalAtmosphere::blend_cells(
+    const SimWeatherCell &a, const SimWeatherCell &b, float weight
+) {
+    return {
+        std::lerp(a.u, b.u, weight), std::lerp(a.v, b.v, weight), std::lerp(a.w, b.w, weight),
+        std::lerp(a.vapor_gkg, b.vapor_gkg, weight), std::lerp(a.liquid_gkg, b.liquid_gkg, weight),
+        std::lerp(a.temp_c, b.temp_c, weight), std::lerp(a.pressure_hpa, b.pressure_hpa, weight),
+        std::lerp(a.rain_mm_hr, b.rain_mm_hr, weight),
+        std::lerp(a.cloud_fraction, b.cloud_fraction, weight), std::lerp(a.tke, b.tke, weight)
+    };
+}
+
+RegionalAtmosphere::SimWeatherCell RegionalAtmosphere::sample_weather_model(
+    const WeatherPublication &frame, double east_m, double north_m, double agl_m, bool use_local
+) {
     int l0 = 0;
     while (l0 < nspain::NSWX_LEVELS - 2 && agl_m > nspain::NSWX_LEVEL_AGL_M[l0 + 1]) ++l0;
     const int l1 = std::min(nspain::NSWX_LEVELS - 1, l0 + 1);
@@ -1756,62 +1836,31 @@ RegionalAtmosphere::SimWeatherCell RegionalAtmosphere::sample_weather_model(doub
         std::max(1.0f, nspain::NSWX_LEVEL_AGL_M[l1] - nspain::NSWX_LEVEL_AGL_M[l0]), 0.0, 1.0));
     auto sample_grid = [&](const std::vector<SimWeatherCell> &grid, int width, int height,
                            double min_e, double min_n, double span_e, double span_n) {
-        SimWeatherCell out{};
-        if (grid.empty() || width < 2 || height < 2) return out;
         const double gx = std::clamp((east_m - min_e) / std::max(1.0, span_e) * (width - 1), 0.0, static_cast<double>(width - 1));
         const double gy = std::clamp((north_m - min_n) / std::max(1.0, span_n) * (height - 1), 0.0, static_cast<double>(height - 1));
         const int x0 = std::min(width - 2, static_cast<int>(gx)), y0 = std::min(height - 2, static_cast<int>(gy));
         const float tx = static_cast<float>(gx - x0), ty = static_cast<float>(gy - y0);
         const size_t cells = static_cast<size_t>(width) * height;
         auto sample_level = [&](int lev) {
-        SimWeatherCell out{};
-        const size_t off = static_cast<size_t>(lev) * cells;
-        auto field = [&](float SimWeatherCell::*m) {
-            float a = std::lerp(grid[off + static_cast<size_t>(y0) * width + x0].*m,
-                                grid[off + static_cast<size_t>(y0) * width + x0 + 1].*m, tx);
-            float b = std::lerp(grid[off + static_cast<size_t>(y0 + 1) * width + x0].*m,
-                                grid[off + static_cast<size_t>(y0 + 1) * width + x0 + 1].*m, tx);
-            return std::lerp(a, b, ty);
+            const auto *a = grid.data() + static_cast<size_t>(lev) * cells + static_cast<size_t>(y0) * width + x0;
+            return blend_cells(blend_cells(a[0], a[1], tx), blend_cells(a[width], a[width + 1], tx), ty);
         };
-        out.u = field(&SimWeatherCell::u); out.v = field(&SimWeatherCell::v); out.w = field(&SimWeatherCell::w);
-        out.vapor_gkg = field(&SimWeatherCell::vapor_gkg); out.liquid_gkg = field(&SimWeatherCell::liquid_gkg);
-        out.temp_c = field(&SimWeatherCell::temp_c); out.pressure_hpa = field(&SimWeatherCell::pressure_hpa);
-        out.rain_mm_hr = field(&SimWeatherCell::rain_mm_hr); out.cloud_fraction = field(&SimWeatherCell::cloud_fraction);
-        out.tke = field(&SimWeatherCell::tke);
-            return out;
-        };
-        const SimWeatherCell a = sample_level(l0), b = sample_level(l1);
-        SimWeatherCell r{};
-        r.u = std::lerp(a.u, b.u, tz); r.v = std::lerp(a.v, b.v, tz); r.w = std::lerp(a.w, b.w, tz);
-        r.vapor_gkg = std::lerp(a.vapor_gkg, b.vapor_gkg, tz); r.liquid_gkg = std::lerp(a.liquid_gkg, b.liquid_gkg, tz);
-        r.temp_c = std::lerp(a.temp_c, b.temp_c, tz); r.pressure_hpa = std::lerp(a.pressure_hpa, b.pressure_hpa, tz);
-        r.rain_mm_hr = std::lerp(a.rain_mm_hr, b.rain_mm_hr, tz); r.cloud_fraction = std::lerp(a.cloud_fraction, b.cloud_fraction, tz);
-        r.tke = std::lerp(a.tke, b.tke, tz);
-        return r;
+        if (tz <= 0.0f) return sample_level(l0);
+        if (tz >= 1.0f) return sample_level(l1);
+        return blend_cells(sample_level(l0), sample_level(l1), tz);
     };
-    const SimWeatherCell coarse = sample_grid(frame_weather_.grid, frame_weather_.grid_w,
-        frame_weather_.grid_h, frame_weather_.min_e, frame_weather_.min_n,
-        frame_weather_.span_e, frame_weather_.span_n);
-    if (frame_weather_.local_grid.empty() || frame_weather_.local_span_e <= 0.0 || frame_weather_.local_span_n <= 0.0)
+    const SimWeatherCell coarse = sample_grid(frame.grid, frame.grid_w,
+        frame.grid_h, frame.min_e, frame.min_n, frame.span_e, frame.span_n);
+    if (!use_local || frame.local_grid.empty())
         return coarse;
-    const double local_e = east_m - frame_weather_.local_min_e;
-    const double local_n = north_m - frame_weather_.local_min_n;
-    const double edge = std::min({local_e, local_n, frame_weather_.local_span_e - local_e,
-                                  frame_weather_.local_span_n - local_n});
-    if (edge <= 0.0) return coarse;
-    const float local_weight = static_cast<float>(smooth01(600.0f, 2200.0f, static_cast<float>(edge)));
+    const double local_e = east_m - frame.local_min_e;
+    const double local_n = north_m - frame.local_min_n;
+    const double edge = std::min({local_e, local_n, frame.local_span_e - local_e, frame.local_span_n - local_n});
+    const float local_weight = smooth01(600.0f, 2200.0f, static_cast<float>(edge));
     if (local_weight <= 0.0f) return coarse;
-    const SimWeatherCell fine = sample_grid(frame_weather_.local_grid, frame_weather_.local_grid_w,
-        frame_weather_.local_grid_h, frame_weather_.local_min_e, frame_weather_.local_min_n,
-        frame_weather_.local_span_e, frame_weather_.local_span_n);
-    auto blend = [local_weight](float a, float b) { return std::lerp(a, b, local_weight); };
-    SimWeatherCell out{};
-    out.u = blend(coarse.u, fine.u); out.v = blend(coarse.v, fine.v); out.w = blend(coarse.w, fine.w);
-    out.vapor_gkg = blend(coarse.vapor_gkg, fine.vapor_gkg); out.liquid_gkg = blend(coarse.liquid_gkg, fine.liquid_gkg);
-    out.temp_c = blend(coarse.temp_c, fine.temp_c); out.pressure_hpa = blend(coarse.pressure_hpa, fine.pressure_hpa);
-    out.rain_mm_hr = blend(coarse.rain_mm_hr, fine.rain_mm_hr); out.cloud_fraction = blend(coarse.cloud_fraction, fine.cloud_fraction);
-    out.tke = blend(coarse.tke, fine.tke);
-    return out;
+    const SimWeatherCell fine = sample_grid(frame.local_grid, frame.local_grid_w,
+        frame.local_grid_h, frame.local_min_e, frame.local_min_n, frame.local_span_e, frame.local_span_n);
+    return blend_cells(coarse, fine, local_weight);
 }
 
 void RegionalAtmosphere::WeatherSolver::seed_cloud_sim() {
@@ -2291,16 +2340,9 @@ bool RegionalAtmosphere::WeatherSolver::step(
 }
 
 void RegionalAtmosphere::update_field(const Vec3 &sun_dir, double sim_time_sec, bool force, float wx_advance01) {
+    if (pack_ && pack_->world_frame() != weather_world_frame_)
+        sync_region(live_lat_, live_lon_);
     if (!poll_weather_model_initialization()) return;
-    if (weather_model_ready_ && pack_ &&
-        (std::abs(pack_->anchor_lat() - weather_anchor_lat_) > 1e-7 ||
-         std::abs(pack_->anchor_lon() - weather_anchor_lon_) > 1e-7)) {
-        stop_weather_worker();
-        weather_model_ready_ = false;
-        weather_textures_ready_ = false;
-        weather_model_time_ = -1.0;
-        weather_model_accum_ = 0.0;
-    }
     if (weather_model_ready_) latch_weather();
     if (local_refinement_pending_ && weather_model_ready_ && !force && !dirty_) {
         stop_weather_worker();
@@ -2395,6 +2437,8 @@ void RegionalAtmosphere::update_field(const Vec3 &sun_dir, double sim_time_sec, 
         live_expired = true;
     }
     if (live_fresh) {
+        if (!weather_model_ready_ && handoff_weather_.source == WeatherSource::Live)
+            synoptic_weather_ = handoff_weather_.forcing;
         WeatherSnapshot target;
         {
             std::lock_guard<std::mutex> lk(live_mtx_);
@@ -2414,7 +2458,8 @@ void RegionalAtmosphere::update_field(const Vec3 &sun_dir, double sim_time_sec, 
         synoptic_weather_.haze_mult = lerpf(synoptic_weather_.haze_mult, target.haze_mult);
         synoptic_weather_.turb_scale = lerpf(synoptic_weather_.turb_scale, target.turb_scale);
         synoptic_weather_.visibility_m = lerpf(synoptic_weather_.visibility_m, target.visibility_m);
-        synoptic_weather_.wind_dir_from_deg = target.wind_dir_from_deg;
+        const float wind_turn = std::remainder(target.wind_dir_from_deg - synoptic_weather_.wind_dir_from_deg, 360.0f);
+        synoptic_weather_.wind_dir_from_deg = std::fmod(synoptic_weather_.wind_dir_from_deg + wind_turn * blend + 360.0f, 360.0f);
         synoptic_weather_.wind_speed_10m_mps = lerpf(synoptic_weather_.wind_speed_10m_mps, target.wind_speed_10m_mps);
         synoptic_weather_.storm_int = lerpf(synoptic_weather_.storm_int, target.storm_int);
         synoptic_weather_.label = target.label;
@@ -2494,7 +2539,11 @@ LocalAirSample RegionalAtmosphere::sample_at(
     double dt_sec, double heading_deg, double tas_mps
 ) const {
     LocalAirSample out{};
-    if ((!lib_.valid() && !weather_model_ready_) || !pack_) {
+    const auto &frame = has_model() ? frame_weather_ : handoff_weather_;
+    const double east_m = (lon_deg - frame.anchor_lon) * frame.metres_lon;
+    const double north_m = (lat_deg - frame.anchor_lat) * frame.metres_lat;
+    const bool model_here = !frame.grid.empty() && distance_inside(frame, east_m, north_m) >= 0.0;
+    if ((!lib_.valid() && !has_model() && !model_here) || !pack_) {
         const WeatherSnapshot &wx = synoptic_weather_;
         const double dir = wx.wind_dir_from_deg * DEG2RAD_D;
         out.wind_east_mps = -std::sin(dir) * wx.wind_speed_10m_mps;
@@ -2503,11 +2552,7 @@ LocalAirSample RegionalAtmosphere::sample_at(
         out.oat_c = wx.oat_sl_c - alt_msl_m * 0.0065;
         return out;
     }
-    const WeatherSnapshot &ws = frame_forcing();
-
-    const bool model_here = covers(lat_deg, lon_deg);
-    const double east_m = (lon_deg - pack_->anchor_lon()) * pack_->anchor_m_lon();
-    const double north_m = (lat_deg - pack_->anchor_lat()) * pack_->anchor_m_lat();
+    const WeatherSnapshot &ws = model_here ? frame.forcing : frame_forcing();
     const double d_lat = 80.0 / pack_->anchor_m_lat();
     const double d_lon = 80.0 / pack_->anchor_m_lon();
     const double g_here = pack_->sample_elevation(lat_deg, lon_deg);
@@ -2523,17 +2568,25 @@ LocalAirSample RegionalAtmosphere::sample_at(
     else if (alt_msl_m < 5400.0) out.atmo_layer = 2;
     else out.atmo_layer = 3;
 
-    SimWeatherCell sim_cell = sample_weather_model(east_m, north_m, agl);
-    WeatherCell cell = lib_.valid() ? lib_.sample(east_m, north_m, agl) : WeatherCell{};
+    SimWeatherCell sim_cell{};
+    WeatherCell cell{};
     if (model_here) {
+        sim_cell = sample_weather_model(frame, east_m, north_m, agl);
         cell.u = sim_cell.u;
         cell.v = sim_cell.v;
         cell.w = sim_cell.w;
         cell.cloud = sim_cell.cloud_fraction - ws.cloud_cov;
+    } else if (lib_.valid()) {
+        const auto *region = pack_->find_region_by_id(active_region_id_);
+        const double baked_e = region ? (lon_deg - region->anchor_lon) * region->m_lon
+                                      : (lon_deg - pack_->anchor_lon()) * pack_->anchor_m_lon();
+        const double baked_n = region ? (lat_deg - region->anchor_lat) * region->m_lat
+                                      : (lat_deg - pack_->anchor_lat()) * pack_->anchor_m_lat();
+        cell = lib_.sample(baked_e, baked_n, agl);
     }
     // Add live grid-steered storm/shower cells (outflow gusts, updraft/downdraft, rain shafts)
     float dyn_cloud = 0.0f, dyn_rain = 0.0f, dyn_w = 0.0f, dyn_oe = 0.0f, dyn_on = 0.0f, dyn_tke = 0.0f;
-    if (model_here) evaluate_dynamic_cells(east_m, north_m, agl,
+    if (model_here) evaluate_dynamic_cells(frame, east_m, north_m, agl,
                            dyn_cloud, dyn_rain, dyn_w, dyn_oe, dyn_on, dyn_tke);
     double we = cell.u + dyn_oe, wn = cell.v + dyn_on;
     if (!model_here && live_weather_available() && !manual_weather_override_) {
@@ -2562,20 +2615,20 @@ LocalAirSample RegionalAtmosphere::sample_at(
     const double c_base_msl = std::max(g_here + 150.0, static_cast<double>(ws.cloud_base_m));
     const double c_top_msl = c_base_msl + std::max(600.0, static_cast<double>(ws.cloud_thick_m));
     out.in_cloud = (alt_msl_m >= c_base_msl && alt_msl_m <= c_top_msl && local_cloud > 0.52) ||
-                   (frame_regime() == WindRegime::KATABATIC_DAWN && agl < 320.0 && local_cloud > 0.62);
-    out.in_storm_cell = (std::max(ws.storm_int, active_weather_.storm_int) > 0.42f &&
+                   ((model_here ? frame.regime : frame_regime()) == WindRegime::KATABATIC_DAWN && agl < 320.0 && local_cloud > 0.62);
+    out.in_storm_cell = (std::max(ws.storm_int, frame.summary.storm_int) > 0.42f &&
                          local_precip > 2.5 && local_cloud > 0.35) || (dyn_rain > 6.0f);
 
     // Real vertical wind shear + multi-point spanwise differential shear directly from the 4-layer grid!
     double grid_roll_shear = 0.0, grid_vert_shear = 0.0;
     if (model_here) {
-        const SimWeatherCell upper = sample_weather_model(east_m, north_m, agl + 180.0);
+        const SimWeatherCell upper = sample_weather_model(frame, east_m, north_m, agl + 180.0);
         grid_vert_shear = std::hypot(upper.u - sim_cell.u, upper.v - sim_cell.v) / 180.0;
         const double hdg_r = heading_deg * DEG2RAD_D;
         // Right-wing unit vector in (East, North) is (cos(hdg), -sin(hdg)); probe grid gradient across +-180 m
         const double re = std::cos(hdg_r) * 180.0, rn = -std::sin(hdg_r) * 180.0;
-        const SimWeatherCell rw = sample_weather_model(east_m + re, north_m + rn, agl);
-        const SimWeatherCell lw = sample_weather_model(east_m - re, north_m - rn, agl);
+        const SimWeatherCell rw = sample_weather_model(frame, east_m + re, north_m + rn, agl);
+        const SimWeatherCell lw = sample_weather_model(frame, east_m - re, north_m - rn, agl);
         // dw/dy across the wing creates an immediate aerodynamic roll torque (left updraft rolls right -> +p)
         grid_roll_shear = std::clamp((lw.w - rw.w) / 360.0 * 4.5, -0.18, 0.18);
     }
@@ -2633,7 +2686,7 @@ LocalAirSample RegionalAtmosphere::sample_at(
     const float vis_moist = std::clamp(static_cast<float>(local_precip / 4.0) + (out.in_cloud ? 0.85f : 0.0f) +
                                        smooth01(0.86f, 0.98f, static_cast<float>(out.relative_humidity)) * 0.45f, 0.0f, 1.0f);
     out.icing_intensity = freezing * vis_moist;
-    out.lightning_flash = lightning_flash_at(east_m, north_m, sim_time_sec);
+    if (model_here && has_model()) out.lightning_flash = lightning_flash_at(east_m, north_m, sim_time_sec);
     out.wind_east_mps = we;
     out.wind_north_mps = wn;
     out.wind_up_mps = std::clamp(out.ridge_lift_mps + out.wave_lift_mps + out.thermal_lift_mps + gust.wg_mps, -12.0, 12.0);

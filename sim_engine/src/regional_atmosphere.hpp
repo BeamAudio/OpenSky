@@ -248,6 +248,7 @@ public:
     GLuint field_tex() const { return field_tex_; }
     GLuint terrain_field_tex() const { return terrain_field_tex_; }
     uint64_t uploaded_weather_generation() const { return uploaded_weather_generation_; }
+    Vec4 map_domain_bounds() const;
     Vec4 domain_bounds() const {
         if (!weather_textures_ready_) return {};
         return {static_cast<float>(min_e_), static_cast<float>(min_n_),
@@ -368,12 +369,16 @@ private:
     void stop_weather_worker();
     void publish_weather_model();
     void refresh_climate_field();
-    void evaluate_dynamic_cells(double east_m, double north_m, double agl_m,
+    static void evaluate_dynamic_cells(const WeatherPublication &frame, double east_m, double north_m, double agl_m,
                                 float &out_cloud_add, float &out_rain_add, float &out_w_add,
-                                float &out_outflow_e, float &out_outflow_n, float &out_tke_add) const;
-    SimWeatherCell sample_weather_model(double east_m, double north_m, double agl_m) const;
+                                float &out_outflow_e, float &out_outflow_n, float &out_tke_add);
+    static double distance_inside(const WeatherPublication &frame, double east_m, double north_m);
+    static SimWeatherCell blend_cells(const SimWeatherCell &a, const SimWeatherCell &b, float weight);
+    static SimWeatherCell sample_weather_model(const WeatherPublication &frame, double east_m, double north_m,
+                                               double agl_m, bool use_local = true);
 
     const PackReader *pack_ = nullptr;
+    std::shared_ptr<const PackReader::WorldFrame> weather_world_frame_;
     WindRegime regime_ = WindRegime::PYRENEAN_THERMAL;
     bool gpu_enabled_ = false;
     int weather_grid_detail_ = 0; // 0: off, 1: 192^2 local tile, 2: 384^2 local tile
@@ -413,6 +418,7 @@ private:
     double refinement_center_lat_ = 42.53131, refinement_center_lon_ = 0.47676;
     double local_center_e_ = 0.0, local_center_n_ = 0.0;
     WeatherPublication frame_weather_, pending_weather_, staging_weather_;
+    WeatherPublication handoff_weather_;
     mutable std::mutex weather_publish_mtx_;
     uint64_t weather_generation_ = 0;
     uint64_t local_terrain_generation_ = 0;
@@ -432,7 +438,6 @@ private:
     bool weather_textures_ready_ = false;
     double weather_model_time_ = -1.0;
     double weather_model_accum_ = 0.0;
-    double weather_anchor_lat_ = 0.0, weather_anchor_lon_ = 0.0;
     std::thread weather_worker_;
     std::future<void> weather_init_future_;
     bool weather_init_pending_ = false;
